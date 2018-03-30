@@ -7,6 +7,8 @@ import uploadCertificateCommand = require("commands/auth/uploadCertificateComman
 import deleteCertificateCommand = require("commands/auth/deleteCertificateCommand");
 import replaceClusterCertificateCommand = require("commands/auth/replaceClusterCertificateCommand");
 import updateCertificatePermissionsCommand = require("commands/auth/updateCertificatePermissionsCommand");
+import getServerCertificateSetupModeCommand = require("commands/auth/getServerCertificateSetupModeCommand");
+import forceRenewServerCertificateCommand = require("commands/auth/forceRenewServerCertificateCommand");
 import getNextOperationId = require("commands/database/studio/getNextOperationId");
 import notificationCenter = require("common/notifications/notificationCenter");
 import getClusterDomainsCommand = require("commands/auth/getClusterDomainsCommand");
@@ -16,6 +18,7 @@ import popoverUtils = require("common/popoverUtils");
 import messagePublisher = require("common/messagePublisher");
 import eventsCollector = require("common/eventsCollector");
 import changesContext = require("common/changesContext");
+import accessManager = require("common/shell/accessManager");
 
 interface unifiedCertificateDefinitionWithCache extends unifiedCertificateDefinition {
     expirationClass: string;
@@ -35,12 +38,14 @@ class certificates extends viewModelBase {
     canReplaceClusterCertificate: KnockoutComputed<boolean>;
     certificates = ko.observableArray<unifiedCertificateDefinition>();
     serverCertificateThumbprint = ko.observable<string>();
+    serverCertificateSetupMode = ko.observable<Raven.Server.Commercial.SetupMode>();
     
     domainsForServerCertificate = ko.observableArray<string>([]);
     
     usingHttps = location.protocol === "https:";
     
     resolveDatabasesAccess = certificateModel.resolveDatabasesAccess;
+    accessManager = accessManager.default.certificatesView;
 
     importedFileName = ko.observable<string>();
     
@@ -61,13 +66,19 @@ class certificates extends viewModelBase {
 
         this.bindToCurrentInstance("onCloseEdit", "save", "enterEditCertificateMode", 
             "deletePermission", "addNewPermission", "fileSelected", "copyThumbprint",
-            "useDatabase", "deleteCertificate");
+            "useDatabase", "deleteCertificate", "renewServerCertificate", "showRenewCertificateButton");
         this.initObservables();
         this.initValidation();
     }
     
     activate() {
-        return this.loadCertificates();
+        this.loadCertificates();
+        
+        return new getServerCertificateSetupModeCommand()
+            .execute()
+            .done((setupMode: Raven.Server.Commercial.SetupMode) => {
+                this.serverCertificateSetupMode(setupMode); 
+             });
     }
     
     compositionComplete() {
@@ -125,6 +136,17 @@ class certificates extends viewModelBase {
         this.newPermissionDatabaseName.extend({
             required: true
         });
+    }    
+    
+    showRenewCertificateButton(thumbprints: string[]) {
+        return ko.pureComputed(() => {
+            return _.includes(thumbprints, this.serverCertificateThumbprint()) && this.serverCertificateSetupMode() === 'LetsEncrypt';
+        });
+    }
+    
+    renewServerCertificate() {
+        return new forceRenewServerCertificateCommand()
+            .execute();
     }
     
     enterEditCertificateMode(itemToEdit: unifiedCertificateDefinition) {
@@ -280,7 +302,6 @@ class certificates extends viewModelBase {
                             });
                 }
             });
-        
     }
     
     private loadCertificates() {
@@ -385,6 +406,29 @@ class certificates extends viewModelBase {
         copyToClipboard.copy(thumbprint, "Thumbprint was copied to clipboard.");
     }
     
+    canDelete(securityClearance: Raven.Client.ServerWide.Operations.Certificates.SecurityClearance) {
+        return ko.pureComputed(() => {
+            if (!this.accessManager.canDeleteClusterAdminCertificate() && securityClearance === "ClusterAdmin") {
+                return false;
+            }
+            
+            if (!this.accessManager.canDeleteClusterNodeCertificate() && securityClearance === "ClusterNode") {
+                return false;
+            }
+            
+            return true; 
+        });
+    }
+
+    canGenerateCertificateForSecurityClearanceType(securityClearance: Raven.Client.ServerWide.Operations.Certificates.SecurityClearance) {
+        return ko.pureComputed(() => {
+            if (!this.accessManager.canGenerateClientCertificateForAdmin() && securityClearance === "ClusterAdmin") {
+                return false;
+            }
+
+            return true;
+        });
+    }
 }
 
 export = certificates;

@@ -7,6 +7,7 @@ using System.IO;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
+using System.Net.WebSockets;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
@@ -103,7 +104,7 @@ namespace Raven.Server.ServerWide
         public ServerStore(RavenConfiguration configuration, RavenServer server)
         {
             // we want our servers to be robust get early errors about such issues
-            MemoryInformation.EnableEarlyOutOfMemoryChecks = true; 
+            MemoryInformation.EnableEarlyOutOfMemoryChecks = true;
 
             Configuration = configuration ?? throw new ArgumentNullException(nameof(configuration));
 
@@ -168,6 +169,84 @@ namespace Raven.Server.ServerWide
             if (_engine.LeaderTag != NodeTag)
                 throw new NotLeadingException($"Stats can be requested only from the raft leader {_engine.LeaderTag}");
             return ClusterMaintenanceSupervisor?.GetStats();
+        }
+
+        public async Task UpdateTopologyChangeNotification()
+        {
+            while (ServerShutdown.IsCancellationRequested == false)
+            {
+                await _engine.WaitForState(RachisState.Follower).WithCancellation(ServerShutdown);
+                if (ServerShutdown.IsCancellationRequested)
+                    return;
+
+                var leaveTask = _engine.WaitForLeaveState(RachisState.Follower);
+                if (await Task.WhenAny(NotificationCenter.WaitForNew(), leaveTask).WithCancellation(ServerShutdown) == leaveTask)
+                {
+                    continue;
+                }
+
+                try
+                {
+                    using (var cts = CancellationTokenSource.CreateLinkedTokenSource(ServerShutdown))
+                    {
+                        var cancelTask = Task.WhenAny(NotificationCenter.WaitForAllRemoved, leaveTask)
+                            .ContinueWith(state =>
+                            {
+                                try
+                                {
+                                    cts.Cancel();
+                                }
+                                catch
+                                {
+                                    // ignored
+                                }
+                            }, ServerShutdown);
+
+                        while (cancelTask.IsCompleted == false)
+                        {
+                            var topology = GetClusterTopology();
+                            var leaderUrl = topology.GetUrlFromTag(_engine.LeaderTag);
+                            if (leaderUrl == null)
+                                continue;
+                            using (var ws = new ClientWebSocket())
+                            using (ContextPool.AllocateOperationContext(out JsonOperationContext context))
+                            {
+                                var leaderWsUrl = new Uri($"{leaderUrl.Replace("http", "ws", StringComparison.OrdinalIgnoreCase)}/server/notification-center/watch");
+
+                                if (Server.Certificate?.Certificate != null)
+                                {
+                                    ws.Options.ClientCertificates.Add(Server.Certificate.Certificate);
+                                }
+                                await ws.ConnectAsync(leaderWsUrl, cts.Token);
+                                while (ws.State == WebSocketState.Open || ws.State == WebSocketState.CloseSent)
+                                {
+                                    using (var notification = await context.ReadFromWebSocket(ws, "ws from Leader", cts.Token))
+                                    {
+                                        if (notification == null)
+                                            break;
+                                        var topologyNotification = JsonDeserializationServer.ClusterTopologyChanged(notification);
+                                        if (topologyNotification != null && topologyNotification.Type == NotificationType.ClusterTopologyChanged)
+                                        {
+                                            topologyNotification.NodeTag = _engine.Tag;
+                                            NotificationCenter.Add(topologyNotification);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                }
+                catch (Exception e)
+                {
+                    if (Logger.IsInfoEnabled)
+                    {
+                        Logger.Info("Error during receiving topology updates from the leader", e);
+                    }
+                }
+            }
         }
 
         internal ClusterObserver Observer { get; set; }
@@ -433,6 +512,57 @@ namespace Raven.Server.ServerWide
 
             LicenseManager.Initialize(_env, ContextPool);
             LatestVersionCheck.Check(this);
+
+            ConfigureAuditLog();
+        }
+
+        private void ConfigureAuditLog()
+        {
+            if (Configuration.Security.AuditLogPath == null)
+                return;
+
+            if (Configuration.Security.AuthenticationEnabled == false)
+            {
+                if (Logger.IsOperationsEnabled)
+                    Logger.Operations("The audit log configuration 'Security.AuditLog.FolderPath' was specified, but the server is not running in a secured mode. Audit log disabled!");
+                return;
+            }
+
+            // we have to do this manually because LoggingSource will ignore errors
+            AssertCanWriteToAuditLogDirectory();
+
+            LoggingSource.AuditLog.SetupLogMode(
+                LogMode.Information,
+                Configuration.Security.AuditLogPath.FullPath,
+                Configuration.Security.AuditLogRetention.AsTimeSpan);
+
+            var auditLog = LoggingSource.AuditLog.GetLogger("ServerStartup", "Audit");
+            auditLog.Operations($"Server started up, listening to {string.Join(", ", Configuration.Core.ServerUrls)} with certificate {_server.Certificate?.Certificate?.Subject} ({_server.Certificate?.Certificate?.Thumbprint}), public url: {Configuration.Core.PublicServerUrl}");
+        }
+
+        private void AssertCanWriteToAuditLogDirectory()
+        {
+            if (Directory.Exists(Configuration.Security.AuditLogPath.FullPath) == false)
+            {
+                try
+                {
+                    Directory.CreateDirectory(Configuration.Security.AuditLogPath.FullPath);
+                }
+                catch (Exception e)
+                {
+                    throw new InvalidOperationException($"Cannot create audit log directory: {Configuration.Security.AuditLogPath.FullPath}, treating this as a fatal error", e);
+                }
+            }
+            try
+            {
+                var testFile = Configuration.Security.AuditLogPath.Combine("write.test").FullPath;
+                File.WriteAllText(testFile, "test we can write");
+                File.Delete(testFile);
+            }
+            catch (Exception e)
+            {
+                throw new InvalidOperationException($"Cannot create new file in audit log directory: {Configuration.Security.AuditLogPath.FullPath}, treating this as a fatal error", e);
+            }
         }
 
         public void TriggerDatabases()
@@ -458,6 +588,7 @@ namespace Raven.Server.ServerWide
             }
 
             Task.Run(ClusterMaintenanceSetupTask, ServerShutdown);
+            Task.Run(UpdateTopologyChangeNotification, ServerShutdown);
         }
 
         private void OnStateChanged(object sender, RachisConsensus.StateTransition state)
@@ -623,7 +754,7 @@ namespace Raven.Server.ServerWide
                             if (cert.TryGet("Certificate", out string certBase64) == false ||
                                 cert.TryGet("Thumbprint", out string certThumbprint) == false)
                                 throw new InvalidOperationException("Invalid 'server/cert' value, expected to get Certificate and Thumbprint properties");
-                        
+
                             if (certThumbprint == Server.Certificate?.Certificate?.Thumbprint)
                             {
                                 if (nodesInCluster > confirmations)
@@ -659,7 +790,7 @@ namespace Raven.Server.ServerWide
 
                             var bytesToSave = Convert.FromBase64String(certBase64);
                             var newClusterCertificate = new X509Certificate2(bytesToSave, (string)null, X509KeyStorageFlags.Exportable);
-                            
+
                             if (string.IsNullOrEmpty(Configuration.Security.CertificatePassword) == false)
                             {
                                 bytesToSave = newClusterCertificate.Export(X509ContentType.Pkcs12, Configuration.Security.CertificatePassword);

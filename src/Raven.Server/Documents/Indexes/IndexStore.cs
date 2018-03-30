@@ -137,7 +137,7 @@ namespace Raven.Server.Documents.Indexes
             CreateIndexInternal(index);
         }
 
-        private static AutoIndexDefinitionBase CreateAutoDefinition(AutoIndexDefinition definition)
+        internal static AutoIndexDefinitionBase CreateAutoDefinition(AutoIndexDefinition definition)
         {
             var mapFields = definition
                 .MapFields
@@ -541,6 +541,9 @@ namespace Raven.Server.Documents.Indexes
 
             if (isStatic && name.StartsWith("Auto/", StringComparison.OrdinalIgnoreCase))
                 throw new ArgumentException($"Index name '{name}' not permitted. Static index name cannot start with 'Auto/'", nameof(name));
+
+            if (isStatic && NameUtils.IsValidIndexName(name) == false)
+                throw new ArgumentException($"Index name '{name}' not permitted. Index name must math '{NameUtils.ValidIndexNameCharacters}' regular expression", nameof(name));
         }
 
         public Index ResetIndex(string name)

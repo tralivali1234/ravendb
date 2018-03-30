@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
+using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Text;
 using Lucene.Net.Analysis;
@@ -798,7 +799,8 @@ namespace Raven.Server.Documents.Queries
                 if (array != null)
                 {
                     ValueTokenType? expectedValueType = null;
-                    foreach (var item in UnwrapArray(array, metadata.QueryText, parameters))
+                    var unwrapedArray = UnwrapArray(array, metadata.QueryText, parameters);
+                    foreach (var item in unwrapedArray)
                     {
                         if (expectedValueType == null)
                             expectedValueType = item.Type;
@@ -853,7 +855,7 @@ namespace Raven.Server.Documents.Queries
             // this is known to be 0-9 with possibly _
             bool isNegative = token[0] == '-';
 
-            for (var index = isNegative  ? 1 : 0; index < token.Length; index++)
+            for (var index = isNegative ? 1 : 0; index < token.Length; index++)
             {
                 var ch = token[index];
                 if (ch == '_')

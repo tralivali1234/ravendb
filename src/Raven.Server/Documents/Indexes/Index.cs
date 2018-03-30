@@ -16,6 +16,7 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Indexes.Spatial;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Queries;
+using Raven.Client.ServerWide;
 using Raven.Client.Util;
 using Raven.Server.Config.Categories;
 using Raven.Server.Config.Settings;
@@ -263,16 +264,7 @@ namespace Raven.Server.Documents.Indexes
                 documentDatabase.IoChanges, documentDatabase.CatastrophicFailureNotification);
             try
             {
-                options.OnNonDurableFileSystemError += documentDatabase.HandleNonDurableFileSystemError;
-                options.OnRecoveryError += documentDatabase.HandleOnRecoveryError;
-                options.CompressTxAboveSizeInBytes = documentDatabase.Configuration.Storage.CompressTxAboveSize.GetValue(SizeUnit.Bytes);
-                options.SchemaVersion = SchemaUpgrader.CurrentVersion.IndexVersion;
-                options.SchemaUpgrader = SchemaUpgrader.Upgrader(SchemaUpgrader.StorageType.Index, null, null);
-                options.ForceUsing32BitsPager = documentDatabase.Configuration.Storage.ForceUsing32BitsPager;
-                options.TimeToSyncAfterFlashInSec = (int)documentDatabase.Configuration.Storage.TimeToSyncAfterFlash.AsTimeSpan.TotalSeconds;
-                options.NumOfConcurrentSyncsPerPhysDrive = documentDatabase.Configuration.Storage.NumberOfConcurrentSyncsPerPhysicalDrive;
-                options.MasterKey = documentDatabase.MasterKey?.ToArray();//clone
-                options.DoNotConsiderMemoryLockFailureAsCatastrophicError = documentDatabase.Configuration.Security.DoNotConsiderMemoryLockFailureAsCatastrophicError;
+                InitializeOptions(options, documentDatabase, name);
 
                 environment = LayoutUpdater.OpenEnvironment(options);
 
@@ -283,6 +275,34 @@ namespace Raven.Server.Documents.Indexes
                 }
                 catch (Exception e)
                 {
+                    if (environment.NextWriteTransactionId == 2 && TryFindIndexDefinition(name, documentDatabase.ReadDatabaseRecord(), out var staticDef, out var autoDef))
+                    {
+                        // initial transaction creating the schema hasn't completed
+                        // let's try to create it again
+
+                        environment.Dispose();
+
+                        if (staticDef != null)
+                        {
+                            switch (staticDef.Type)
+                            {
+                                case IndexType.Map:
+                                    return MapIndex.CreateNew(staticDef, documentDatabase);
+                                case IndexType.MapReduce:
+                                    return MapReduceIndex.CreateNew(staticDef, documentDatabase);
+                            }
+                        }
+                        else
+                        {
+                            var definition = IndexStore.CreateAutoDefinition(autoDef);
+
+                            if (definition is AutoMapIndexDefinition autoMapDef)
+                                return AutoMapIndex.CreateNew(autoMapDef, documentDatabase);
+                            if (definition is AutoMapReduceIndexDefinition autoMapReduceDef)
+                                return AutoMapReduceIndex.CreateNew(autoMapReduceDef, documentDatabase);
+                        }
+                    }
+                    
                     throw new IndexOpenException(
                         $"Could not read index type from storage in '{path}'. This indicates index data file corruption.",
                         e);
@@ -398,18 +418,23 @@ namespace Raven.Server.Documents.Indexes
                 : StorageEnvironmentOptions.ForPath(indexPath.FullPath, indexTempPath?.FullPath, null,
                     documentDatabase.IoChanges, documentDatabase.CatastrophicFailureNotification);
 
-            options.OnNonDurableFileSystemError += documentDatabase.HandleNonDurableFileSystemError;
-            options.OnRecoveryError += documentDatabase.HandleOnRecoveryError;
+            InitializeOptions(options, documentDatabase, name);
 
+            return options;
+        }
+
+        private static void InitializeOptions(StorageEnvironmentOptions options, DocumentDatabase documentDatabase, string name)
+        {
+            options.OnNonDurableFileSystemError += documentDatabase.HandleNonDurableFileSystemError;
+            options.OnRecoveryError += (s, e) => documentDatabase.HandleOnIndexRecoveryError(name, s, e);
+            options.CompressTxAboveSizeInBytes = documentDatabase.Configuration.Storage.CompressTxAboveSize.GetValue(SizeUnit.Bytes);
             options.SchemaVersion = SchemaUpgrader.CurrentVersion.IndexVersion;
             options.SchemaUpgrader = SchemaUpgrader.Upgrader(SchemaUpgrader.StorageType.Index, null, null);
-            options.CompressTxAboveSizeInBytes = documentDatabase.Configuration.Storage.CompressTxAboveSize.GetValue(SizeUnit.Bytes);
             options.ForceUsing32BitsPager = documentDatabase.Configuration.Storage.ForceUsing32BitsPager;
             options.TimeToSyncAfterFlashInSec = (int)documentDatabase.Configuration.Storage.TimeToSyncAfterFlash.AsTimeSpan.TotalSeconds;
             options.NumOfConcurrentSyncsPerPhysDrive = documentDatabase.Configuration.Storage.NumberOfConcurrentSyncsPerPhysicalDrive;
-            options.MasterKey = documentDatabase.MasterKey?.ToArray();//clone
+            options.MasterKey = documentDatabase.MasterKey?.ToArray(); //clone
             options.DoNotConsiderMemoryLockFailureAsCatastrophicError = documentDatabase.Configuration.Security.DoNotConsiderMemoryLockFailureAsCatastrophicError;
-            return options;
         }
 
         internal ExitWriteLock DrainRunningQueries()
@@ -1511,6 +1536,7 @@ namespace Raven.Server.Documents.Indexes
                     var changeType = GetIndexChangeType(state, oldState);
                     if (changeType != IndexChangeTypes.None)
                     {
+                        // HandleIndexChange is going to be called here
                         DocumentDatabase.Changes.RaiseNotifications(new IndexChange
                         {
                             Name = Name,
@@ -1564,12 +1590,12 @@ namespace Raven.Server.Documents.Indexes
 
         public virtual void Enable()
         {
-            if (State != IndexState.Disabled)
+            if (State != IndexState.Disabled && State != IndexState.Error)
                 return;
 
             using (DrainRunningQueries())
             {
-                if (State != IndexState.Disabled)
+                if (State != IndexState.Disabled && State != IndexState.Error)
                     return;
 
                 SetState(IndexState.Normal);
@@ -2599,30 +2625,7 @@ namespace Raven.Server.Documents.Indexes
 
             if (_lowMemoryFlag.IsRaised() && count > MinBatchSize)
             {
-                _batchStopped = DocumentDatabase.IndexStore.StoppedConcurrentIndexBatches.Wait(0);
-                if (_batchStopped == false)
-                {
-                    var msg = $"Halting processing of batch after {count:#,#;;0} and waiting because of low memory, other indexes are currently completing and index {Name} will wait for them to complete";
-                    stats.RecordMapCompletedReason(msg);
-                    if (_logger.IsInfoEnabled)
-                        _logger.Info(msg);
-                    var timeout = _indexStorage.DocumentDatabase.Configuration.Indexing.MaxTimeForDocumentTransactionToRemainOpen.AsTimeSpan;
-
-                    while (true)
-                    {
-                        _batchStopped = DocumentDatabase.IndexStore.StoppedConcurrentIndexBatches.Wait(
-                            timeout,
-                            _indexingProcessCancellationTokenSource.Token);
-                        if (_batchStopped)
-                            break;
-
-                        if (_lowMemoryFlag.IsRaised() == false)
-                            break;
-
-                        if (_logger.IsInfoEnabled)
-                            _logger.Info($"{Name} is still waiting for other indexes to complete their batches because there is a low memory condition in action...");
-                    };
-                }
+                HandleStoppedBatchesConcurrently(stats, count);
 
                 stats.RecordMapCompletedReason($"The batch was stopped after processing {count:#,#;;0} documents because of low memory");
                 return false;
@@ -2701,6 +2704,40 @@ namespace Raven.Server.Documents.Indexes
             return true;
         }
 
+        private void HandleStoppedBatchesConcurrently(IndexingStatsScope stats, int count)
+        {
+            if (_batchStopped)
+            {
+                // already stopped by MapDocuments, HandleReferences or CleanupDeletedDocuments
+                return;
+            }
+
+            _batchStopped = DocumentDatabase.IndexStore.StoppedConcurrentIndexBatches.Wait(0);
+            if (_batchStopped)
+                return;
+
+            var message = $"Halting processing of batch after {count:#,#;;0} and waiting because of low memory, other indexes are currently completing and index {Name} will wait for them to complete";
+            stats.RecordMapCompletedReason(message);
+            if (_logger.IsInfoEnabled)
+                _logger.Info(message);
+            var timeout = _indexStorage.DocumentDatabase.Configuration.Indexing.MaxTimeForDocumentTransactionToRemainOpen.AsTimeSpan;
+
+            while (true)
+            {
+                _batchStopped = DocumentDatabase.IndexStore.StoppedConcurrentIndexBatches.Wait(
+                    timeout,
+                    _indexingProcessCancellationTokenSource.Token);
+                if (_batchStopped)
+                    break;
+
+                if (_lowMemoryFlag.IsRaised() == false)
+                    break;
+
+                if (_logger.IsInfoEnabled)
+                    _logger.Info($"{Name} is still waiting for other indexes to complete their batches because there is a low memory condition in action...");
+            }
+        }
+
         public void Compact(Action<IOperationProgress> onProgress, CompactionResult result)
         {
             if (_isCompactionInProgress)
@@ -2737,7 +2774,7 @@ namespace Raven.Server.Documents.Indexes
                         DocumentDatabase.CatastrophicFailureNotification);
                     srcOptions.ForceUsing32BitsPager = DocumentDatabase.Configuration.Storage.ForceUsing32BitsPager;
                     srcOptions.OnNonDurableFileSystemError += DocumentDatabase.HandleNonDurableFileSystemError;
-                    srcOptions.OnRecoveryError += DocumentDatabase.HandleOnRecoveryError;
+                    srcOptions.OnRecoveryError += (s, e) => DocumentDatabase.HandleOnIndexRecoveryError(Name, s, e);
                     srcOptions.CompressTxAboveSizeInBytes = DocumentDatabase.Configuration.Storage.CompressTxAboveSize.GetValue(SizeUnit.Bytes);
                     srcOptions.TimeToSyncAfterFlashInSec = (int)DocumentDatabase.Configuration.Storage.TimeToSyncAfterFlash.AsTimeSpan.TotalSeconds;
                     srcOptions.NumOfConcurrentSyncsPerPhysDrive = DocumentDatabase.Configuration.Storage.NumberOfConcurrentSyncsPerPhysicalDrive;
@@ -2751,7 +2788,7 @@ namespace Raven.Server.Documents.Indexes
                             DocumentDatabase.CatastrophicFailureNotification))
                     {
                         compactOptions.OnNonDurableFileSystemError += DocumentDatabase.HandleNonDurableFileSystemError;
-                        compactOptions.OnRecoveryError += DocumentDatabase.HandleOnRecoveryError;
+                        compactOptions.OnRecoveryError += (s, e) => DocumentDatabase.HandleOnIndexRecoveryError(Name, s, e);
                         compactOptions.CompressTxAboveSizeInBytes = DocumentDatabase.Configuration.Storage.CompressTxAboveSize.GetValue(SizeUnit.Bytes);
                         compactOptions.ForceUsing32BitsPager = DocumentDatabase.Configuration.Storage.ForceUsing32BitsPager;
                         compactOptions.TimeToSyncAfterFlashInSec = (int)DocumentDatabase.Configuration.Storage.TimeToSyncAfterFlash.AsTimeSpan.TotalSeconds;
@@ -2929,6 +2966,34 @@ namespace Raven.Server.Documents.Indexes
 
                 return new SpatialField(name, new SpatialOptions());
             });
+        }
+
+        private static bool TryFindIndexDefinition(string directoryName, DatabaseRecord record, out IndexDefinition staticDef, out AutoIndexDefinition autoDef)
+        {
+            foreach (var index in record.Indexes)
+            {
+                if (directoryName == IndexDefinitionBase.GetIndexNameSafeForFileSystem(index.Key))
+                {
+                    staticDef = index.Value;
+                    autoDef = null;
+                    return true;
+                }
+            }
+
+            foreach (var index in record.AutoIndexes)
+            {
+                if (directoryName == IndexDefinitionBase.GetIndexNameSafeForFileSystem(index.Key))
+                {
+                    autoDef = index.Value;
+                    staticDef = null;
+                    return true;
+                }
+            }
+
+            staticDef = null;
+            autoDef = null;
+            
+            return false;
         }
 
         protected struct QueryDoneRunning : IDisposable
