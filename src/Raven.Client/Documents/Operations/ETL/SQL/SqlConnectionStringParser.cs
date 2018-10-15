@@ -1,5 +1,4 @@
 ﻿using System;
-using System.IO;
 
 namespace Raven.Client.Documents.Operations.ETL.SQL
 {
@@ -13,22 +12,81 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
             switch (SqlProviderParser.GetSupportedProvider(factoryName))
             {
                 case SqlProvider.SqlClient:
-                    database = GetConnectionStringValue(connectionString, new[] { "Initial Catalog", "Database" }, throwIfNotFound: false);
+                    database = GetConnectionStringValue(connectionString, new[] { "Initial Catalog", "Database" });
 
                     if (database == null)
                         database = "master";
 
-                    server = GetConnectionStringValue(connectionString, new[] { "Data Source", "Server" });
+                    server = GetConnectionStringValue(connectionString, new[] { "Data Source", "Server", "Address", "Addr", "Network Address" });
                     break;
                 case SqlProvider.Npgsql:
                     database = GetConnectionStringValue(connectionString, new[] { "Database" });
                     server = GetConnectionStringValue(connectionString, new[] { "Host", "Data Source", "Server" });
 
-                    var port = GetConnectionStringValue(connectionString, new[] { "Port" }, throwIfNotFound: false);
+                    var postgrePort = GetConnectionStringValue(connectionString, new[] { "Port" });
 
-                    if (string.IsNullOrEmpty(port))
-                        server += $":{port}";
+                    if (string.IsNullOrEmpty(postgrePort))
+                        server += $":{postgrePort}";
                     break;
+                case SqlProvider.MySqlClient:
+                    database = GetConnectionStringValue(connectionString, new[] { "Database", "Initial Catalog" });
+
+                    if (database == null)
+                        database = "mysql";
+
+                    server = GetConnectionStringValue(connectionString, new[] { "Host", "Server", "Data Source", "DataSource", "Address", "Addr", "Network Address" });
+
+                    if (server == null)
+                        server = "localhost";
+
+                    var mysqlPort = GetConnectionStringValue(connectionString, new[] { "Port" });
+
+                    if (string.IsNullOrEmpty(mysqlPort) == false)
+                        server += $":{mysqlPort}";
+                    break;
+                case SqlProvider.OracleClient:
+
+                    server = null;
+                    database = null;
+
+                    var dataSource = GetConnectionStringValue(connectionString, new[] { "Data Source" });
+
+                    if (string.IsNullOrEmpty(dataSource) == false)
+                    {
+                        server = GetOracleDataSourceSubValue(dataSource, "HOST");
+
+                        if (server != null)
+                        {
+                            var port = GetOracleDataSourceSubValue(dataSource, "PORT");
+
+                            if (port != null)
+                                server += $":{port}";
+                        }
+
+                        database = GetOracleDataSourceSubValue(dataSource, "SERVICE_NAME") ?? GetOracleDataSourceSubValue(dataSource, "SID");
+
+                        if (server == null)
+                        {
+                            var parts = dataSource.Split(new []{'@'}, 2);
+
+                            if (parts.Length == 2)
+                            {
+                                // Data Source=username/password@myserver//instancename;
+                                // Data Source=username/password@myserver/myservice:dedicated/instancename;
+
+                                server = parts[1];
+                            }
+                            else
+                            {
+                                // Data Source=myOracleDB;
+                                server = dataSource;
+                            }
+                        }
+                    }
+
+                    break;
+
+                    
                 default:
                     throw new NotSupportedException($"Factory '{factoryName}' is not supported");
             }
@@ -36,18 +94,13 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
             return (database, server);
         }
 
-        public static string GetConnectionStringValue(string connectionString, string[] keyNames, bool throwIfNotFound = true)
+        public static string GetConnectionStringValue(string connectionString, string[] keyNames)
         {
             var parts = connectionString.Split(';');
 
             foreach (var part in parts)
             {
-                var keyValue = part.Split('=');
-               
-                if (keyValue.Length != 2)
-                {
-                    continue;
-                }
+                var keyValue = part.Split(new[] { '=' }, 2);
 
                 foreach (var key in keyNames)
                 {
@@ -56,10 +109,26 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
                 }
             }
 
-            if (throwIfNotFound)
-                throw new InvalidDataException($"Invalid connection string. Could not find neither of '{string.Join(",", keyNames)}' keys in the connection string: {connectionString}");
-
             return null;
+        }
+
+        internal static string GetOracleDataSourceSubValue(string dataSourceValue, string key)
+        {
+            var indexOf = dataSourceValue.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+
+            if (indexOf == -1)
+                return null;
+
+            var subString = dataSourceValue.Substring(indexOf);
+
+            var closingBracket = subString.IndexOf(')');
+
+            if (closingBracket == -1)
+                return null;
+
+            var subValue = subString.Substring(0, closingBracket);
+
+            return GetConnectionStringValue(subValue, new []{ key });
         }
     }
 }

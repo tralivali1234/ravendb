@@ -69,6 +69,9 @@ namespace Raven.Server.Documents.Indexes
             if (x.HasQuotedName)
                 name = $"'{name}'";
 
+            if (x.GroupByArrayBehavior == GroupByArrayBehavior.ByContent)
+                name = AutoIndexField.GetGroupByArrayContentAutoIndexFieldName(name).ToUpperFirstLetter();
+
             if (x.Indexing == AutoFieldIndexing.Default || x.Indexing == AutoFieldIndexing.No)
             {
                 if (x.Spatial != null)
@@ -84,6 +87,9 @@ namespace Raven.Server.Documents.Indexes
 
             if (x.Indexing.HasFlag(AutoFieldIndexing.Search))
                 functions.Add(AutoIndexField.GetSearchAutoIndexFieldName(name).ToUpperFirstLetter());
+
+            if (x.Indexing.HasFlag(AutoFieldIndexing.Highlighting))
+                functions.Add(AutoIndexField.GetHighlightingAutoIndexFieldName(name).ToUpperFirstLetter());
 
             if (x.Indexing.HasFlag(AutoFieldIndexing.Exact))
                 functions.Add(AutoIndexField.GetExactAutoIndexFieldName(name).ToUpperFirstLetter());

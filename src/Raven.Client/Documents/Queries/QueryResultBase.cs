@@ -1,4 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
+using Raven.Client.Documents.Operations.Counters;
+using Raven.Client.Documents.Queries.Timings;
+using Sparrow.Json;
 
 namespace Raven.Client.Documents.Queries
 {
@@ -13,6 +17,17 @@ namespace Raven.Client.Documents.Queries
         /// Gets or sets the document included in the result.
         /// </summary>
         public TInclude Includes { get; set; }
+
+        /// <summary>
+        /// Gets or sets the Counters included in the result.
+        /// </summary>
+        public BlittableJsonReaderObject CounterIncludes { get; set; }
+
+        /// <summary>
+        /// The names of all the counters that the server
+        /// was asked to include in the result, by document id.
+        /// </summary>
+        public Dictionary<string, string[]> IncludedCounterNames { get; set; }
 
         /// <summary>
         /// The paths that the server included in the results
@@ -49,5 +64,15 @@ namespace Raven.Client.Documents.Queries
         /// The timestamp of the last time the index was queried
         /// </summary>
         public DateTime LastQueryTime { get; set; }
+
+        /// <summary>
+        /// Tag of a cluster node which responded to the query
+        /// </summary>
+        public string NodeTag { get; set; }
+
+        /// <summary>
+        /// Detailed timings for various parts of a query (Lucene search, loading documents, transforming results) - if requested.
+        /// </summary>
+        public QueryTimings Timings { get; set; }
     }
 }

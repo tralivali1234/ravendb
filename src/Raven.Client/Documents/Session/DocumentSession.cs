@@ -7,7 +7,6 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Linq;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Commands;
@@ -15,7 +14,6 @@ using Raven.Client.Documents.Commands.MultiGet;
 using Raven.Client.Documents.Linq;
 using Raven.Client.Documents.Session.Operations;
 using Raven.Client.Documents.Session.Operations.Lazy;
-using Raven.Client.Http;
 
 namespace Raven.Client.Documents.Session
 {
@@ -42,27 +40,37 @@ namespace Raven.Client.Documents.Session
         /// Access the lazy operations
         /// </summary>
         public ILazySessionOperations Lazily => this;
-        
+
         /// <summary>
         /// Access the attachments operations
         /// </summary>
-        public IAttachmentsSessionOperations Attachments { get; }
-        
-        /// <summary>
+        public IAttachmentsSessionOperations Attachments => _attachments ?? (_attachments = new DocumentSessionAttachments(this));
+        private IAttachmentsSessionOperations _attachments;
+
+        /// <summary>        
         /// Access the revisions operations
         /// </summary>
-        public IRevisionsSessionOperations Revisions { get; }
+        public IRevisionsSessionOperations Revisions => _revisions ?? (_revisions = new DocumentSessionRevisions(this));
+        private IRevisionsSessionOperations _revisions;
+
+        /// <summary>
+        /// Access to cluster wide transaction operations
+        /// </summary>
+        public IClusterTransactionOperations ClusterTransaction => _clusterTransaction ?? (_clusterTransaction = new ClusterTransactionOperations(this));
+        private IClusterTransactionOperations _clusterTransaction;
+
+        protected override ClusterTransactionOperationsBase GetClusterSession()
+        {
+            return (ClusterTransactionOperationsBase)_clusterTransaction;
+        }
 
         /// <summary>
         /// Initializes a new instance of the <see cref="DocumentSession"/> class.
         /// </summary>
-        public DocumentSession(string dbName, DocumentStore documentStore, Guid id, RequestExecutor requestExecutor)
-            : base(dbName, documentStore, requestExecutor, id)
+        public DocumentSession(DocumentStore documentStore, Guid id, SessionOptions options)
+            : base(documentStore, id, options)
         {
-            Attachments = new DocumentSessionAttachments(this);
-            Revisions = new DocumentSessionRevisions(this);
         }
-
         /// <summary>
         /// Saves all the changes to the Raven server.
         /// </summary>
@@ -75,7 +83,11 @@ namespace Raven.Client.Documents.Session
                 if (command == null)
                     return;
 
+                if (NoTracking)
+                    throw new InvalidOperationException($"Cannot execute '{nameof(SaveChanges)}' when entity tracking is disabled in session.");
+
                 RequestExecutor.Execute(command, Context, sessionInfo: SessionInfo);
+                UpdateSessionAfterSaveChanges(command.Result);
                 saveChangesOperation.SetResult(command.Result);
             }
         }
@@ -89,6 +101,9 @@ namespace Raven.Client.Documents.Session
         {
             if (id == null)
                 throw new ArgumentNullException(nameof(id));
+
+            if (_knownMissingIds.Contains(id))
+                return false;
 
             if (DocumentsById.TryGetValue(id, out _))
                 return true;
@@ -186,7 +201,7 @@ namespace Raven.Client.Documents.Session
             }
         }
 
-        private bool ExecuteLazyOperationsSingleStep(ResponseTimeInformation responseTimeInformation, 
+        private bool ExecuteLazyOperationsSingleStep(ResponseTimeInformation responseTimeInformation,
             List<GetRequest> requests)
         {
             var multiGetOperation = new MultiGetOperation(this);

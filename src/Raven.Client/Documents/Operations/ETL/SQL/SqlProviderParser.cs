@@ -18,12 +18,10 @@ namespace Raven.Client.Documents.Operations.ETL.SQL
                 case "System.Data.OleDb":
                     throw new NotImplementedException($"Factory '{factoryName}' is not implemented yet");
                     //return SqlProvider.OleDb;
-                case "System.Data.OracleClient":
-                    throw new NotImplementedException($"Factory '{factoryName}' is not implemented yet");
-                    //return SqlProvider.OracleClient;
+                case "Oracle.ManagedDataAccess.Client":
+                    return SqlProvider.OracleClient;
                 case "MySql.Data.MySqlClient":
-                    throw new NotImplementedException($"Factory '{factoryName}' is not implemented yet");
-                    //return SqlProvider.MySqlClient;
+                    return SqlProvider.MySqlClient;
                 case "System.Data.SqlServerCe.3.5":
                     throw new NotImplementedException($"Factory '{factoryName}' is not implemented yet");
                     //return SqlProvider.SqlServerCe_3_5;

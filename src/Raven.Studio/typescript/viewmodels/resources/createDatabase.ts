@@ -6,6 +6,7 @@ import createDatabaseCommand = require("commands/resources/createDatabaseCommand
 import restoreDatabaseFromBackupCommand = require("commands/resources/restoreDatabaseFromBackupCommand");
 import migrateLegacyDatabaseFromDatafilesCommand = require("commands/resources/migrateLegacyDatabaseFromDatafilesCommand");
 import getClusterTopologyCommand = require("commands/database/cluster/getClusterTopologyCommand");
+import getDatabaseLocationCommand = require("commands/resources/getDatabaseLocationCommand");
 import clusterTopology = require("models/database/cluster/clusterTopology");
 import clusterNode = require("models/database/cluster/clusterNode");
 import databaseCreationModel = require("models/resources/creation/databaseCreationModel");
@@ -16,6 +17,7 @@ import notificationCenter = require("common/notifications/notificationCenter");
 import license = require("models/auth/licenseModel");
 import appUrl = require("common/appUrl");
 import router = require("plugins/router");
+import viewHelpers = require("common/helpers/view/viewHelpers");
 
 class createDatabase extends dialogViewModelBase {
     
@@ -43,6 +45,9 @@ class createDatabase extends dialogViewModelBase {
     selectionState: KnockoutComputed<checkbox>;
     canUseDynamicOption: KnockoutComputed<boolean>; 
 
+    databaseLocationCalculated = ko.observable<string>();
+    databaseLocationShowing: KnockoutComputed<string>;
+    
     getDatabaseByName(name: string): database {
         return databasesManager.default.getDatabaseByName(name);
     }
@@ -78,10 +83,6 @@ class createDatabase extends dialogViewModelBase {
     }
 
     activate() {
-        //TODO: if !!this.licenseStatus() && this.licenseStatus().IsCommercial && this.licenseStatus().Attributes.periodicBackup !== "true" preselect periodic export
-        //TODO: fetchClusterWideConfig
-        //TODO: fetchCustomBundles
-
         const getTopologyTask = new getClusterTopologyCommand()
             .execute()
             .done(topology => {
@@ -91,7 +92,13 @@ class createDatabase extends dialogViewModelBase {
 
         const getEncryptionKeyTask = this.encryptionSection.generateEncryptionKey();
 
-        return $.when<any>(getTopologyTask, getEncryptionKeyTask)
+        const getDefaultDatabaseLocationTask = new getDatabaseLocationCommand(this.databaseModel.name(), this.databaseModel.path.dataPath())
+            .execute()
+            .done((fullPath: string) => {
+                this.databaseLocationCalculated(fullPath);
+            });
+
+        return $.when<any>(getTopologyTask, getEncryptionKeyTask, getDefaultDatabaseLocationTask)
             .done(() => {
                 // setup validation after we fetch and populate form with data
                 this.databaseModel.setupValidation((name: string) => !this.getDatabaseByName(name), this.clusterNodes.length);
@@ -110,7 +117,7 @@ class createDatabase extends dialogViewModelBase {
 
         popoverUtils.longWithHover($(".data-exporter-label small"),
             {
-                content: '<strong>Raven.StorageExporter.exe</strong> can be found in <strong>tools</strong><br /> package (for version v3.X) on <a target="_blank" href="http://ravendb.net/downloads">ravendb.net</a> website'
+                content: '<strong>Raven.StorageExporter.exe</strong> can be found in <strong>tools</strong><br /> package (for version v3.x) on <a target="_blank" href="http://ravendb.net/downloads">ravendb.net</a> website'
             });
         
         popoverUtils.longWithHover($(".data-directory-label small"), 
@@ -152,10 +159,12 @@ class createDatabase extends dialogViewModelBase {
         // hide advanced if respononding bundle was unchecked
         this.databaseModel.configurationSections.forEach(section => {
             section.enabled.subscribe(enabled => {
-                if (section.alwaysEnabled || enabled) {
-                    this.currentAdvancedSection(section.id);
-                } else if (!enabled && this.currentAdvancedSection() === section.id) {
-                    this.currentAdvancedSection(createDatabase.defaultSection);
+                if (!this.databaseModel.lockActiveTab()) {
+                    if (section.alwaysEnabled || enabled) {
+                        this.currentAdvancedSection(section.id);
+                    } else if (!enabled && this.currentAdvancedSection() === section.id) {
+                        this.currentAdvancedSection(createDatabase.defaultSection);
+                    }
                 }
             });
         });
@@ -168,7 +177,9 @@ class createDatabase extends dialogViewModelBase {
 
         const encryption = this.databaseModel.configurationSections.find(x => x.id === "encryption");
         encryption.enabled.subscribe(encryptionEnabled => {
-            if (encryptionEnabled) {
+            const creationMode = this.databaseModel.creationMode;
+            const canUseManualMode = creationMode === "newDatabase";
+            if (encryptionEnabled && canUseManualMode) {
                 this.databaseModel.replication.dynamicMode(false);
                 this.databaseModel.replication.manualMode(true);
             }
@@ -208,6 +219,21 @@ class createDatabase extends dialogViewModelBase {
                 return "some_checked";
             return "unchecked";
         });
+
+
+        this.databaseLocationShowing = ko.pureComputed(() => {
+            return this.databaseLocationCalculated();
+        });
+
+        this.databaseModel.path.dataPath.throttle(300).subscribe((newPathValue) => {
+            if (this.databaseModel.path.dataPath.isValid()) {
+                new getDatabaseLocationCommand(this.databaseModel.name(), newPathValue)
+                    .execute()
+                    .done((fullPath: string) => this.databaseLocationCalculated(fullPath))
+            } else {
+                this.databaseLocationCalculated("Invalid path");
+            }
+        });
     }
 
     getAvailableSections() {
@@ -227,50 +253,55 @@ class createDatabase extends dialogViewModelBase {
     }
 
     createDatabase() {
-        eventsCollector.default.reportEvent("database", this.databaseModel.creationMode);
 
-        const globalValid = this.isValid(this.databaseModel.globalValidationGroup);
+        viewHelpers.asyncValidationCompleted(this.databaseModel.globalValidationGroup, () => {
 
-        const availableSections = this.getAvailableSections();
-        
-        const sectionsValidityList = availableSections.map(section => {
-            if (section.enabled()) {
-                return this.isValid(section.validationGroup);
-            } else {
-                return true;
+            eventsCollector.default.reportEvent("database", this.databaseModel.creationMode);
+
+            const availableSections = this.getAvailableSections();
+
+            const sectionsValidityList = availableSections.map(section => {
+                if (section.enabled()) {
+                    return this.isValid(section.validationGroup);
+                } else {
+                    return true;
+                }
+            });
+
+            const globalValid = this.isValid(this.databaseModel.globalValidationGroup);
+            const allValid = globalValid && _.every(sectionsValidityList, x => !!x);
+
+            if (allValid) {
+                // disable validation for name as it might display error: database already exists
+                // since we get async notifications during db creation
+                this.databaseModel.name.extend({validatable: false});
+
+                switch (this.databaseModel.creationMode) {
+                    case "restore":
+                        this.createDatabaseFromBackup();
+                        break;
+                    case "newDatabase":
+                        this.createDatabaseInternal();
+                        break;
+                    case "legacyMigration":
+                        this.createDatabaseFromLegacyDatafiles();
+                        break;
+                }
+
+                return;
+            }
+
+            const firstInvalidSection = sectionsValidityList.indexOf(false);
+            if (firstInvalidSection !== -1) {
+                const sectionToShow = availableSections[firstInvalidSection].id;
+                this.showAdvancedConfigurationFor(sectionToShow);
             }
         });
-
-        const allValid = globalValid && _.every(sectionsValidityList, x => !!x);
-
-        if (allValid) {
-            // disable validation for name as it might display error: database already exists
-            // since we get async notifications during db creation
-            this.databaseModel.name.extend({ validatable: false });
-            
-            switch (this.databaseModel.creationMode) {
-                case "restore":
-                    this.createDatabaseFromBackup();
-                    break;
-                case "newDatabase":
-                    this.createDatabaseInternal();
-                    break;
-                case "legacyMigration":
-                    this.createDatabaseFromLegacyDatafiles();
-                    break;
-            }
-            
-            return;
-        }
-
-        const firstInvalidSection = sectionsValidityList.indexOf(false);
-        if (firstInvalidSection !== -1) {
-            const sectionToShow = availableSections[firstInvalidSection].id;
-            this.showAdvancedConfigurationFor(sectionToShow);
-        }
     }
 
     showAdvancedConfigurationFor(sectionName: availableConfigurationSectionId) {
+        const targetSection = this.getAvailableSections().find(x => x.id === sectionName);
+        
         this.currentAdvancedSection(sectionName);
 
         const sectionConfiguration = this.databaseModel.configurationSections.find(x => x.id === sectionName);

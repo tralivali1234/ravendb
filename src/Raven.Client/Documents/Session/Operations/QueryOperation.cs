@@ -4,6 +4,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using System.Text;
+using System.Text.RegularExpressions;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Documents.Session.Tokens;
@@ -41,7 +42,7 @@ namespace Raven.Client.Documents.Session.Operations
             _indexName = indexName;
             _indexQuery = indexQuery;
             _fieldsToFetch = fieldsToFetch;
-            DisableEntitiesTracking = disableEntitiesTracking;
+            NoTracking = disableEntitiesTracking;
             _metadataOnly = metadataOnly;
             _indexEntriesOnly = indexEntriesOnly;
 
@@ -98,7 +99,7 @@ namespace Raven.Client.Documents.Session.Operations
             var queryResult = _currentQueryResults.CreateSnapshot();
             queryResult.Results.BlittableValidation();
 
-            if (DisableEntitiesTracking == false)
+            if (NoTracking == false)
                 _session.RegisterIncludes(queryResult.Includes);
 
             var list = new List<T>();
@@ -108,11 +109,19 @@ namespace Raven.Client.Documents.Session.Operations
 
                 metadata.TryGetId(out var id);
 
-                list.Add(Deserialize<T>(id, document, metadata, _fieldsToFetch, DisableEntitiesTracking, _session));
+                list.Add(Deserialize<T>(id, document, metadata, _fieldsToFetch, NoTracking, _session));
             }
 
-            if (DisableEntitiesTracking == false)
+            if (NoTracking == false)
+            {
                 _session.RegisterMissingIncludes(queryResult.Results, queryResult.Includes, queryResult.IncludedPaths);
+                if (queryResult.CounterIncludes != null)
+                {
+                    _session.RegisterCounters(
+                        queryResult.CounterIncludes,
+                        queryResult.IncludedCounterNames);
+                }
+            }
 
             return list;
         }
@@ -126,17 +135,31 @@ namespace Raven.Client.Documents.Session.Operations
             {
                 var type = typeof(T);
                 var typeInfo = type.GetTypeInfo();
+                var projectionField = fieldsToFetch.Projections[0];
+
+                if (fieldsToFetch.SourceAlias != null )
+                {
+                    if (projectionField.StartsWith(fieldsToFetch.SourceAlias))
+                    {
+                        // remove source-alias from projection name
+                        projectionField = projectionField.Substring(fieldsToFetch.SourceAlias.Length + 1);
+                    }
+                    if (Regex.IsMatch(projectionField, "'([^']*)")) 
+                    {
+                        // projection field is quoted, remove quotes
+                        projectionField = projectionField.Substring(1, projectionField.Length -2);
+                    }
+                }
+
                 if (type == typeof(string) || typeInfo.IsValueType || typeInfo.IsEnum)
                 {
-                    var projectionField = fieldsToFetch.Projections[0];
-                    T value;
-                    return document.TryGet(projectionField, out value) == false
-                        ? default(T)
+                    return document.TryGet(projectionField, out T value) == false
+                        ? default
                         : value;
                 }
 
-                if (document.TryGetMember(fieldsToFetch.Projections[0], out object inner) == false)
-                    return default(T);
+                if (document.TryGetMember(projectionField, out object inner) == false)
+                    return default;
 
                 if (fieldsToFetch.FieldsToFetch != null && fieldsToFetch.FieldsToFetch[0] == fieldsToFetch.Projections[0])
                 {
@@ -151,16 +174,22 @@ namespace Raven.Client.Documents.Session.Operations
             {
                 // we need to make an additional check, since it is possible that a value was explicitly stated
                 // for the identity property, in which case we don't want to override it.
-                object value;
                 var identityProperty = session.Conventions.GetIdentityProperty(typeof(T));
-                if (identityProperty != null && (document.TryGetMember(identityProperty.Name, out value) == false || value == null))
+                if (identityProperty != null && (document.TryGetMember(identityProperty.Name, out object value) == false || value == null))
                     session.GenerateEntityIdOnTheClient.TrySetIdentity(result, id);
             }
 
             return result;
         }
 
-        public bool DisableEntitiesTracking { get; set; }
+        [Obsolete("Use NoTracking instead")]
+        public bool DisableEntitiesTracking
+        {
+            get => NoTracking;
+            set => NoTracking = value;
+        }
+
+        public bool NoTracking { get; set; }
 
         public void EnsureIsAcceptableAndSaveResult(QueryResult result)
         {
@@ -180,9 +209,9 @@ namespace Raven.Client.Documents.Session.Operations
                 if (_indexQuery.QueryParameters != null && _indexQuery.QueryParameters.Count > 0)
                 {
                     parameters = new StringBuilder();
-                    
+
                     parameters.Append("(parameters: ");
-                    
+
                     var first = true;
 
                     foreach (var parameter in _indexQuery.QueryParameters)

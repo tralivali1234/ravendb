@@ -1,4 +1,5 @@
 ﻿@menu-width: 280px;
+@right-panel-width: 400px;
 @menu-width-collapsed: 120px;
 @navbar-height: 70px;
 @navbar-height-xs: 51px;
@@ -23,6 +24,66 @@ html {
     flex-grow: 1;
     display: flex;
     flex-direction: column;
+}
+
+.browser-alert {
+    position: absolute;
+    z-index: 9998;
+    top: 0;
+    left: 0;
+    width: 100vw;
+    height: 100vh;
+
+    .browser-message {
+        position: fixed;
+        top: 50%;
+        left: 50%;
+        transform: translateX(-50%) translateY(-50%);
+        background-color: fadeout(@gray-lighter,10%);
+        color: @gray-dark;
+        z-index: 9999;
+        text-align: center;
+        padding: @grid-gutter-width;
+        width: 380px;
+        max-width: 90%;
+        
+        .checkbox {
+            margin-top: 15px;
+        }
+
+        .browser-links {
+            margin: @grid-gutter-width -@grid-gutter-width;
+            display: flex;
+
+            a {
+                width: 50%;
+                display: block;
+                padding: @grid-gutter-width/2;
+                color: @gray-lighter;
+                font-weight: bold;
+
+                i {
+                    display: block;
+                }
+
+                &.chrome {
+                    background-color: #4885ed;
+
+                    &:hover {
+                        background-color: lighten(#4885ed,5%);
+                    }
+                }
+
+                &.firefox {
+                    background-color: #FF6611;
+
+                    &:hover {
+                        background-color: lighten(#FF6611,5%);
+                    }
+                }
+            }
+        }
+    }
 }
 
 body {
@@ -403,7 +464,7 @@ body {
             -o-transition: opacity @menu-transition-ease;
             transition: opacity @menu-transition-ease;
             display: block;
-            text-align:center;
+            text-align: center;
         }
     }
 
@@ -525,6 +586,20 @@ body {
             &:hover {
                 color: @gray-light;
             }
+        }
+    }
+
+    .server-environment {
+        background-color: @gray-darker;
+        padding: 2px @grid-gutter-width/2;
+        height: 38px;
+        margin-right: @grid-gutter-width/2;
+        line-height: 13px;
+        text-align: center;
+
+        small {
+            text-transform: uppercase;
+            font-size: 10px;
         }
     }
 
@@ -699,8 +774,21 @@ body {
                     background-color: @gray;
                 }
             }
+            
+            .database-switcher {
+                .label {
+                    opacity: 1;
+                }
+            }
 
             &.active {
+                .database-switcher {
+                    padding-right: 80px;
+                    .label {
+                        opacity: 0;
+                    }
+                }
+
                 .resources-link {
                     display: block;
                 }
@@ -740,7 +828,6 @@ body {
                 z-index: 22;
 
                 &.active {
-                    right: (@grid-gutter-width / 2);
                 }
             }
         }
@@ -753,6 +840,10 @@ body {
         }
 
         .database-list {
+            .label {
+                text-transform: uppercase;
+                width: 97px;
+            }
         }
 
         @media (min-width: @screen-md) {
@@ -809,7 +900,15 @@ body {
             position: relative;
             z-index: 20;
             cursor: pointer;
-            padding-top: 4px;
+            display: flex;
+            align-items: center;
+            padding-top: 0px;
+            padding-bottom: 0px;
+            padding-right: 40px;
+
+            .database {
+                flex-grow: 1;
+            }
 
             &:after {
                 .icon-style;
@@ -839,8 +938,8 @@ body {
         flex-grow: 1;
         margin: @grid-gutter-width;
         position: relative;
-        max-width: 1580px;
-        max-height: 789px;
+        max-width: 1700px;
+        max-height: 900px;
     }
 }
 
@@ -860,9 +959,9 @@ body {
     -moz-transition: transform @menu-transition-ease;
     -ms-transition: transform @menu-transition-ease;
     -o-transition: transform @menu-transition-ease;
-    transition: transform @menu-transition-ease;
-    width: @menu-width;
-    flex-basis: @menu-width;
+    transition: transform @menu-transition-ease;    
+    width: @right-panel-width;
+    flex-basis: @right-panel-width;
     flex-shrink:0;
 
     @media (min-width: @screen-md) {

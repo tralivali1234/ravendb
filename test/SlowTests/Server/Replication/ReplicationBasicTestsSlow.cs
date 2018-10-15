@@ -8,6 +8,7 @@ using Raven.Client.Documents.Operations.Replication;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Certificates;
+using Raven.Server.Commercial;
 using Raven.Tests.Core.Utils.Entities;
 using Xunit;
 
@@ -96,10 +97,9 @@ namespace SlowTests.Server.Replication
         [Fact]
         public async Task DisableExternalReplication()
         {
-
             using (var store1 = GetDocumentStore())
             using (var store2 = GetDocumentStore())
-            {
+            {    
                 var externalList = await SetupReplicationAsync(store1, store2);
                 using (var session = store1.OpenSession())
                 {
@@ -116,14 +116,25 @@ namespace SlowTests.Server.Replication
                 Assert.Equal("John Dow", replicated1.Name);
                 Assert.Equal(30, replicated1.Age);
 
+                var db1 = await GetDocumentDatabaseInstanceFor(store1);
+                var db2 = await GetDocumentDatabaseInstanceFor(store2);
+                var replicationConnection = db1.ReplicationLoader.OutgoingHandlers.First();
+
                 var external = new ExternalReplication(store1.Database, $"ConnectionString-{store2.Identifier}")
                 {
                     TaskId = externalList.First().TaskId,
                     Disabled = true
                 };
-                var res = await store1.Maintenance.SendAsync(new UpdateExternalReplicationOperation(external));
 
+                var res = await store1.Maintenance.SendAsync(new UpdateExternalReplicationOperation(external));
                 Assert.Equal(externalList.First().TaskId, res.TaskId);
+
+                //make sure the command is processed
+                await db1.ServerStore.Cluster.WaitForIndexNotification(res.RaftCommandIndex);
+                await db2.ServerStore.Cluster.WaitForIndexNotification(res.RaftCommandIndex);
+
+                var connectionDropped = await WaitForValueAsync(() => replicationConnection.IsConnectionDisposed, true);
+                Assert.True(connectionDropped);
                 
                 using (var session = store1.OpenSession())
                 {

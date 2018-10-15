@@ -7,6 +7,7 @@
 using Sparrow;
 using Sparrow.Binary;
 using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
@@ -56,11 +57,10 @@ namespace Voron.Impl.Journal
 
         private readonly object _writeLock = new object();
         private int _maxNumberOfPagesRequiredForCompressionBuffer;
-        
+
         internal NativeMemory.ThreadStats CurrentFlushingInProgressHolder;
 
         private readonly DisposeOnce<SingleAttempt> _disposeRunner;
-
 
         public WriteAheadJournal(StorageEnvironment env)
         {
@@ -159,7 +159,7 @@ namespace Voron.Impl.Journal
             }
 
             var oldestLogFileStillInUse = logInfo.CurrentJournal - logInfo.JournalFilesCount + 1;
-            if (_env.Options.IncrementalBackupEnabled == false)
+            if (_env.Options.IncrementalBackupEnabled == false && _env.Options.CopyOnWriteMode == false)
             {
                 // we want to check that we cleanup old log files if they aren't needed
                 // this is more just to be safe than anything else, they shouldn't be there.
@@ -193,34 +193,42 @@ namespace Voron.Impl.Journal
                         var journalReader = new JournalReader(pager, _dataPager, recoveryPager, lastSyncedTransactionId,
                             transactionHeader))
                     {
-                        journalReader.RecoverAndValidate(_env.Options);
-
-                        var lastReadHeaderPtr = journalReader.LastTransactionHeader;
-
-                        if (lastReadHeaderPtr != null)
+                        var transactionHeaders = ArrayPool<TransactionHeader>.Shared.Rent((int)journalReader.NumberOfAllocated4Kb);
+                        try
                         {
-                            *txHeader = *lastReadHeaderPtr;
-                            lastSyncedTxId = txHeader->TransactionId;
-                            lastSyncedJournal = journalNumber;
+                            var transactionCount = journalReader.RecoverAndValidate(_env.Options, transactionHeaders);
+
+                            var lastReadHeaderPtr = journalReader.LastTransactionHeader;
+
+                            if (lastReadHeaderPtr != null)
+                            {
+                                *txHeader = *lastReadHeaderPtr;
+                                lastSyncedTxId = txHeader->TransactionId;
+                                lastSyncedJournal = journalNumber;
+                            }
+
+                            pager.Dispose(); // need to close it before we open the journal writer
+
+                            if (lastSyncedTxId != -1 && (journalReader.RequireHeaderUpdate || journalNumber == logInfo.CurrentJournal))
+                            {
+                                var jrnlWriter = _env.Options.CreateJournalWriter(journalNumber,
+                                    pager.NumberOfAllocatedPages * Constants.Storage.PageSize);
+                                var jrnlFile = new JournalFile(_env, jrnlWriter, journalNumber);
+                                jrnlFile.InitFrom(journalReader, transactionHeaders, transactionCount);
+                                jrnlFile.AddRef(); // creator reference - write ahead log
+
+                                journalFiles.Add(jrnlFile);
+                            }
+
+                            if (journalReader.RequireHeaderUpdate) //this should prevent further loading of transactions
+                            {
+                                requireHeaderUpdate = true;
+                                break;
+                            }
                         }
-
-                        pager.Dispose(); // need to close it before we open the journal writer
-
-                        if (lastSyncedTxId != -1 && (journalReader.RequireHeaderUpdate || journalNumber == logInfo.CurrentJournal))
+                        finally
                         {
-                            var jrnlWriter = _env.Options.CreateJournalWriter(journalNumber,
-                                pager.NumberOfAllocatedPages * Constants.Storage.PageSize);
-                            var jrnlFile = new JournalFile(_env, jrnlWriter, journalNumber);
-                            jrnlFile.InitFrom(journalReader);
-                            jrnlFile.AddRef(); // creator reference - write ahead log
-
-                            journalFiles.Add(jrnlFile);
-                        }
-
-                        if (journalReader.RequireHeaderUpdate) //this should prevent further loading of transactions
-                        {
-                            requireHeaderUpdate = true;
-                            break;
+                            ArrayPool<TransactionHeader>.Shared.Return(transactionHeaders);
                         }
                     }
 
@@ -238,16 +246,19 @@ namespace Voron.Impl.Journal
 
             _journalIndex = lastSyncedJournal;
 
-            _headerAccessor.Modify(
-                header =>
-                {
-                    header->Journal.CurrentJournal = lastSyncedJournal;
-                    header->Journal.JournalFilesCount = _files.Count;
-                    header->IncrementalBackup.LastCreatedJournal = _journalIndex;
-                });
+            if (_env.Options.CopyOnWriteMode == false)
+            {
+                _headerAccessor.Modify(
+                    header =>
+                    {
+                        header->Journal.CurrentJournal = lastSyncedJournal;
+                        header->Journal.JournalFilesCount = _files.Count;
+                        header->IncrementalBackup.LastCreatedJournal = _journalIndex;
+                    });
 
-            CleanupInvalidJournalFiles(lastSyncedJournal);
-            CleanupUnusedJournalFiles(oldestLogFileStillInUse, lastSyncedJournal);
+                CleanupInvalidJournalFiles(lastSyncedJournal);
+                CleanupUnusedJournalFiles(oldestLogFileStillInUse, lastSyncedJournal);
+            }
 
             if (_files.Count > 0)
             {
@@ -621,7 +632,7 @@ namespace Voron.Impl.Journal
                 // we don't actually have to do that in our own transaction, what we'll do is to setup things so if there is a running
                 // write transaction, we'll piggy back on its commit to complete our process, without interrupting its work
                 _waj._env.FlushInProgressLock.EnterWriteLock();
-                _waj.CurrentFlushingInProgressHolder = NativeMemory.ThreadAllocations.Value;
+                _waj.CurrentFlushingInProgressHolder = NativeMemory.CurrentThreadStats;
 
                 try
                 {
@@ -986,7 +997,7 @@ namespace Voron.Impl.Journal
                         _currentTotalWrittenBytes = Interlocked.Read(ref _parent._totalWrittenButUnsyncedBytes);
                         _lastSyncedJournal = _parent._lastFlushedJournalId;
                         _lastSyncedTransactionId = _parent._lastFlushedTransactionId;
-                        _parent.SetLastReadTxHeader(_parent._lastFlushedJournal, _lastSyncedTransactionId, ref _transactionHeader);
+                        _parent._lastFlushedJournal.SetLastReadTxHeader(_lastSyncedTransactionId, ref _transactionHeader);
                         if (_lastSyncedTransactionId != _transactionHeader.TransactionId)
                         {
                             VoronUnrecoverableErrorException.Raise(_parent._waj._env,
@@ -1005,7 +1016,7 @@ namespace Voron.Impl.Journal
                         }
 
                         _parent._waj._env.Options.SetLastReusedJournalCountOnSync(_journalsToDelete.Count);
-                        
+
                         foreach (var kvp in _journalsToDelete)
                         {
                             _parent._journalsToDelete.Remove(kvp.Key);
@@ -1091,8 +1102,8 @@ namespace Voron.Impl.Journal
                     if (j.Number == lastProcessedJournal) // we are in the last log we synced
                     {
                         if (j.Available4Kbs != 0 || //　if there are more pages to be used here or
-                            // we didn't synchronize whole journal
-                            j.PageTranslationTable.MaxTransactionId() != lastFlushedTransactionId) 
+                                                    // we didn't synchronize whole journal
+                            j.PageTranslationTable.MaxTransactionId() != lastFlushedTransactionId)
                             continue; // do not mark it as unused
 
 
@@ -1128,37 +1139,6 @@ namespace Voron.Impl.Journal
 
                     _waj._updateLogInfo(header);
                 });
-            }
-
-            public void SetLastReadTxHeader(JournalFile file, long maxTransactionId, ref TransactionHeader lastReadTxHeader)
-            {
-                var readTxHeader = stackalloc TransactionHeader[1];
-                lastReadTxHeader.TransactionId = -1;
-                long txPos = 0;
-                while (true)
-                {
-                    if (file.ReadTransaction(txPos, readTxHeader) == false)
-                        break;
-                    if (readTxHeader->HeaderMarker != Constants.TransactionHeaderMarker)
-                        break;
-                    if (readTxHeader->TransactionId > maxTransactionId)
-                        break;
-                    if (lastReadTxHeader.TransactionId > readTxHeader->TransactionId)
-                        // we got to a trasaction that is smaller than the previous one, this is very 
-                        // likely a reused journal with old transaction, which we can ignore
-                        break;
-
-                    lastReadTxHeader = *readTxHeader;
-
-                    var totalSize = readTxHeader->CompressedSize != -1 ? readTxHeader->CompressedSize + sizeof(TransactionHeader) : readTxHeader->UncompressedSize + sizeof(TransactionHeader);
-
-
-                    var roundTo4Kb = (totalSize / (4 * Constants.Size.Kilobyte)) +
-                                     (totalSize % (4 * Constants.Size.Kilobyte) == 0 ? 0 : 1);
-
-                    // We skip to the next transaction header.
-                    txPos += roundTo4Kb * 4 * Constants.Size.Kilobyte;
-                }
             }
 
             public void Dispose()
@@ -1297,7 +1277,8 @@ namespace Voron.Impl.Journal
                     _lazyTransactionBuffer?.WriteBufferToFile(CurrentFile, tx);
                     CurrentFile = null;
                 }
-                ZeroCompressionBufferIfNeeded(tx);
+
+                ZeroCompressionBufferIfNeeded(tx); 
                 ReduceSizeOfCompressionBufferIfNeeded();
 
                 return journalEntry;
@@ -1322,7 +1303,22 @@ namespace Voron.Impl.Journal
 
             const int transactionHeaderPageOverhead = 1;
             var pagesRequired = (transactionHeaderPageOverhead + pagesCountIncludingAllOverflowPages + overheadInPages);
-            var pagerState = _compressionPager.EnsureContinuous(0, pagesRequired);
+
+            PagerState pagerState;
+            try
+            {
+                pagerState = _compressionPager.EnsureContinuous(0, pagesRequired);
+            }
+            catch (InsufficientMemoryException)
+            {
+                // RavenDB-10830: failed to lock memory of temp buffers in encrypted db, let's create new file with initial size
+
+                _compressionPager.Dispose();
+                _compressionPager = CreateCompressionPager(_env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize);
+                _lastCompressionBufferReduceCheck = DateTime.UtcNow;
+                throw;
+            }
+
             tx.EnsurePagerStateReference(pagerState);
 
             _compressionPager.EnsureMapped(tx, 0, pagesRequired);
@@ -1401,13 +1397,27 @@ namespace Voron.Impl.Journal
                 var outputBufferSize = LZ4.MaximumOutputLength(totalSizeWritten);
                 int outputBufferInPages = checked((int)((outputBufferSize + sizeof(TransactionHeader)) / Constants.Storage.PageSize +
                                                         ((outputBufferSize + sizeof(TransactionHeader)) % Constants.Storage.PageSize == 0 ? 0 : 1)));
+
                 _maxNumberOfPagesRequiredForCompressionBuffer = Math.Max(pagesRequired + outputBufferInPages, _maxNumberOfPagesRequiredForCompressionBuffer);
 
                 var totalSizeWrittenPlusTxHeader = totalSizeWritten + sizeof(TransactionHeader);
                 var pagesWritten = (totalSizeWrittenPlusTxHeader / Constants.Storage.PageSize) +
                                    (totalSizeWrittenPlusTxHeader % Constants.Storage.PageSize == 0 ? 0 : 1);
 
-                pagerState = _compressionPager.EnsureContinuous(pagesWritten, outputBufferInPages);
+                try
+                {
+                    pagerState = _compressionPager.EnsureContinuous(pagesWritten, outputBufferInPages);
+                }
+                catch (InsufficientMemoryException)
+                {
+                    // RavenDB-10830: failed to lock memory of temp buffers in encrypted db, let's create new file with initial size
+
+                    _compressionPager.Dispose();
+                    _compressionPager = CreateCompressionPager(_env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize);
+                    _lastCompressionBufferReduceCheck = DateTime.UtcNow;
+                    throw;
+                }
+
                 tx.EnsurePagerStateReference(pagerState);
                 _compressionPager.EnsureMapped(tx, pagesWritten, outputBufferInPages);
 
@@ -1471,7 +1481,7 @@ namespace Voron.Impl.Journal
                 // the AEAD method, so no need to do it twice
                 txHeader->Hash = 0;
             }
-            
+
             var prepreToWriteToJournal = new CompressedPagesResult
             {
                 Base = txHeaderPtr,
@@ -1497,7 +1507,7 @@ namespace Voron.Impl.Journal
             txHeader->Flags |= TransactionPersistenceModeFlags.Encrypted;
             ulong macLen = (ulong)Sodium.crypto_aead_xchacha20poly1305_ietf_abytes();
             var subKeyLen = Sodium.crypto_aead_xchacha20poly1305_ietf_keybytes();
-            var subKey = stackalloc byte[(int)subKeyLen ];
+            var subKey = stackalloc byte[(int)subKeyLen];
             fixed (byte* mk = _env.Options.MasterKey)
             fixed (byte* ctx = Context)
             {
@@ -1523,7 +1533,7 @@ namespace Voron.Impl.Journal
                 npub,
                 subKey
             );
-            
+
             Debug.Assert(macLen == (ulong)Sodium.crypto_aead_xchacha20poly1305_ietf_abytes());
 
             if (rc != 0)
@@ -1592,9 +1602,10 @@ namespace Voron.Impl.Journal
         private DateTime _lastCompressionBufferReduceCheck = DateTime.UtcNow;
         private CompressionAccelerationStats _lastCompressionAccelerationInfo = new CompressionAccelerationStats();
 
-        public void ReduceSizeOfCompressionBufferIfNeeded()
+        public void ReduceSizeOfCompressionBufferIfNeeded(bool forceReduce = false)
         {
-            if (!ShouldReduceSizeOfCompressionPager())
+            var initialSize = _env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize;
+            if (ShouldReduceSizeOfCompressionPager(initialSize, forceReduce) == false)
                 return;
 
             // the compression pager is too large, we probably had a big transaction and now can
@@ -1602,15 +1613,15 @@ namespace Voron.Impl.Journal
             if (_logger.IsOperationsEnabled)
             {
                 _logger.Operations(
-                    $"Compression buffer: {_compressionPager} has reached size {(_compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize) / Constants.Size.Kilobyte:#,#0} kb which is more than the limit " +
-                    $"of {_env.Options.MaxScratchBufferSize / 1024:#,#0} kb. Will trim it now to the max size allowed. If this is happen on a regular basis," +
+                    $"Compression buffer: {_compressionPager} has reached size {new Size(_compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize, SizeUnit.Bytes)} which is more than the initial size " +
+                    $"of {new Size(initialSize, SizeUnit.Bytes)}. Will trim it now to the max size allowed. If this is happen on a regular basis," +
                     " consider raising the limit (MaxScratchBufferSize option control it), since it can cause performance issues");
             }
 
             _lastCompressionBufferReduceCheck = DateTime.UtcNow;
 
             _compressionPager.Dispose();
-            _compressionPager = CreateCompressionPager(_env.Options.MaxScratchBufferSize);
+            _compressionPager = CreateCompressionPager(initialSize);
         }
 
         public void ZeroCompressionBufferIfNeeded(IPagerLevelTransactionState tx)
@@ -1619,27 +1630,30 @@ namespace Voron.Impl.Journal
                 return;
 
             var compressionBufferSize = _compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize;
+            _compressionPager.EnsureMapped(tx, 0, checked((int)_compressionPager.NumberOfAllocatedPages));
             var pagePointer = _compressionPager.AcquirePagePointer(tx, 0);
             Sodium.sodium_memzero(pagePointer, (UIntPtr)compressionBufferSize);
         }
 
-        private bool ShouldReduceSizeOfCompressionPager()
+        private bool ShouldReduceSizeOfCompressionPager(long initialSize, bool forceReduce)
         {
             var compressionBufferSize = _compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize;
-            if (compressionBufferSize <= _env.Options.MaxScratchBufferSize)
+            if (compressionBufferSize <= initialSize)
                 return false;
+
+            if (forceReduce)
+                return true;
 
             if ((DateTime.UtcNow - _lastCompressionBufferReduceCheck).TotalMinutes < 5)
                 return false;
 
-
-            // while we are above the limit, we still recently used at least half of it, no point
-            // in reducing size yet, we'll be called again
-            var shouldReduceSizeOfCompressionPager = _maxNumberOfPagesRequiredForCompressionBuffer < _compressionPager.NumberOfAllocatedPages / 2;
-            if (shouldReduceSizeOfCompressionPager)
+            if (_maxNumberOfPagesRequiredForCompressionBuffer < _compressionPager.NumberOfAllocatedPages / 2)
             {
+                // we recently used at least half of the compression buffer,
+                // no point in reducing size yet, we'll try to do it again next time
                 return true;
             }
+
             _maxNumberOfPagesRequiredForCompressionBuffer = 0;
             _lastCompressionBufferReduceCheck = DateTime.UtcNow;
             return true;
@@ -1649,10 +1663,12 @@ namespace Voron.Impl.Journal
         {
             if (Monitor.TryEnter(_writeLock) == false)
                 return;
+
             // if we can't get it, we are active, so it doesn't matter
             try
             {
-                ReduceSizeOfCompressionBufferIfNeeded();
+                // called when the storage environment was idle
+                ReduceSizeOfCompressionBufferIfNeeded(forceReduce: true);
             }
             finally
             {
@@ -1667,6 +1683,5 @@ namespace Voron.Impl.Journal
         public int NumberOf4Kbs;
         public int NumberOfUncompressedPages;
     }
-
 }
 

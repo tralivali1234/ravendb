@@ -36,6 +36,7 @@ namespace Raven.Client.Documents.Smuggler
             Identities = new Counts();
             Indexes = new Counts();
             CompareExchange = new Counts();
+            Counters = new CountsWithLastEtag();
         }
 
         public string Message { get; private set; }
@@ -108,7 +109,8 @@ namespace Raven.Client.Documents.Smuggler
             public override Counts Identities => _result.Identities;
             public override Counts Indexes => _result.Indexes;
             public override Counts CompareExchange => _result.CompareExchange;
-            
+            public override CountsWithLastEtag Counters => _result.Counters;
+
             public override DynamicJsonValue ToJson()
             {
                 var json = base.ToJson();
@@ -129,6 +131,9 @@ namespace Raven.Client.Documents.Smuggler
 
             if (Conflicts.LastEtag > lastEtag)
                 lastEtag = Conflicts.LastEtag;
+
+            if (Counters.LastEtag > lastEtag)
+                lastEtag = Counters.LastEtag;
 
             return lastEtag;
         }
@@ -152,6 +157,8 @@ namespace Raven.Client.Documents.Smuggler
         
         public virtual Counts CompareExchange { get; set; }
 
+        public virtual CountsWithLastEtag Counters { get; set; }
+
         public virtual DynamicJsonValue ToJson()
         {
             return new DynamicJsonValue(GetType())
@@ -164,6 +171,7 @@ namespace Raven.Client.Documents.Smuggler
                 [nameof(Identities)] = Identities.ToJson(),
                 [nameof(Indexes)] = Indexes.ToJson(),
                 [nameof(CompareExchange)] = CompareExchange.ToJson(),
+                [nameof(Counters)] = Counters.ToJson()
             };
         }
 
@@ -223,8 +231,8 @@ namespace Raven.Client.Documents.Smuggler
 
             public override string ToString()
             {
-                return $"Read: {ReadCount}. " +
-                       $"Errored: {ErroredCount}.";
+                return $"Read: {ReadCount:#,#;;0}. " +
+                       $"Errored: {ErroredCount:#,#;;0}.";
             }
         }
 

@@ -10,14 +10,17 @@ using Microsoft.AspNetCore.Http.Extensions;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Primitives;
+using Raven.Client;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Exceptions;
+using Raven.Client.Exceptions.Cluster;
 using Raven.Client.Exceptions.Commercial;
 using Raven.Client.Exceptions.Database;
 using Raven.Client.Exceptions.Documents;
 using Raven.Client.Exceptions.Documents.Compilation;
 using Raven.Client.Exceptions.Routing;
 using Raven.Client.Exceptions.Security;
+using Raven.Client.Properties;
 using Raven.Server.Config;
 using Raven.Server.Routing;
 using Raven.Server.TrafficWatch;
@@ -27,7 +30,6 @@ using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 using Sparrow.LowMemory;
 using Voron.Exceptions;
-using ConcurrencyException = Voron.Exceptions.ConcurrencyException;
 
 namespace Raven.Server
 {
@@ -38,7 +40,7 @@ namespace Raven.Server
         private int _requestId;
         private readonly Logger _logger = LoggingSource.Instance.GetLogger<RavenServerStartup>("Server");
 
-        public void Configure(IApplicationBuilder app, ILoggerFactory loggerfactory)
+        public void Configure(IApplicationBuilder app, ILoggerFactory loggerFactory)
         {
             app.UseWebSockets(new WebSocketOptions
             {
@@ -154,18 +156,22 @@ namespace Raven.Server
             {
                 context.Response.StatusCode = (int)HttpStatusCode.OK;
                 context.Response.Headers["Content-Type"] = "application/json; charset=utf-8";
+                context.Response.Headers[Constants.Headers.ServerVersion] = RavenVersionAttribute.Instance.AssemblyVersion;
 
                 var sp = Stopwatch.StartNew();
+
                 database = await _router.HandlePath(context, context.Request.Method, context.Request.Path.Value);
-                sp.Stop();
 
                 if (_logger.IsInfoEnabled && SkipHttpLogging == false)
                 {
                     _logger.Info($"{context.Request.Method} {context.Request.Path.Value}?{context.Request.QueryString.Value} - {context.Response.StatusCode} - {sp.ElapsedMilliseconds:#,#;;0} ms");
                 }
 
+                // check if TW has clients
                 if (TrafficWatchManager.HasRegisteredClients)
                     LogTrafficWatch(context, sp.ElapsedMilliseconds, database);
+
+                sp.Stop();
             }
             catch (Exception e)
             {
@@ -174,6 +180,13 @@ namespace Raven.Server
 
                 if (context.RequestAborted.IsCancellationRequested)
                     return;
+
+                if (context.Request.Headers.TryGetValue(Constants.Headers.ClientVersion, out var versions))
+                {
+                    var version = versions.ToString();
+                    if (version.Length > 0 && version[0] != RavenVersionAttribute.Instance.MajorVersionAsChar)
+                        e = new ClientVersionMismatchException($"RavenDB does not support interaction between Client API and Server when major version does not match. Client: {version}. Server: {RavenVersionAttribute.Instance.AssemblyVersion}", e);
+                }
 
                 MaybeSetExceptionStatusCode(context, e);
 
@@ -209,26 +222,36 @@ namespace Raven.Server
             }
         }
 
+        /// <summary>
+        /// LogTrafficWatch gets HttpContext, elapsed time and database name 
+        /// </summary>
+        /// <param name="context"></param>
+        /// <param name="elapsedMilliseconds"></param>
+        /// <param name="database"></param>
         private void LogTrafficWatch(HttpContext context, long elapsedMilliseconds, string database)
         {
-                var requestId = Interlocked.Increment(ref _requestId);
+            var requestId = Interlocked.Increment(ref _requestId);
+            var contextItem = context.Items["TrafficWatch"];
+            (string CustomInfo, TrafficWatchChangeType Type) twTuple =
+                ((string, TrafficWatchChangeType)?)contextItem ?? ("N/A", TrafficWatchChangeType.None);
 
-                var twn = new TrafficWatchChange
-                {
-                    TimeStamp = DateTime.UtcNow,
-                    RequestId = requestId, // counted only for traffic watch
-                    HttpMethod = context.Request.Method ?? "N/A", // N/A ?
-                    ElapsedMilliseconds = elapsedMilliseconds,
-                    ResponseStatusCode = context.Response.StatusCode,
-                    RequestUri = context.Request.GetEncodedUrl(),
-                    AbsoluteUri = $"{context.Request.Scheme}://{context.Request.Host}",
-                    DatabaseName = database ?? "N/A",
-                    CustomInfo = "", 
-                    InnerRequestsCount = 0, 
-                    QueryTimings = null
-                };
+            var twn = new TrafficWatchChange
+            {
+                TimeStamp = DateTime.UtcNow,
+                RequestId = requestId, // counted only for traffic watch
+                HttpMethod = context.Request.Method ?? "N/A", // N/A ?
+                ElapsedMilliseconds = elapsedMilliseconds,
+                ResponseStatusCode = context.Response.StatusCode,
+                RequestUri = context.Request.GetEncodedUrl(),
+                AbsoluteUri = $"{context.Request.Scheme}://{context.Request.Host}",
+                DatabaseName = database ?? "N/A",
+                CustomInfo = twTuple.CustomInfo,
+                Type = twTuple.Type,
+                InnerRequestsCount = 0,
+                QueryTimings = null
+            };
 
-                TrafficWatchManager.DispatchMessage(twn);
+            TrafficWatchManager.DispatchMessage(twn);
         }
 
         private void MaybeAddAdditionalExceptionData(DynamicJsonValue djv, Exception exception)
@@ -250,18 +273,18 @@ namespace Raven.Server
         private static void MaybeSetExceptionStatusCode(HttpContext httpContext, Exception exception)
         {
             var response = httpContext.Response;
-            
+
             if (response.HasStarted)
                 return;
 
             if (exception is InsufficientTransportLayerProtectionException)
             {
                 Web.RequestHandler.SetupCORSHeaders(httpContext);
-                response.StatusCode = (int) HttpStatusCode.BadRequest;
+                response.StatusCode = (int)HttpStatusCode.BadRequest;
                 return;
             }
 
-            if (exception is LowMemoryException || 
+            if (exception is LowMemoryException ||
                 exception is OutOfMemoryException ||
                 exception is VoronUnrecoverableErrorException)
             {
@@ -269,7 +292,7 @@ namespace Raven.Server
                 return;
             }
 
-            if (exception is DocumentConflictException || 
+            if (exception is DocumentConflictException ||
                 exception is ConflictException ||
                 exception is ConcurrencyException)
             {
@@ -280,7 +303,9 @@ namespace Raven.Server
             if (exception is DatabaseDisabledException ||
                 exception is DatabaseLoadFailureException ||
                 exception is DatabaseLoadTimeoutException ||
-                exception is DatabaseConcurrentLoadTimeoutException)
+                exception is DatabaseConcurrentLoadTimeoutException ||
+                exception is NodeIsPassiveException ||
+                exception is ClientVersionMismatchException)
             {
                 response.StatusCode = (int)HttpStatusCode.ServiceUnavailable;
                 return;
@@ -293,7 +318,7 @@ namespace Raven.Server
                 return;
             }
 
-            if (exception is UnauthorizedAccessException)
+            if (exception is AuthorizationException)
             {
                 response.StatusCode = (int)HttpStatusCode.Forbidden;
                 return;
@@ -314,7 +339,7 @@ namespace Raven.Server
             if (exception is DatabaseNotRelevantException)
             {
                 response.StatusCode = (int)HttpStatusCode.Gone;
-                response.Headers.Add("Cache-Control",new StringValues(new []{ "must-revalidate", "no-cache" }));
+                response.Headers.Add("Cache-Control", new StringValues(new[] { "must-revalidate", "no-cache" }));
                 return;
             }
 

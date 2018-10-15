@@ -1,9 +1,9 @@
 ﻿using System;
+using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Linq;
 using System.Text.RegularExpressions;
 using System.Threading;
-using Sparrow.Collections.LockFree;
 
 namespace Raven.Server.Documents.Indexes
 {
@@ -31,11 +31,11 @@ namespace Raven.Server.Documents.Indexes
             // so this should be called if user is using a reasonable number
             // of regex queries.
             if (_count > _halfCapacity)
-                Updatetimestamp(result);
+                UpdateTimestamp(result);
             return result.RegexLazy.Value; 
         }
 
-        private static void Updatetimestamp(ConcurrentLruRegexCacheNode result)
+        private static void UpdateTimestamp(ConcurrentLruRegexCacheNode result)
         {
             var timestamp = Stopwatch.GetTimestamp();
 
@@ -94,7 +94,7 @@ namespace Raven.Server.Documents.Indexes
                     .Take(_capacity / 4))
                 {
                     
-                    if(_regexCache.Remove(kv.Key))
+                    if(_regexCache.TryRemove(kv.Key, out _))
                         countRemoved++;
                 }
                 Interlocked.Add(ref _count, -countRemoved);

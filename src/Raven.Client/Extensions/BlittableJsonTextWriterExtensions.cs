@@ -50,15 +50,6 @@ namespace Raven.Client.Extensions
                 writer.WriteComma();
             }
 
-#if FEATURE_EXPLAIN_SCORES
-            if (query.ExplainScores)
-            {
-                writer.WritePropertyName(nameof(query.ExplainScores));
-                writer.WriteBool(query.ExplainScores);
-                writer.WriteComma();
-            }
-#endif
-
 #if FEATURE_SHOW_TIMINGS
             if (query.ShowTimings)
             {
@@ -77,7 +68,7 @@ namespace Raven.Client.Extensions
 
             writer.WritePropertyName(nameof(query.QueryParameters));
             if (query.QueryParameters != null)
-                writer.WriteObject(EntityToBlittable.ConvertEntityToBlittable(query.QueryParameters, conventions, context));
+                writer.WriteObject(EntityToBlittable.ConvertEntityToBlittable(query.QueryParameters, conventions, context, conventions.CreateSerializer(), documentInfo: null));
             else
                 writer.WriteNull();
 

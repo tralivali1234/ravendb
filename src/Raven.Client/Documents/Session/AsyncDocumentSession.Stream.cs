@@ -1,4 +1,3 @@
-using System;
 using System.IO;
 using System.Linq;
 using System.Threading;
@@ -23,6 +22,7 @@ namespace Raven.Client.Documents.Session
             private readonly IAsyncDocumentQuery<T> _query;
             private readonly FieldsToFetchToken _fieldsToFetch;
             private readonly CancellationToken _token;
+            private BlittableJsonReaderObject _prev;
 
             public YieldStream(AsyncDocumentSession parent, IAsyncDocumentQuery<T> query, FieldsToFetchToken fieldsToFetch, IAsyncEnumerator<BlittableJsonReaderObject> enumerator, CancellationToken token)
             {
@@ -42,10 +42,13 @@ namespace Raven.Client.Documents.Session
 
             public async Task<bool> MoveNextAsync()
             {
+                _prev?.Dispose(); // dispose the previous instance
                 while (true)
                 {
                     if (await _enumerator.MoveNextAsync().WithCancellation(_token).ConfigureAwait(false) == false)
                         return false;
+
+                    _prev = _enumerator.Current;
 
                     _query?.InvokeAfterStreamExecuted(_enumerator.Current);
 
@@ -73,17 +76,17 @@ namespace Raven.Client.Documents.Session
             }
         }
 
-        public Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(IAsyncRawDocumentQuery<T> query, CancellationToken token = new CancellationToken())
+        public Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(IAsyncRawDocumentQuery<T> query, CancellationToken token = default)
         {
             return StreamAsync((IAsyncDocumentQuery<T>)query, token);
         }
 
-        public Task StreamIntoAsync<T>(IAsyncRawDocumentQuery<T> query, Stream output, CancellationToken token = new CancellationToken())
+        public Task StreamIntoAsync<T>(IAsyncRawDocumentQuery<T> query, Stream output, CancellationToken token = default)
         {
             return StreamIntoAsync((IAsyncDocumentQuery<T>)query, output, token);
         }
 
-        public async Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(IAsyncDocumentQuery<T> query, CancellationToken token = default(CancellationToken))
+        public async Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(IAsyncDocumentQuery<T> query, CancellationToken token = default)
         {
             var documentQuery = (AsyncDocumentQuery<T>)query;
             var fieldsToFetch = documentQuery.FieldsToFetchToken;
@@ -95,11 +98,11 @@ namespace Raven.Client.Documents.Session
             var result = streamOperation.SetResultAsync(command.Result);
 
             var queryOperation = ((AsyncDocumentQuery<T>)query).InitializeQueryOperation();
-            queryOperation.DisableEntitiesTracking = true;
+            queryOperation.NoTracking = true;
             return new YieldStream<T>(this, query, fieldsToFetch, result, token);
         }
 
-        public Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(IQueryable<T> query, CancellationToken token = default(CancellationToken))
+        public Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(IQueryable<T> query, CancellationToken token = default)
         {
             var queryInspector = (IRavenQueryProvider)query.Provider;
             var indexQuery = queryInspector.ToAsyncDocumentQuery<T>(query.Expression);
@@ -107,7 +110,7 @@ namespace Raven.Client.Documents.Session
         }
 
         public async Task<IAsyncEnumerator<StreamResult<T>>> StreamAsync<T>(string startsWith, string matches = null, int start = 0,
-                                   int pageSize = Int32.MaxValue, string startAfter = null, CancellationToken token = default(CancellationToken))
+                                   int pageSize = int.MaxValue, string startAfter = null, CancellationToken token = default)
         {
             var streamOperation = new StreamOperation(this);
             var command = streamOperation.CreateRequest(startsWith, matches, start, pageSize, null, startAfter);
@@ -116,7 +119,7 @@ namespace Raven.Client.Documents.Session
             return new YieldStream<T>(this, null, null, result, token);
         }
 
-        public async Task StreamIntoAsync<T>(IAsyncDocumentQuery<T> query, Stream output, CancellationToken token = default(CancellationToken))
+        public async Task StreamIntoAsync<T>(IAsyncDocumentQuery<T> query, Stream output, CancellationToken token = default)
         {
             var streamOperation = new StreamOperation(this);
             var command = streamOperation.CreateRequest(query.GetIndexQuery());

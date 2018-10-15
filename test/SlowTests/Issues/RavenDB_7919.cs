@@ -39,6 +39,11 @@ namespace SlowTests.Issues
                     await database.QueryRunner.ExecuteQuery(new IndexQueryServerSide("from Users where LastName = 'Arek'"), context, null,
                         OperationCancelToken.None);
                 }
+
+                var sameIndex = database.IndexStore.GetIndex(autoIndex.Name);
+
+                Assert.Same(autoIndex, sameIndex);
+                Assert.Equal(IndexState.Normal, sameIndex.State);
             }
         }
 
@@ -61,7 +66,7 @@ namespace SlowTests.Issues
 
                 var dynamicQuery = DynamicQueryMapping.Create(new IndexQueryServerSide("from Users where FirstName = 'Arek'"));
 
-                var result = matcher.Match(dynamicQuery);
+                var result = matcher.Match(dynamicQuery, null);
 
                 Assert.Equal(DynamicQueryMatchType.CompleteButIdle, result.MatchType);
             }
@@ -94,7 +99,7 @@ namespace SlowTests.Issues
 
                 var dynamicQuery = DynamicQueryMapping.Create(new IndexQueryServerSide("from Users group by Location select count()"));
 
-                var result = matcher.Match(dynamicQuery);
+                var result = matcher.Match(dynamicQuery, null);
 
                 Assert.Equal(DynamicQueryMatchType.CompleteButIdle, result.MatchType);
             }

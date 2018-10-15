@@ -4,7 +4,11 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
+using Raven.Client.Documents.Linq;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Queries.Explanation;
+using Raven.Client.Documents.Queries.Highlighting;
+using Raven.Client.Documents.Queries.Timings;
 using Raven.Client.Documents.Session.Operations.Lazy;
 using Raven.Client.Documents.Session.Tokens;
 using Raven.Client.Util;
@@ -15,7 +19,7 @@ namespace Raven.Client.Documents.Session
     /// <summary>
     /// A query against a Raven index
     /// </summary>
-    public partial class DocumentQuery<T> : AbstractDocumentQuery<T, DocumentQuery<T>>, IDocumentQuery<T>, IRawDocumentQuery<T>
+    public partial class DocumentQuery<T> : AbstractDocumentQuery<T, DocumentQuery<T>>, IDocumentQuery<T>, IRawDocumentQuery<T>, IDocumentQueryGenerator
     {
         /// <summary>
         /// Initializes a new instance of the <see cref="DocumentQuery{T}"/> class.
@@ -55,14 +59,19 @@ namespace Raven.Client.Documents.Session
             return this;
         }
 
-#if FEATURE_EXPLAIN_SCORES
         /// <inheritdoc />
-        public IDocumentQuery<T> ExplainScores()
+        IDocumentQuery<T> IDocumentQueryBase<T, IDocumentQuery<T>>.IncludeExplanations(out Explanations explanations)
         {
-            ShouldExplainScores = true;
+            IncludeExplanations(null, out explanations);
             return this;
         }
-#endif
+
+        /// <inheritdoc />
+        IDocumentQuery<T> IDocumentQueryBase<T, IDocumentQuery<T>>.IncludeExplanations(ExplanationOptions options, out Explanations explanations)
+        {
+            IncludeExplanations(options, out explanations);
+            return this;
+        }
 
         /// <inheritdoc />
         public IDocumentQuery<TProjection> SelectFields<TProjection>(params string[] fields)
@@ -266,21 +275,19 @@ namespace Raven.Client.Documents.Session
             return this;
         }
 
-#if FEATURE_SHOW_TIMINGS
         /// <inheritdoc />
-        IDocumentQuery<T> IQueryBase<T, IDocumentQuery<T>>.ShowTimings()
+        IDocumentQuery<T> IQueryBase<T, IDocumentQuery<T>>.Timings(out QueryTimings timings)
         {
-            ShowTimings();
+            IncludeTimings(out timings);
             return this;
         }
 
         /// <inheritdoc />
-        IRawDocumentQuery<T> IQueryBase<T, IRawDocumentQuery<T>>.ShowTimings()
+        IRawDocumentQuery<T> IQueryBase<T, IRawDocumentQuery<T>>.Timings(out QueryTimings timings)
         {
-            ShowTimings();
+            IncludeTimings(out timings);
             return this;
         }
-#endif
 
         /// <inheritdoc />
         IDocumentQuery<T> IDocumentQueryBase<T, IDocumentQuery<T>>.Include(string path)
@@ -345,7 +352,14 @@ namespace Raven.Client.Documents.Session
         /// <inheritdoc />
         IDocumentQuery<T> IFilterDocumentQueryBase<T, IDocumentQuery<T>>.WhereLucene(string fieldName, string whereClause)
         {
-            WhereLucene(fieldName, whereClause);
+            WhereLucene(fieldName, whereClause, exact: false);
+            return this;
+        }
+
+        /// <inheritdoc />
+        IDocumentQuery<T> IFilterDocumentQueryBase<T, IDocumentQuery<T>>.WhereLucene(string fieldName, string whereClause, bool exact)
+        {
+            WhereLucene(fieldName, whereClause, exact);
             return this;
         }
 
@@ -647,7 +661,8 @@ namespace Raven.Client.Documents.Session
         /// <inheritdoc />
         IDocumentQuery<T> IDocumentQueryBase<T, IDocumentQuery<T>>.OrderBy<TValue>(Expression<Func<T, TValue>> propertySelector)
         {
-            OrderBy(GetMemberQueryPathForOrderBy(propertySelector), OrderingUtil.GetOrderingOfType(propertySelector.ReturnType));
+            var rangeType = Conventions.GetRangeType(propertySelector.ReturnType);
+            OrderBy(GetMemberQueryPathForOrderBy(propertySelector), OrderingUtil.GetOrderingFromRangeType(rangeType));
             return this;
         }
 
@@ -663,7 +678,8 @@ namespace Raven.Client.Documents.Session
         {
             foreach (var item in propertySelectors)
             {
-                OrderBy(GetMemberQueryPathForOrderBy(item), OrderingUtil.GetOrderingOfType(item.ReturnType));
+                var rangeType = Conventions.GetRangeType(item.ReturnType);
+                OrderBy(GetMemberQueryPathForOrderBy(item), OrderingUtil.GetOrderingFromRangeType(rangeType));
             }
             return this;
         }
@@ -678,7 +694,8 @@ namespace Raven.Client.Documents.Session
         /// <inheritdoc />
         IDocumentQuery<T> IDocumentQueryBase<T, IDocumentQuery<T>>.OrderByDescending<TValue>(Expression<Func<T, TValue>> propertySelector)
         {
-            OrderByDescending(GetMemberQueryPathForOrderBy(propertySelector), OrderingUtil.GetOrderingOfType(propertySelector.ReturnType));
+            var rangeType = Conventions.GetRangeType(propertySelector.ReturnType);
+            OrderByDescending(GetMemberQueryPathForOrderBy(propertySelector), OrderingUtil.GetOrderingFromRangeType(rangeType));
             return this;
         }
 
@@ -694,7 +711,8 @@ namespace Raven.Client.Documents.Session
         {
             foreach (var item in propertySelectors)
             {
-                OrderByDescending(GetMemberQueryPathForOrderBy(item), OrderingUtil.GetOrderingOfType(item.ReturnType));
+                var rangeType = Conventions.GetRangeType(item.ReturnType);
+                OrderByDescending(GetMemberQueryPathForOrderBy(item), OrderingUtil.GetOrderingFromRangeType(rangeType));
             }
 
             return this;
@@ -845,7 +863,9 @@ namespace Raven.Client.Documents.Session
                         .Select(x => x == identityProperty.Name ? Constants.Documents.Indexing.Fields.DocumentIdFieldName : x)
                         .ToArray();
 
-                newFieldsToFetch = FieldsToFetchToken.Create(fields, queryData.Projections.ToArray(), queryData.IsCustomFunction);
+                GetSourceAliasIfExists(queryData, fields, out var sourceAlias);
+
+                newFieldsToFetch = FieldsToFetchToken.Create(fields, queryData.Projections.ToArray(), queryData.IsCustomFunction, sourceAlias);
             }
             else
                 newFieldsToFetch = null;
@@ -864,40 +884,86 @@ namespace Raven.Client.Documents.Session
             {
                 QueryRaw = QueryRaw,
                 PageSize = PageSize,
-                SelectTokens = SelectTokens,
+                SelectTokens = new LinkedList<QueryToken>(SelectTokens),
                 FieldsToFetchToken = FieldsToFetchToken,
-                WhereTokens = WhereTokens,
-                OrderByTokens = OrderByTokens,
-                GroupByTokens = GroupByTokens,
-                QueryParameters = QueryParameters,
+                WhereTokens = new LinkedList<QueryToken>(WhereTokens),
+                OrderByTokens = new LinkedList<QueryToken>(OrderByTokens),
+                GroupByTokens = new LinkedList<QueryToken>(GroupByTokens),
+                QueryParameters = new Parameters(QueryParameters),
                 Start = Start,
                 Timeout = Timeout,
                 QueryStats = QueryStats,
                 TheWaitForNonStaleResults = TheWaitForNonStaleResults,
                 Negate = Negate,
-                Includes = new HashSet<string>(Includes),
+                DocumentIncludes = new HashSet<string>(DocumentIncludes),
+                CounterIncludesTokens = CounterIncludesTokens,
                 RootTypes = { typeof(T) },
                 BeforeQueryExecutedCallback = BeforeQueryExecutedCallback,
                 AfterQueryExecutedCallback = AfterQueryExecutedCallback,
                 AfterStreamExecutedCallback = AfterStreamExecutedCallback,
-#if FEATURE_HIGHLIGHTING
-                HighlightedFields = new List<HighlightedField>(HighlightedFields),
-                HighlighterPreTags = HighlighterPreTags,
-                HighlighterPostTags = HighlighterPostTags,
-#endif
+                HighlightingTokens = HighlightingTokens,
+                QueryHighlightings = QueryHighlightings,
                 DisableEntitiesTracking = DisableEntitiesTracking,
                 DisableCaching = DisableCaching,
-#if FEATURE_SHOW_TIMINGS
-                ShowQueryTimings = ShowQueryTimings,
-#endif
-#if FEATURE_EXPLAIN_SCORES
-                ShouldExplainScores = ShouldExplainScores,
-#endif
+                QueryTimings = QueryTimings,
+                Explanations = Explanations,
+                ExplanationToken = ExplanationToken,
                 IsIntersect = IsIntersect,
                 DefaultOperator = DefaultOperator
             };
 
             return query;
+        }
+
+        public IRavenQueryable<T> ToQueryable()
+        {
+            var type = typeof(T);
+
+            var queryStatistics = new QueryStatistics();
+            var highlightings = new LinqQueryHighlightings();
+
+            var ravenQueryInspector = new RavenQueryInspector<T>();
+            var ravenQueryProvider = new RavenQueryProvider<T>(
+                this,
+                IndexName,
+                CollectionName,
+                type,
+                queryStatistics,
+                highlightings,
+                IsGroupBy,
+                Conventions);
+
+            ravenQueryInspector.Init(ravenQueryProvider,
+                queryStatistics,
+                highlightings,
+                IndexName,
+                CollectionName,
+                null,
+                TheSession,
+                IsGroupBy);
+
+            return ravenQueryInspector;
+        }
+
+        InMemoryDocumentSessionOperations IDocumentQueryGenerator.Session => TheSession;
+
+        RavenQueryInspector<TS> IDocumentQueryGenerator.CreateRavenQueryInspector<TS>()
+        {
+            return ((IDocumentQueryGenerator)Session).CreateRavenQueryInspector<TS>();
+        }
+
+        public IDocumentQuery<TResult> Query<TResult>(string indexName, string collectionName, bool isMapReduce)
+        {
+            if (indexName != IndexName || collectionName != CollectionName)
+                throw new InvalidOperationException(
+                    $"DocumentQuery source has (index name: {IndexName}, collection: {CollectionName}), but got request for (index name: {indexName}, collection: {collectionName}), you cannot change the index name / collection when using DocumentQuery as the source");
+
+            return SelectFields<TResult>();
+        }
+
+        public IAsyncDocumentQuery<TResult> AsyncQuery<TResult>(string indexName, string collectionName, bool isMapReduce)
+        {
+            throw new NotSupportedException("Cannot create an async LINQ query from DocumentQuery, you need to use AsyncDocumentQuery for that");
         }
     }
 }

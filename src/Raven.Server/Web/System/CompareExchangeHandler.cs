@@ -41,9 +41,8 @@ namespace Raven.Server.Web.System
             var start = GetStart();
             var pageSize = GetPageSize();
 
-            var prefix = Database.Name + "/";
             var startsWithKey = GetStringQueryString("startsWith", false);
-            var items = ServerStore.Cluster.GetCompareExchangeValuesStartsWith(context, Database.Name, prefix + startsWithKey, start, pageSize);
+            var items = ServerStore.Cluster.GetCompareExchangeValuesStartsWith(context, Database.Name, CompareExchangeCommandBase.GetActualKey(Database.Name, startsWithKey), start, pageSize);
 
             var numberOfResults = 0;
             using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
@@ -78,13 +77,12 @@ namespace Raven.Server.Web.System
         
         private void GetCompareExchangeValuesByKey(TransactionOperationContext context, StringValues keys)
         {
-            var prefix = Database.Name + "/";
             var sw = Stopwatch.StartNew();
 
             var items = new List<(string Key, long Index, BlittableJsonReaderObject Value)>(keys.Count);
             foreach (var key in keys)
             {
-                var item = ServerStore.Cluster.GetCompareExchangeValue(context, prefix + key);
+                var item = ServerStore.Cluster.GetCompareExchangeValue(context, CompareExchangeCommandBase.GetActualKey(Database.Name, key));
                 if (item.Value == null && keys.Count == 1)
                 {
                     HttpContext.Response.StatusCode = (int)HttpStatusCode.NotFound;
@@ -122,8 +120,7 @@ namespace Raven.Server.Web.System
         [RavenAction("/databases/*/cmpxchg", "PUT", AuthorizationStatus.ValidUser)]
         public async Task PutCompareExchangeValue()
         {
-            var prefix = Database.Name + "/";
-            var key = prefix + GetStringQueryString("key");
+            var key = GetStringQueryString("key");
 
             // ReSharper disable once PossibleInvalidOperationException
             var index = GetLongQueryString("index", true).Value;
@@ -133,19 +130,19 @@ namespace Raven.Server.Web.System
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
                 var updateJson = await context.ReadForMemoryAsync(RequestBodyStream(), "read-unique-value");
-                var command = new AddOrUpdateCompareExchangeCommand(key, updateJson, index, context);
+                var command = new AddOrUpdateCompareExchangeCommand(Database.Name, key, updateJson, index, context);
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
-                    (var raftIndex, var res) = await ServerStore.SendToLeaderAsync(command);
+                    (var raftIndex, var response) = await ServerStore.SendToLeaderAsync(context, command);
                     await ServerStore.Cluster.WaitForIndexNotification(raftIndex);
                     using (context.OpenReadTransaction())
                     {
-                        var tuple = (AddOrUpdateCompareExchangeCommand.CompareExchangeResult)res;
+                        var result = (CompareExchangeCommandBase.CompareExchangeResult)response;
                         context.Write(writer, new DynamicJsonValue
                         {
-                            [nameof(CompareExchangeResult<object>.Index)] = tuple.Index,
-                            [nameof(CompareExchangeResult<object>.Value)] = tuple.Value,
-                            [nameof(CompareExchangeResult<object>.Successful)] = tuple.Index == raftIndex
+                            [nameof(CompareExchangeResult<object>.Index)] = result.Index,
+                            [nameof(CompareExchangeResult<object>.Value)] = result.Value,
+                            [nameof(CompareExchangeResult<object>.Successful)] = result.Index == raftIndex
                         });
                     }
                 }
@@ -155,8 +152,7 @@ namespace Raven.Server.Web.System
         [RavenAction("/databases/*/cmpxchg", "DELETE", AuthorizationStatus.ValidUser)]
         public async Task DeleteCompareExchangeValue()
         {
-            var prefix = Database.Name + "/";
-            var key = prefix + GetStringQueryString("key");
+            var key = GetStringQueryString("key");
 
             // ReSharper disable once PossibleInvalidOperationException
             var index = GetLongQueryString("index", true).Value;
@@ -165,19 +161,19 @@ namespace Raven.Server.Web.System
 
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
-                var command = new RemoveCompareExchangeCommand(key, index, context);
+                var command = new RemoveCompareExchangeCommand(Database.Name, key, index, context);
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
-                    (var raftIndex, var res) = await ServerStore.SendToLeaderAsync(command);
+                    (var raftIndex, var response) = await ServerStore.SendToLeaderAsync(context, command);
                     await ServerStore.Cluster.WaitForIndexNotification(raftIndex);
                     using (context.OpenReadTransaction())
                     {
-                        var tuple = (AddOrUpdateCompareExchangeCommand.CompareExchangeResult)res;
+                        var result = (CompareExchangeCommandBase.CompareExchangeResult)response;
                         context.Write(writer, new DynamicJsonValue
                         {
-                            [nameof(CompareExchangeResult<object>.Index)] = tuple.Index,
-                            [nameof(CompareExchangeResult<object>.Value)] = tuple.Value,
-                            [nameof(CompareExchangeResult<object>.Successful)] = tuple.Index == raftIndex
+                            [nameof(CompareExchangeResult<object>.Index)] = result.Index,
+                            [nameof(CompareExchangeResult<object>.Value)] = result.Value,
+                            [nameof(CompareExchangeResult<object>.Successful)] = result.Index == raftIndex
                         });
                     }
                 }

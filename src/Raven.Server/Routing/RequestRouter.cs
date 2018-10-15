@@ -7,18 +7,24 @@
 using System;
 using System.Collections.Generic;
 using System.Net;
-using System.Threading.Tasks;
-using Microsoft.AspNetCore.Http;
-using Raven.Server.Documents;
 using System.Threading;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections.Features;
+using Microsoft.AspNetCore.Http;
 using Microsoft.AspNetCore.Http.Features.Authentication;
 using Microsoft.Extensions.Primitives;
+using Raven.Client;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Routing;
+using Raven.Client.Properties;
 using Raven.Client.Util;
+using Raven.Server.Documents;
+using Raven.Server.ServerWide;
 using Raven.Server.Utils;
 using Raven.Server.Web;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Logging;
 
 namespace Raven.Server.Routing
 {
@@ -27,7 +33,6 @@ namespace Raven.Server.Routing
         private readonly Trie<RouteInformation> _trie;
         private readonly RavenServer _ravenServer;
         private readonly MetricCounters _serverMetrics;
-
         public List<RouteInformation> AllRoutes;
 
         public RequestRouter(Dictionary<string, RouteInformation> routes, RavenServer ravenServer)
@@ -50,7 +55,11 @@ namespace Raven.Server.Routing
         {
             var tryMatch = _trie.TryMatch(method, path);
             if (tryMatch.Value == null)
-                throw new RouteNotFoundException($"There is no handler for path: {method} {path}{context.Request.QueryString}");
+            {
+                var exception = new RouteNotFoundException($"There is no handler for path: {method} {path}{context.Request.QueryString}");
+                AssertClientVersion(context, exception);
+                throw exception;
+            }
 
             var reqCtx = new RequestHandlerContext
             {
@@ -66,52 +75,131 @@ namespace Raven.Server.Routing
             _serverMetrics.Requests.RequestsPerSec.Mark();
 
             Interlocked.Increment(ref _serverMetrics.Requests.ConcurrentRequestsCount);
-            _ravenServer.Statistics.LastRequestTime = SystemTime.UtcNow;
 
-            if (handler == null)
+            try
             {
-                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                using (var ctx = JsonOperationContext.ShortTermSingleUse())
-                using (var writer = new BlittableJsonTextWriter(ctx, context.Response.Body))
+                _ravenServer.Statistics.LastRequestTime = SystemTime.UtcNow;
+
+                if (handler == null)
                 {
-                    ctx.Write(writer,
-                        new DynamicJsonValue
-                        {
-                            ["Type"] = "Error",
-                            ["Message"] = $"There is no handler for {context.Request.Method} {context.Request.Path}"
-                        });
+                    var auditLog = LoggingSource.AuditLog.IsInfoEnabled ? LoggingSource.AuditLog.GetLogger("RequestRouter", "Audit") : null;
+
+                    if (auditLog != null)
+                    {
+                        auditLog.Info($"Invalid request {context.Request.Method} {context.Request.Path} by " +
+                            $"(Cert: {context.Connection.ClientCertificate?.Subject} ({context.Connection.ClientCertificate?.Thumbprint}) {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort})");
+                    }
+
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    using (var ctx = JsonOperationContext.ShortTermSingleUse())
+                    using (var writer = new BlittableJsonTextWriter(ctx, context.Response.Body))
+                    {
+                        ctx.Write(writer,
+                            new DynamicJsonValue
+                            {
+                                ["Type"] = "Error",
+                                ["Message"] = $"There is no handler for {context.Request.Method} {context.Request.Path}"
+                            });
+                    }
+                    return null;
                 }
-                return null;
-            }
 
-            if (_ravenServer.Configuration.Security.AuthenticationEnabled)
-            {
-                var authResult = TryAuthorize(tryMatch.Value, context, reqCtx.Database);
-                if (authResult == false)
-                    return reqCtx.Database?.Name;
-            }
+                if (_ravenServer.Configuration.Security.AuthenticationEnabled)
+                {
+                    var authResult = TryAuthorize(tryMatch.Value, context, reqCtx.Database);
+                    if (authResult == false)
+                        return reqCtx.Database?.Name;
+                }
 
-            if (reqCtx.Database != null)
-            {
-                using (reqCtx.Database.DatabaseInUse(tryMatch.Value.SkipUsagesCount))
+                if (reqCtx.Database != null)
+                {
+                    using (reqCtx.Database.DatabaseInUse(tryMatch.Value.SkipUsagesCount))
+                    {
+                        if (reqCtx.HttpContext.Response.Headers.TryGetValue(Constants.Headers.LastKnownClusterTransactionIndex, out var value)
+                            && long.TryParse(value, out var index)
+                            && index < reqCtx.Database.RachisLogIndexNotifications.LastModifiedIndex)
+                        {
+                            await reqCtx.Database.RachisLogIndexNotifications.WaitForIndexNotification(index, reqCtx.HttpContext.RequestAborted);
+                        }
+
+                        await handler(reqCtx);
+                    }
+                }
+                else
+                {
                     await handler(reqCtx);
+                }
             }
-            else
+            finally
             {
-                await handler(reqCtx);
+                Interlocked.Decrement(ref _serverMetrics.Requests.ConcurrentRequestsCount);
             }
-
-            Interlocked.Decrement(ref _serverMetrics.Requests.ConcurrentRequestsCount);
 
             return reqCtx.Database?.Name;
+        }
+
+        public static void AssertClientVersion(HttpContext context, Exception innerException)
+        {
+            // client in this context could be also a follower sending a command to his leader.
+            if (context.Request.Headers.TryGetValue(Constants.Headers.ClientVersion, out var versionHeader) &&
+                Version.TryParse(versionHeader, out var clientVersion))
+            {
+                var currentServerVersion = RavenVersionAttribute.Instance;
+
+                if (currentServerVersion.MajorVersion != clientVersion.Major || currentServerVersion.BuildVersion < clientVersion.Revision || currentServerVersion.BuildVersion == ServerVersion.DevBuildNumber || (clientVersion.Revision >= 40 && clientVersion.Revision < 50))
+                {
+                    throw new ClientVersionMismatchException(
+                        $"Failed to make a request from a newer client with build version {clientVersion} to an older server with build version {RavenVersionAttribute.Instance.AssemblyVersion}.{Environment.NewLine}" +
+                        $"Upgrading this node might fix this issue.",
+                        innerException);
+                }
+            }
         }
 
         private bool TryAuthorize(RouteInformation route, HttpContext context, DocumentDatabase database)
         {
             var feature = context.Features.Get<IHttpAuthenticationFeature>() as RavenServer.AuthenticateConnection;
 
-            var authenticationStatus = feature?.Status;
+            if (feature.WrittenToAuditLog == 0) // intentionally racy, we'll check it again later
+            {
+                var auditLog = LoggingSource.AuditLog.IsInfoEnabled ? LoggingSource.AuditLog.GetLogger("RequestRouter", "Audit") : null;
 
+                if (auditLog != null)
+                {
+                    // only one thread will win it, technically, there can't really be threading
+                    // here, because there is a single connection, but better to be safe
+                    if (Interlocked.CompareExchange(ref feature.WrittenToAuditLog, 1, 0) == 0)
+                    {
+                        if (feature.WrongProtocolMessage != null)
+                        {
+                            auditLog.Info($"Connection from {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} " +
+                                $"used the wrong protocol and will be rejected. {feature.WrongProtocolMessage}");
+                        }
+                        else
+                        {
+                            auditLog.Info($"Connection from {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} " +
+                                $"with certificate '{feature.Certificate?.Subject} ({feature.Certificate?.Thumbprint})', status: {feature.StatusForAudit}, " +
+                                $"databases: [{string.Join(", ", feature.AuthorizedDatabases.Keys)}]");
+
+                            var conLifetime = context.Features.Get<IConnectionLifetimeFeature>();
+                            if(conLifetime != null)
+                            {
+                                var msg = $"Connection {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} closed. Was used with: " +
+                                 $"with certificate '{feature.Certificate?.Subject} ({feature.Certificate?.Thumbprint})', status: {feature.StatusForAudit}, " +
+                                 $"databases: [{string.Join(", ", feature.AuthorizedDatabases.Keys)}]";
+
+                                conLifetime.ConnectionClosed.Register(() =>
+                                {
+                                    auditLog.Info(msg);
+                                });
+                            }
+
+                        }
+                    }
+                }
+            }
+
+            var authenticationStatus = feature?.Status;
             switch (route.AuthorizationStatus)
             {
                 case AuthorizationStatus.UnauthenticatedClients:
@@ -126,11 +214,11 @@ namespace Raven.Server.Routing
                             case RavenServer.AuthenticationStatus.NotYetValid:
                             case RavenServer.AuthenticationStatus.None:
                             case RavenServer.AuthenticationStatus.UnfamiliarCertificate:
-                                UnlikelyFailAuthorization(context, database?.Name, feature);
+                                UnlikelyFailAuthorization(context, database?.Name, feature, route.AuthorizationStatus);
                                 return false;
                         }
                     }
-                    
+
                     return true;
                 case AuthorizationStatus.ClusterAdmin:
                 case AuthorizationStatus.Operator:
@@ -145,7 +233,7 @@ namespace Raven.Server.Routing
                         case RavenServer.AuthenticationStatus.NotYetValid:
                         case RavenServer.AuthenticationStatus.None:
                         case RavenServer.AuthenticationStatus.UnfamiliarCertificate:
-                            UnlikelyFailAuthorization(context, database?.Name, feature);
+                            UnlikelyFailAuthorization(context, database?.Name, feature, route.AuthorizationStatus);
                             return false;
                         case RavenServer.AuthenticationStatus.Allowed:
                             if (route.AuthorizationStatus == AuthorizationStatus.Operator || route.AuthorizationStatus == AuthorizationStatus.ClusterAdmin)
@@ -153,7 +241,6 @@ namespace Raven.Server.Routing
 
                             if (database == null)
                                 return true;
-
                             if (feature.CanAccess(database.Name, route.AuthorizationStatus == AuthorizationStatus.DatabaseAdmin))
                                 return true;
 
@@ -178,10 +265,14 @@ namespace Raven.Server.Routing
             throw new ArgumentOutOfRangeException("Unknown route auth status: " + route.AuthorizationStatus);
         }
 
-        public void UnlikelyFailAuthorization(HttpContext context, string database, RavenServer.AuthenticateConnection feature)
+        public void UnlikelyFailAuthorization(HttpContext context, string database,
+            RavenServer.AuthenticateConnection feature,
+            AuthorizationStatus authorizationStatus)
         {
             string message;
-            if (feature == null || feature.Status == RavenServer.AuthenticationStatus.None || feature.Status == RavenServer.AuthenticationStatus.NoCertificateProvided)
+            if (feature == null ||
+                feature.Status == RavenServer.AuthenticationStatus.None ||
+                feature.Status == RavenServer.AuthenticationStatus.NoCertificateProvided)
             {
                 message = "This server requires client certificate for authentication, but none was provided by the client.";
             }
@@ -192,6 +283,8 @@ namespace Raven.Server.Routing
                     name = feature.Certificate.Subject;
                 if (string.IsNullOrWhiteSpace(name))
                     name = feature.Certificate.ToString(false);
+
+                name += "(Thumbprint: " + feature.Certificate.Thumbprint + ")";
 
                 if (feature.Status == RavenServer.AuthenticationStatus.UnfamiliarCertificate)
                 {
@@ -218,6 +311,19 @@ namespace Raven.Server.Routing
                     message = "Access to the server was denied.";
                 }
             }
+            switch (authorizationStatus)
+            {
+                case AuthorizationStatus.ClusterAdmin:
+                    message += " ClusterAdmin access is required but not given to this certificate";
+                    break;
+                case AuthorizationStatus.Operator:
+                    message += " Operator/ClusterAdmin access is required but not given to this certificate";
+                    break;
+                case AuthorizationStatus.DatabaseAdmin:
+                    message += " DatabaseAdmin access is required but not given to this certificate";
+                    break;
+            }
+
             context.Response.StatusCode = (int)HttpStatusCode.Forbidden;
             using (var ctx = JsonOperationContext.ShortTermSingleUse())
             using (var writer = new BlittableJsonTextWriter(ctx, context.Response.Body))

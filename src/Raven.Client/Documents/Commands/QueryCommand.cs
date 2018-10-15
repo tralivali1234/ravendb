@@ -47,7 +47,7 @@ namespace Raven.Client.Documents.Commands
         {
             CanCache = _indexQuery.DisableCaching == false;
 
-            // we won't allow aggresive caching of queries with WaitForNonStaleResults
+            // we won't allow aggressive caching of queries with WaitForNonStaleResults
             CanCacheAggressively = CanCache && _indexQuery.WaitForNonStaleResults == false;
 
             var path = new StringBuilder(node.Url)
@@ -103,7 +103,14 @@ namespace Raven.Client.Documents.Commands
             Result = JsonDeserializationClient.QueryResult(response);
 
             if (fromCache)
+            {
                 Result.DurationInMs = -1;
+                if (Result.Timings != null)
+                {
+                    Result.Timings.DurationInMs = -1;
+                    Result.Timings = null;
+                }
+            }
         }
 
         public override bool IsReadRequest => true;

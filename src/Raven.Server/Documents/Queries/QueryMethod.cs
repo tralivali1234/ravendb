@@ -83,6 +83,24 @@ namespace Raven.Server.Documents.Queries
             if (string.Equals(methodName, "array", StringComparison.OrdinalIgnoreCase))
                 return MethodType.Array;
 
+            if (string.Equals(methodName, "highlight", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Highlight;
+
+            if (string.Equals(methodName, "explanations", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Explanation;
+
+            if (string.Equals(methodName, "timings", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Timings;
+
+            if (string.Equals(methodName, "counters", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Counters;
+
+            if (string.Equals(methodName, "fuzzy", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Fuzzy;
+
+            if (string.Equals(methodName, "proximity", StringComparison.OrdinalIgnoreCase))
+                return MethodType.Proximity;
+
             if (throwIfNoMatch == false)
                 return MethodType.Unknown;
 

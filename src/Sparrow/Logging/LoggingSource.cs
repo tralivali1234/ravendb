@@ -19,11 +19,15 @@ namespace Sparrow.Logging
 {
     public sealed class LoggingSource
     {
-        private const string LoggingThreadName = "Logging Thread";
-        [ThreadStatic] private static string _currentThreadId;
+        [ThreadStatic]
+        private static string _currentThreadId;
+
+        public static bool UseUtcTime;
+        internal static long LocalToUtcOffsetInTicks;
 
         static LoggingSource()
         {
+            LocalToUtcOffsetInTicks = TimeZoneInfo.Local.GetUtcOffset(DateTime.Now).Ticks;
             ThreadLocalCleanup.ReleaseThreadLocalState += () => _currentThreadId = null;
         }
 
@@ -34,22 +38,29 @@ namespace Sparrow.Logging
         private readonly ConcurrentQueue<WeakReference<LocalThreadWriterState>> _newThreadStates =
             new ConcurrentQueue<WeakReference<LocalThreadWriterState>>();
 
+        private bool _updateLocalTimeOffset;
         private string _path;
-        private readonly TimeSpan _retentionTime;
+        private readonly string _name;
+        private TimeSpan _retentionTime;
         private string _dateString;
-        private MultipleUseFlag _keepLogging = new MultipleUseFlag(true);
+        private readonly MultipleUseFlag _keepLogging = new MultipleUseFlag(true);
         private int _logNumber;
         private DateTime _today;
         public bool IsInfoEnabled;
         public bool IsOperationsEnabled;
+
         private Stream _additionalOutput;
 
         private Stream _pipeSink;
         private static readonly int TimeToWaitForLoggingToEndInMilliseconds = 5_000;
 
-        public static readonly LoggingSource Instance = new LoggingSource(Path.GetTempPath(), LogMode.None);
+        public static readonly LoggingSource Instance = new LoggingSource(LogMode.None, Path.GetTempPath(), TimeSpan.FromDays(3), "Logging")
+        {
+            _updateLocalTimeOffset = true
+        };
+        public static readonly LoggingSource AuditLog = new LoggingSource(LogMode.None, Path.GetTempPath(), TimeSpan.MaxValue, "Audit Log");
 
-        private static byte[] _headerRow =
+        private static readonly byte[] _headerRow =
             Encodings.Utf8.GetBytes($"Time,\tThread,\tLevel,\tSource,\tLogger,\tMessage,\tException{Environment.NewLine}");
 
         public class WebSocketContext
@@ -57,8 +68,8 @@ namespace Sparrow.Logging
             public LoggingFilter Filter { get; } = new LoggingFilter();
         }
 
-        private readonly Collections.LockFree.ConcurrentDictionary<WebSocket, WebSocketContext> _listeners =
-            new Collections.LockFree.ConcurrentDictionary<WebSocket, WebSocketContext>();
+        private readonly ConcurrentDictionary<WebSocket, WebSocketContext> _listeners =
+            new ConcurrentDictionary<WebSocket, WebSocketContext>();
 
         public LogMode LogMode { get; private set; }
         private LogMode _oldLogMode;
@@ -114,30 +125,27 @@ namespace Sparrow.Logging
             }
         }
 
-        private LoggingSource(string path, LogMode logMode = LogMode.Information,
-            TimeSpan retentionTime = default(TimeSpan))
+        public LoggingSource(LogMode logMode, string path, TimeSpan retentionTime, string name)
         {
             _path = path;
-            if (retentionTime == default(TimeSpan))
-                retentionTime = TimeSpan.FromDays(3);
-
-            _retentionTime = retentionTime;
+            _name = name;
             _localState = new ThreadLocal<LocalThreadWriterState>(GenerateThreadWriterState);
 
-            SetupLogMode(logMode, path);
+            SetupLogMode(logMode, path, retentionTime);
         }
 
-        public void SetupLogMode(LogMode logMode, string path)
+        public void SetupLogMode(LogMode logMode, string path, TimeSpan retentionTime = default)
         {
             lock (this)
             {
-                if (LogMode == logMode && path == _path)
+                if (LogMode == logMode && path == _path && retentionTime == _retentionTime)
                     return;
                 LogMode = logMode;
+                _path = path;
+                _retentionTime = retentionTime == default ? TimeSpan.FromDays(3) : retentionTime;
+
                 IsInfoEnabled = (logMode & LogMode.Information) == LogMode.Information;
                 IsOperationsEnabled = (logMode & LogMode.Operations) == LogMode.Operations;
-
-                _path = path;
 
                 Directory.CreateDirectory(_path);
                 var copyLoggingThread = _loggingThread;
@@ -178,7 +186,7 @@ namespace Sparrow.Logging
             _loggingThread = new Thread(BackgroundLogger)
             {
                 IsBackground = true,
-                Name = LoggingThreadName
+                Name = _name + " Thread"
             };
             _loggingThread.Start();
         }
@@ -191,7 +199,7 @@ namespace Sparrow.Logging
 
         }
 
-        private Stream GetNewStream(long maxFileSize)
+        private FileStream GetNewStream(long maxFileSize)
         {
             if (DateTime.Today != _today)
             {
@@ -201,12 +209,14 @@ namespace Sparrow.Logging
                     {
                         _today = DateTime.Today;
                         _dateString = DateTime.Today.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
-                        _logNumber = 0;
-
+                        _logNumber = GetNextLogNumberForToday();
                         CleanupOldLogFiles();
                     }
                 }
             }
+
+            UpdateLocalDateTimeOffset();
+
             while (true)
             {
                 var nextLogNumber = Interlocked.Increment(ref _logNumber);
@@ -214,9 +224,46 @@ namespace Sparrow.Logging
                                nextLogNumber.ToString("000", CultureInfo.InvariantCulture) + ".log";
                 if (File.Exists(fileName) && new FileInfo(fileName).Length >= maxFileSize)
                     continue;
-                var fileStream = SafeFileStream.Create(fileName, FileMode.Create, FileAccess.Write, FileShare.Read, 32 * 1024, false);
+                var fileStream = SafeFileStream.Create(fileName, FileMode.Append, FileAccess.Write, FileShare.Read, 32 * 1024, false);
                 fileStream.Write(_headerRow, 0, _headerRow.Length);
                 return fileStream;
+            }
+        }
+
+        private void UpdateLocalDateTimeOffset()
+        {
+            if (_updateLocalTimeOffset == false || UseUtcTime)
+                return;
+
+            var offset = TimeZoneInfo.Local.GetUtcOffset(DateTime.Now).Ticks;
+            if (offset != LocalToUtcOffsetInTicks)
+                Interlocked.Exchange(ref LocalToUtcOffsetInTicks, offset);
+        }
+
+        private int GetNextLogNumberForToday()
+        {
+            var lastLogFile = Directory.GetFiles(_path, $"{_dateString}.*.log").LastOrDefault();
+            if (lastLogFile == null)
+                return 0;
+
+            int start = lastLogFile.LastIndexOf('.', lastLogFile.Length - "000.log".Length);
+            if (start == -1)
+                return 0;
+
+            try
+            {
+                start++;
+                var length = lastLogFile.Length - ".log".Length - start;
+                var logNumber = lastLogFile.Substring(start, length);
+                if (int.TryParse(logNumber, out var number) == false ||
+                    number <= 0)
+                    return 0;
+
+                return --number;
+            }
+            catch
+            {
+                return 0;
             }
         }
 
@@ -268,7 +315,7 @@ namespace Sparrow.Logging
             var state = _localState.Value;
             if (state.Generation != _generation)
             {
-                _localState.Value = GenerateThreadWriterState();
+                state = _localState.Value = GenerateThreadWriterState();
             }
 
             if (state.Free.Dequeue(out var item))
@@ -309,7 +356,7 @@ namespace Sparrow.Logging
                                    ", ";
             }
 
-            writer.Write(entry.At.GetDefaultRavenFormat(true));
+            writer.Write(entry.At.GetDefaultRavenFormat(isUtc: LoggingSource.UseUtcTime));
             writer.Write(_currentThreadId);
 
             switch (entry.Type)
@@ -373,6 +420,20 @@ namespace Sparrow.Logging
                                 {
                                     if (_keepLogging == false)
                                         return;
+                                    // we don't want to have fsync here, we just
+                                    // want to send it to the OS
+                                    currentFile.Flush(flushToDisk: false);
+                                    if (_hasEntries.IsSet == false)
+                                    {
+                                        // about to go to sleep, so can check if need to update offset or create new file for today logs
+                                        UpdateLocalDateTimeOffset();
+
+                                        if (DateTime.Today != _today)
+                                        {
+                                            // let's create new file so its name will have today date
+                                            break;
+                                        }
+                                    }
 
                                     _hasEntries.Wait();
                                     if (_keepLogging == false)

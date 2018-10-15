@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Text;
@@ -10,6 +11,7 @@ using Raven.Client.Json;
 using Raven.Server.Documents.Queries;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
+using Raven.Client.Util;
 using static System.String;
 
 namespace Raven.Server.Documents.Handlers
@@ -20,17 +22,28 @@ namespace Raven.Server.Documents.Handlers
         private DocumentsOperationContext _context;
         private StreamWriter _writer;
         private CsvWriter _csvWriter;
-        private string[] _properties;
-        private const string FileName = "export.csv";
+        private (string, string)[] _properties;
         private bool writeHeader = true;
-        public StreamCsvDocumentQueryResultWriter(HttpResponse response, Stream stream, DocumentsOperationContext context, string[] properties = null)
+        public StreamCsvDocumentQueryResultWriter(HttpResponse response, Stream stream, DocumentsOperationContext context, string[] properties = null, string csvFileName = "export")
         {
+            csvFileName = $"{csvFileName}_{SystemTime.UtcNow.ToString("yyyyMMdd_HHmm", CultureInfo.InvariantCulture)}.csv"; 
+            
             _response = response;
-            _response.Headers["Content-Disposition"] = $"attachment; filename=\"{FileName}\"; filename*=UTF-8''{FileName}";
+            _response.Headers["Content-Disposition"] = $"attachment; filename=\"{csvFileName}\"; filename*=UTF-8''{csvFileName}";
             _writer = new StreamWriter(stream, Encoding.UTF8);
             _csvWriter = new CsvWriter(_writer);
             _context = context;
-            _properties = properties;
+            //We need to write headers without the escaping but the path should be escaped
+            //so @metadata.@collection should not be written in the header as @metadata\.@collection
+            //We can't escape while constructing the path since we will write the escaping in the header this way, we need both.
+            _properties = properties?.Select(p => (p, Escape(p))).ToArray();
+        }
+        
+        private char[] splitter = {'.'};
+        private string Escape(string s)
+        {
+            var tokens = s.Split(splitter,StringSplitOptions.RemoveEmptyEntries);
+            return Join('.', tokens.Select(BlittablePath.EscapeString));
         }
 
         public void Dispose()
@@ -54,7 +67,7 @@ namespace Raven.Server.Documents.Handlers
         public void AddResult(Document res)
         {            
             WriteCsvHeaderIfNeeded(res);
-            foreach (var property in _properties)
+            foreach ((var property, var path) in _properties)
             {
                 if (Constants.Documents.Metadata.Id == property)
                 {
@@ -62,7 +75,7 @@ namespace Raven.Server.Documents.Handlers
                 }
                 else
                 {
-                    var o = new BlittablePath(property).Evaluate(res.Data, false);
+                    var o = new BlittablePath(path).Evaluate(res.Data, false);
                     _csvWriter.WriteField(o?.ToString());
                 }                
             }
@@ -75,10 +88,11 @@ namespace Raven.Server.Documents.Handlers
                 return;
             if (_properties == null)
             {
-                _properties = GetPropertiesRecursive(Empty, res.Data).ToArray();
+                _properties = GetPropertiesRecursive((Empty, Empty), res.Data).ToArray();
+
             }
             writeHeader = false;
-            foreach (var property in _properties)
+            foreach ((var property, var path) in _properties)
             {
                 _csvWriter.WriteField(property);
             }
@@ -86,28 +100,33 @@ namespace Raven.Server.Documents.Handlers
             _csvWriter.NextRecord();
         }
 
-        private IEnumerable<string> GetPropertiesRecursive(string parentPath, BlittableJsonReaderObject obj)
+        private IEnumerable<(string Property, string Path)> GetPropertiesRecursive((string ParentProperty, string ParentPath) propertyTuple, BlittableJsonReaderObject obj, bool addId = true)
         {
-            var inMetadata = Constants.Documents.Metadata.Key.Equals(parentPath);
-            foreach (var propery in obj.GetPropertyNames())
+            var inMetadata = Constants.Documents.Metadata.Key.Equals(propertyTuple.ParentPath);
+            if (addId)
+            {
+                yield return (Constants.Documents.Metadata.Id, Constants.Documents.Metadata.Id);
+            }
+            foreach (var p in obj.GetPropertyNames())
             {
                 //skip properties starting with '@' unless we are in the metadata and we need to export @metadata.@collection
-                if (inMetadata && propery.Equals(Constants.Documents.Metadata.Collection) == false)
+                if (inMetadata && p.Equals(Constants.Documents.Metadata.Collection) == false)
                     continue;                
-                if(propery.StartsWith('@') && propery.Equals(Constants.Documents.Metadata.Key) == false && parentPath.Equals(Constants.Documents.Metadata.Key) == false)
+                if(p.StartsWith('@') && p.Equals(Constants.Documents.Metadata.Key) == false && propertyTuple.ParentPath.Equals(Constants.Documents.Metadata.Key) == false)
                     continue; 
-                var path = IsNullOrEmpty(parentPath) ? propery : $"{parentPath}.{propery}";
+                var path = IsNullOrEmpty(propertyTuple.ParentPath) ? BlittablePath.EscapeString(p) : $"{propertyTuple.ParentPath}.{BlittablePath.EscapeString(p)}";
+                var property = IsNullOrEmpty(propertyTuple.ParentPath) ? p : $"{propertyTuple.ParentPath}.{p}";
                 object res;
-                if (obj.TryGetMember(propery, out res) && res is BlittableJsonReaderObject)
+                if (obj.TryGetMember(p, out res) && res is BlittableJsonReaderObject)
                 {
-                    foreach (var nested in GetPropertiesRecursive(path, res as BlittableJsonReaderObject))
+                    foreach (var nested in GetPropertiesRecursive((property, path), res as BlittableJsonReaderObject, addId:false))
                     {
                         yield return nested;
                     }
                 }
                 else
                 {                    
-                    yield return path;
+                    yield return (property, path);
                 }
             }
         }

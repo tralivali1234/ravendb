@@ -13,14 +13,16 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Lambda2Js;
 using Newtonsoft.Json;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Identity;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Documents.Operations.Counters;
+using Raven.Client.Documents.Session.Operations;
 using Raven.Client.Documents.Session.Operations.Lazy;
-using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents.Session;
 using Raven.Client.Extensions;
 using Raven.Client.Http;
@@ -51,7 +53,11 @@ namespace Raven.Client.Documents.Session
         private readonly int _hash = Interlocked.Increment(ref _instancesCounter);
         protected bool GenerateDocumentIdsOnStore = true;
         protected internal readonly SessionInfo SessionInfo;
+
         private BatchOptions _saveChangesOptions;
+
+        public TransactionMode TransactionMode;
+
         private bool _isDisposed;
         private JsonSerializer _jsonSerializer;
 
@@ -73,7 +79,7 @@ namespace Raven.Client.Documents.Session
         /// <summary>
         /// Entities whose id we already know do not exists, because they are a missing include, or a missing load, etc.
         /// </summary>
-        private readonly HashSet<string> _knownMissingIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        protected readonly HashSet<string> _knownMissingIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private Dictionary<string, object> _externalState;
 
@@ -116,6 +122,13 @@ namespace Raven.Client.Documents.Session
         protected internal readonly Dictionary<object, DocumentInfo> DocumentsByEntity =
             new Dictionary<object, DocumentInfo>(ObjectReferenceEqualityComparer<object>.Default);
 
+        /// <summary>
+        /// hold the data required to manage Counters tracking for RavenDB's Unit of Work
+        /// </summary>
+        protected internal Dictionary<string, (bool GotAll, Dictionary<string, long?> Values)> CountersByDocId =>
+            _countersByDocId ?? (_countersByDocId = new Dictionary<string, (bool GotAll, Dictionary<string, long?> Values)>(StringComparer.OrdinalIgnoreCase));
+
+        private Dictionary<string, (bool GotAll, Dictionary<string, long?> Values)> _countersByDocId;
         protected readonly DocumentStoreBase _documentStore;
 
         public string DatabaseName { get; }
@@ -127,7 +140,7 @@ namespace Raven.Client.Documents.Session
 
         public RequestExecutor RequestExecutor => _requestExecutor;
 
-        internal OperationExecutor Operations => _operationExecutor ?? (_operationExecutor = DocumentStore.Operations.ForDatabase(DatabaseName));
+        internal OperationExecutor Operations => _operationExecutor ?? (_operationExecutor = new SessionOperationExecutor(this));
 
         public JsonOperationContext Context => _context;
 
@@ -179,6 +192,8 @@ namespace Raven.Client.Documents.Session
         protected internal readonly Dictionary<(string, CommandType, string), ICommandData> DeferredCommandsDictionary =
             new Dictionary<(string, CommandType, string), ICommandData>();
 
+        public readonly bool NoTracking;
+
         public int DeferredCommandsCount => DeferredCommands.Count;
 
         public GenerateEntityIdOnTheClient GenerateEntityIdOnTheClient { get; }
@@ -190,21 +205,30 @@ namespace Raven.Client.Documents.Session
         /// Initializes a new instance of the <see cref="InMemoryDocumentSessionOperations"/> class.
         /// </summary>
         protected InMemoryDocumentSessionOperations(
-            string databaseName,
             DocumentStoreBase documentStore,
-            RequestExecutor requestExecutor,
-            Guid id)
+            Guid id,
+            SessionOptions options)
         {
             Id = id;
-            DatabaseName = databaseName;
+            DatabaseName = options.Database ?? documentStore.Database;
+            if (string.IsNullOrWhiteSpace(DatabaseName))
+                ThrowNoDatabase();
+
             _documentStore = documentStore;
-            _requestExecutor = requestExecutor;
-            _releaseOperationContext = requestExecutor.ContextPool.AllocateOperationContext(out _context);
+            _requestExecutor = options.RequestExecutor ?? documentStore.GetRequestExecutor(DatabaseName);
+            _releaseOperationContext = _requestExecutor.ContextPool.AllocateOperationContext(out _context);
+            NoTracking = options.NoTracking;
             UseOptimisticConcurrency = _requestExecutor.Conventions.UseOptimisticConcurrency;
             MaxNumberOfRequestsPerSession = _requestExecutor.Conventions.MaxNumberOfRequestsPerSession;
             GenerateEntityIdOnTheClient = new GenerateEntityIdOnTheClient(_requestExecutor.Conventions, GenerateId);
             EntityToBlittable = new EntityToBlittable(this);
-            SessionInfo = new SessionInfo(_clientSessionId, false);
+            SessionInfo = new SessionInfo(_clientSessionId, false, _documentStore.GetLastTransactionIndex(DatabaseName), options.NoCaching);
+            TransactionMode = options.TransactionMode;
+
+            _javascriptCompilationOptions = new JavascriptCompilationOptions
+            {
+                CustomMetadataProvider = new PropertyNameConventionJSMetadataProvider(_documentStore.Conventions)
+            };
         }
 
         /// <summary>
@@ -228,6 +252,31 @@ namespace Raven.Client.Documents.Session
             documentInfo.MetadataInstance = metadata;
             return metadata;
         }
+
+        public void SetTransactionMode(TransactionMode mode)
+        {
+            TransactionMode = mode;
+        }
+
+        /// <summary>
+        /// Gets all counter names for the specified entity.
+        /// </summary>
+        /// <typeparam name="T"></typeparam>
+        /// <param name="instance">The instance.</param>
+        /// <returns></returns>
+        public List<string> GetCountersFor<T>(T instance)
+        {
+            if (instance == null)
+                throw new ArgumentNullException(nameof(instance));
+
+            var documentInfo = GetDocumentInfo(instance);
+
+            if (documentInfo.Metadata.TryGet(Constants.Documents.Metadata.Counters,
+                out BlittableJsonReaderArray counters) == false)
+                return null;
+            return counters.Select(x => x.ToString()).ToList();
+        }
+
 
         /// <summary>
         /// Gets the Change Vector for the specified entity.
@@ -271,7 +320,7 @@ namespace Raven.Client.Documents.Session
 
             AssertNoNonUniqueInstance(instance, id);
 
-            throw new ArgumentException($"Document {id} doesn\'t exist in the session");
+            throw new ArgumentException($"Document {id} doesn't exist in the session");
         }
 
         /// <summary>
@@ -285,7 +334,7 @@ namespace Raven.Client.Documents.Session
 
         internal bool IsLoadedOrDeleted(string id)
         {
-            return DocumentsById.TryGetValue(id, out DocumentInfo documentInfo) && documentInfo.Document != null ||
+            return DocumentsById.TryGetValue(id, out DocumentInfo documentInfo) && (documentInfo.Document != null || documentInfo.Entity != null) ||
                    IsDeleted(id) ||
                    IncludedDocumentsById.ContainsKey(id);
         }
@@ -372,7 +421,29 @@ more responsive application.
         /// <returns></returns>
         private object TrackEntity(Type entityType, DocumentInfo documentFound)
         {
-            return TrackEntity(entityType, documentFound.Id, documentFound.Document, documentFound.Metadata, noTracking: false);
+            return TrackEntity(entityType, documentFound.Id, documentFound.Document, documentFound.Metadata, noTracking: NoTracking);
+        }
+
+        internal void RegisterExternalLoadedIntoTheSession(DocumentInfo info)
+        {
+            if (NoTracking)
+                return;
+
+            if (DocumentsById.TryGetValue(info.Id, out var existing))
+            {
+                if (ReferenceEquals(existing.Entity, info.Entity))
+                    return;
+                throw new InvalidOperationException("The document " + info.Id + " is already in the session with a different entity instance");
+            }
+            if (DocumentsByEntity.TryGetValue(info.Entity, out existing))
+            {
+                if (string.Equals(info.Id, existing.Id, StringComparison.OrdinalIgnoreCase))
+                    return;
+                throw new InvalidOperationException("Attempted to load an entity with id " + info.Id + ", but the entity instance already exists in the session with id: " + existing.Id);
+            }
+            DocumentsByEntity.Add(info.Entity, info);
+            DocumentsById.Add(info);
+            IncludedDocumentsById.Remove(info.Id);
         }
 
         /// <summary>
@@ -386,6 +457,8 @@ more responsive application.
         /// <returns></returns>
         private object TrackEntity(Type entityType, string id, BlittableJsonReaderObject document, BlittableJsonReaderObject metadata, bool noTracking)
         {
+            noTracking = NoTracking || noTracking; // if noTracking is session-wide then we want to override the passed argument
+
             if (string.IsNullOrEmpty(id))
             {
                 return DeserializeFromTransformer(entityType, null, document);
@@ -472,6 +545,7 @@ more responsive application.
 
             DeletedEntities.Add(entity);
             IncludedDocumentsById.Remove(value.Id);
+            _countersByDocId?.Remove(value.Id);
             _knownMissingIds.Add(value.Id);
         }
 
@@ -511,6 +585,7 @@ more responsive application.
 
             _knownMissingIds.Add(id);
             changeVector = UseOptimisticConcurrency ? changeVector : null;
+            _countersByDocId?.Remove(id);
             Defer(new DeleteCommandData(id, expectedChangeVector ?? changeVector));
         }
 
@@ -541,7 +616,10 @@ more responsive application.
 
         private void StoreInternal(object entity, string changeVector, string id, ConcurrencyCheckMode forceConcurrencyCheck)
         {
-            if (null == entity)
+            if (NoTracking)
+                throw new InvalidOperationException("Cannot store entity. Entity tracking is disabled in this session.");
+
+            if (entity == null)
                 throw new ArgumentNullException(nameof(entity));
 
             DocumentInfo value;
@@ -713,22 +791,88 @@ more responsive application.
             PrepareForEntitiesDeletion(result, null);
             PrepareForEntitiesPuts(result);
 
-            if(DeferredCommands.Count > 0)
+            PrepareCompareExchangeEntities(result);
+
+            if (DeferredCommands.Count > 0)
             {
                 // this allow OnBeforeStore to call Defer during the call to include
                 // additional values during the same SaveChanges call
                 result.DeferredCommands.AddRange(DeferredCommands);
                 foreach (var item in DeferredCommandsDictionary)
-                {
                     result.DeferredCommandsDictionary[item.Key] = item.Value;
-                }
 
                 DeferredCommands.Clear();
                 DeferredCommandsDictionary.Clear();
             }
 
+            foreach (var deferredCommand in result.DeferredCommands)
+                deferredCommand.OnBeforeSaveChanges(this);
+
             return result;
         }
+
+        internal void ValidateClusterTransaction(SaveChangesData result)
+        {
+            if (TransactionMode != TransactionMode.ClusterWide)
+                return;
+
+            if (UseOptimisticConcurrency)
+                throw new NotSupportedException(
+                    $"{nameof(UseOptimisticConcurrency)} is not supported with {nameof(TransactionMode)} set to {nameof(TransactionMode.ClusterWide)}");
+
+            foreach (var command in result.SessionCommands)
+            {
+                switch (command.Type)
+                {
+                    case CommandType.PUT:
+                    case CommandType.DELETE:
+                        if (command.ChangeVector != null)
+                            throw new NotSupportedException($"Optimistic concurrency for '{command.Id}' is not supported when using a cluster transaction.");
+                        break;
+                    case CommandType.CompareExchangeDELETE:
+                    case CommandType.CompareExchangePUT:
+                        break;
+                    default:
+                        throw new NotSupportedException($"The command '{command.Type}' is not supported in a cluster session.");
+
+                }
+            }
+        }
+
+        private void PrepareCompareExchangeEntities(SaveChangesData result)
+        {
+            ClusterTransactionOperationsBase clusterTransactionOperations = GetClusterSession();
+
+            if (clusterTransactionOperations == null || clusterTransactionOperations.HasCommands == false)
+                return;
+
+            if (TransactionMode != TransactionMode.ClusterWide)
+                throw new InvalidOperationException($"Performing cluster transaction operations require the '{nameof(TransactionMode)}' to be set to '{nameof(TransactionMode.ClusterWide)}'.");
+
+            if (clusterTransactionOperations.StoreCompareExchange != null)
+            {
+                foreach (var item in clusterTransactionOperations.StoreCompareExchange)
+                {
+                    var djv = new DynamicJsonValue()
+                    {
+                        ["Object"] = EntityToBlittable.ConvertToBlittableIfNeeded(item.Value.Entity)
+                    };
+                    var blittable = Context.ReadObject(djv, item.Key);
+                    result.SessionCommands.Add(new PutCompareExchangeCommandData(item.Key, blittable, item.Value.Index));
+                }
+            }
+
+            if (clusterTransactionOperations.DeleteCompareExchange != null)
+            {
+                foreach (var item in clusterTransactionOperations.DeleteCompareExchange)
+                {
+                    result.SessionCommands.Add(new DeleteCompareExchangeCommandData(item.Key, item.Value));
+                }
+            }
+            clusterTransactionOperations.Clear();
+        }
+
+        protected abstract ClusterTransactionOperationsBase GetClusterSession();
 
         private static bool UpdateMetadataModifications(DocumentInfo documentInfo)
         {
@@ -807,12 +951,15 @@ more responsive application.
         {
             foreach (var entity in DocumentsByEntity)
             {
-                var metadataUpdated = UpdateMetadataModifications(entity.Value);
-                var document = EntityToBlittable.ConvertEntityToBlittable(entity.Key, entity.Value);
-                if (entity.Value.IgnoreChanges || EntityChanged(document, entity.Value, null) == false)
+                if (entity.Value.IgnoreChanges)
                     continue;
 
-                if (result.DeferredCommandsDictionary.TryGetValue((entity.Value.Id, CommandType.ClientNotAttachment, null), out ICommandData command))
+                var metadataUpdated = UpdateMetadataModifications(entity.Value);
+                var document = EntityToBlittable.ConvertEntityToBlittable(entity.Key, entity.Value);
+                if (EntityChanged(document, entity.Value, null) == false)
+                    continue;
+
+                if (result.DeferredCommandsDictionary.TryGetValue((entity.Value.Id, CommandType.ClientModifyDocumentCommand, null), out ICommandData command))
                     ThrowInvalidModifiedDocumentWithDeferredCommand(command);
 
                 var onOnBeforeStore = OnBeforeStore;
@@ -820,7 +967,7 @@ more responsive application.
                 {
                     var beforeStoreEventArgs = new BeforeStoreEventArgs(this, entity.Value.Id, entity.Key);
                     onOnBeforeStore(this, beforeStoreEventArgs);
-                    if (beforeStoreEventArgs.MetadataAccessed)
+                    if (metadataUpdated || beforeStoreEventArgs.MetadataAccessed)
                         metadataUpdated |= UpdateMetadataModifications(entity.Value);
                     if (beforeStoreEventArgs.MetadataAccessed ||
                         EntityChanged(document, entity.Value, null))
@@ -880,6 +1027,12 @@ more responsive application.
                 $"Cannot perform save because document {resultCommand.Id} has been modified by the session and is also taking part in deferred {resultCommand.Type} command");
         }
 
+        private static void ThrowNoDatabase()
+        {
+            throw new InvalidOperationException(
+                $"Cannot open a Session without specifying a name of a database to operate on. Database name can be passed as an argument when Session is being opened or default database can be defined using '{nameof(DocumentStore)}.{nameof(IDocumentStore.Database)}' property.");
+        }
+
         protected bool EntityChanged(BlittableJsonReaderObject newObj, DocumentInfo documentInfo, IDictionary<string, DocumentsChanges[]> changes)
         {
             return BlittableOperation.EntityChanged(newObj, documentInfo, changes);
@@ -937,11 +1090,17 @@ more responsive application.
             var realTimeout = timeout ?? TimeSpan.FromSeconds(15);
             if (_saveChangesOptions == null)
                 _saveChangesOptions = new BatchOptions();
-            _saveChangesOptions.WaitForReplicas = true;
-            _saveChangesOptions.Majority = majority;
-            _saveChangesOptions.NumberOfReplicasToWaitFor = replicas;
-            _saveChangesOptions.WaitForReplicasTimeout = realTimeout;
-            _saveChangesOptions.ThrowOnTimeoutInWaitForReplicas = throwOnTimeout;
+
+            var replicationOptions = new ReplicationBatchOptions
+            {
+                WaitForReplicas = true,
+                Majority = majority,
+                NumberOfReplicasToWaitFor = replicas,
+                WaitForReplicasTimeout = realTimeout,
+                ThrowOnTimeoutInWaitForReplicas = throwOnTimeout
+            };
+
+            _saveChangesOptions.ReplicationOptions = replicationOptions;
         }
 
         public void WaitForIndexesAfterSaveChanges(TimeSpan? timeout = null, bool throwOnTimeout = false,
@@ -950,10 +1109,16 @@ more responsive application.
             var realTimeout = timeout ?? TimeSpan.FromSeconds(15);
             if (_saveChangesOptions == null)
                 _saveChangesOptions = new BatchOptions();
-            _saveChangesOptions.WaitForIndexes = true;
-            _saveChangesOptions.WaitForIndexesTimeout = realTimeout;
-            _saveChangesOptions.ThrowOnTimeoutInWaitForIndexes = throwOnTimeout;
-            _saveChangesOptions.WaitForSpecificIndexes = indexes;
+
+            var indexOptions = new IndexBatchOptions
+            {
+                WaitForIndexes = true,
+                WaitForIndexesTimeout = realTimeout,
+                ThrowOnTimeoutInWaitForIndexes = throwOnTimeout,
+                WaitForSpecificIndexes = indexes
+            };
+
+            _saveChangesOptions.IndexOptions = indexOptions;
         }
 
         private void GetAllEntitiesChanges(IDictionary<string, DocumentsChanges[]> changes)
@@ -987,6 +1152,7 @@ more responsive application.
             {
                 DocumentsByEntity.Remove(entity);
                 DocumentsById.Remove(documentInfo.Id);
+                _countersByDocId?.Remove(documentInfo.Id);
             }
 
             DeletedEntities.Remove(entity);
@@ -1002,7 +1168,7 @@ more responsive application.
             DeletedEntities.Clear();
             DocumentsById.Clear();
             _knownMissingIds.Clear();
-            IncludedDocumentsById.Clear();
+            _countersByDocId?.Clear();
         }
 
         /// <summary>
@@ -1039,9 +1205,12 @@ more responsive application.
         {
             DeferredCommandsDictionary[(command.Id, command.Type, command.Name)] = command;
             DeferredCommandsDictionary[(command.Id, CommandType.ClientAnyCommand, null)] = command;
-            if (command.Type != CommandType.AttachmentPUT && 
-                command.Type != CommandType.AttachmentDELETE)
-                DeferredCommandsDictionary[(command.Id, CommandType.ClientNotAttachment, null)] = command;
+            if (command.Type != CommandType.AttachmentPUT &&
+                command.Type != CommandType.AttachmentDELETE &&
+                command.Type != CommandType.AttachmentCOPY &&
+                command.Type != CommandType.AttachmentMOVE &&
+                command.Type != CommandType.Counters)
+                DeferredCommandsDictionary[(command.Id, CommandType.ClientModifyDocumentCommand, null)] = command;
         }
 
         public void AssertNotDisposed()
@@ -1097,16 +1266,17 @@ more responsive application.
 
         public void RegisterMissing(string id)
         {
-            _knownMissingIds.Add(id);
-        }
+            if (NoTracking)
+                return;
 
-        public void UnregisterMissing(string id)
-        {
-            _knownMissingIds.Remove(id);
+            _knownMissingIds.Add(id);
         }
 
         internal void RegisterIncludes(BlittableJsonReaderObject includes)
         {
+            if (NoTracking)
+                return;
+
             if (includes == null)
                 return;
 
@@ -1130,6 +1300,9 @@ more responsive application.
 
         public void RegisterMissingIncludes(BlittableJsonReaderArray results, BlittableJsonReaderObject includes, ICollection<string> includePaths)
         {
+            if (NoTracking)
+                return;
+
             if (includePaths == null || includePaths.Count == 0)
                 return;
 
@@ -1159,6 +1332,160 @@ more responsive application.
                     });
                 }
             }
+        }
+
+        internal void RegisterCounters(BlittableJsonReaderObject resultCounters, string[] ids, string[] countersToInclude, bool gotAll)
+        {
+            if (NoTracking)
+                return;
+
+            if (resultCounters == null || resultCounters.Count == 0)
+            {
+                if (gotAll)
+                {
+                    foreach (var id in ids)
+                    {
+                        SetGotAllCountersForDocument(id);
+                    }
+
+                    return;
+                }
+
+            }
+            else
+            {
+                RegisterCountersInternal(resultCounters, countersToInclude: null, fromQueryResult: false, gotAll: gotAll);
+            }
+
+            RegisterMissingCounters(ids, countersToInclude);
+
+        }
+
+        internal void RegisterCounters(BlittableJsonReaderObject resultCounters, Dictionary<string, string[]> countersToInclude)
+        {
+            if (NoTracking)
+                return;
+
+            if (resultCounters == null || resultCounters.Count == 0)
+            {
+                SetGotAllInCacheIfNeeded(countersToInclude);
+            }
+            else
+            {
+                RegisterCountersInternal(resultCounters, countersToInclude);
+            }
+
+            RegisterMissingCounters(countersToInclude);
+
+        }
+
+        private void RegisterCountersInternal(BlittableJsonReaderObject resultCounters, Dictionary<string, string[]> countersToInclude, bool fromQueryResult = true, bool gotAll = false)
+        {
+            var propertyDetails = new BlittableJsonReaderObject.PropertyDetails();
+            foreach (var propertyIndex in resultCounters.GetPropertiesByInsertionOrder())
+            {
+                resultCounters.GetPropertyByIndex(propertyIndex, ref propertyDetails);
+                if (propertyDetails.Value == null)
+                    continue;
+                if (fromQueryResult)
+                {
+                    gotAll = countersToInclude.TryGetValue(propertyDetails.Name, out var counters) &&
+                             counters.Length == 0;
+                }
+                var bjra = (BlittableJsonReaderArray)propertyDetails.Value;
+                if (bjra.Length == 0 && gotAll == false)
+                    continue;
+
+                RegisterCountersForDocument(propertyDetails.Name, gotAll, bjra);
+            }
+        }
+
+        private void RegisterCountersForDocument(string id, bool gotAll, BlittableJsonReaderArray counters)
+        {
+            if (CountersByDocId.TryGetValue(id, out var cache) == false)
+            {
+                cache.Values = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            foreach (BlittableJsonReaderObject counterBlittable in counters)
+            {
+                if (counterBlittable.TryGet(nameof(CounterDetail.CounterName), out string name) == false ||
+                    counterBlittable.TryGet(nameof(CounterDetail.TotalValue), out long value) == false)
+                    continue;
+                cache.Values[name] = value;
+            }
+
+            cache.GotAll = gotAll;
+            CountersByDocId[id] = cache;
+        }
+
+        private void SetGotAllInCacheIfNeeded(Dictionary<string, string[]> countersToInclude)
+        {
+            foreach (var kvp in countersToInclude)
+            {
+                if (kvp.Value.Length != 0)
+                    continue;
+
+                SetGotAllCountersForDocument(kvp.Key);
+            }
+        }
+
+        private void SetGotAllCountersForDocument(string id)
+        {
+            if (CountersByDocId.TryGetValue(id, out var cache) == false)
+            {
+                cache.Values = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+            }
+
+            cache.GotAll = true;
+            CountersByDocId[id] = cache;
+        }
+
+        private void RegisterMissingCounters(Dictionary<string, string[]> countersToInclude)
+        {
+            if (countersToInclude == null)
+                return;
+
+            foreach (var kvp in countersToInclude)
+            {
+                if (CountersByDocId.TryGetValue(kvp.Key, out var cache) == false)
+                {
+                    cache.Values = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+                    CountersByDocId.Add(kvp.Key, cache);
+                }
+
+                foreach (var counter in kvp.Value)
+                {
+                    if (cache.Values.ContainsKey(counter))
+                        continue;
+
+                    cache.Values[counter] = null;
+                }
+            }
+        }
+
+        private void RegisterMissingCounters(string[] ids, string[] countersToInclude)
+        {
+            if (countersToInclude == null)
+                return;
+
+            foreach (var counter in countersToInclude)
+            {
+                foreach (var id in ids)
+                {
+                    if (CountersByDocId.TryGetValue(id, out var cache) == false)
+                    {
+                        cache.Values = new Dictionary<string, long?>(StringComparer.OrdinalIgnoreCase);
+                        CountersByDocId.Add(id, cache);
+                    }
+
+                    if (cache.Values.ContainsKey(counter))
+                        continue;
+
+                    cache.Values[counter] = null;
+                }
+            }
+
         }
 
         public override int GetHashCode()
@@ -1342,6 +1669,13 @@ more responsive application.
             }
         }
 
+        protected void UpdateSessionAfterSaveChanges(BatchCommandResult result)
+        {
+            var returnedTransactionIndex = result.TransactionIndex;
+            _documentStore.SetLastTransactionIndex(DatabaseName, returnedTransactionIndex);
+            SessionInfo.LastClusterTransactionIndex = returnedTransactionIndex;
+        }
+
         public void OnAfterSaveChangesInvoke(AfterSaveChangesEventArgs afterSaveChangesEventArgs)
         {
             OnAfterSaveChanges?.Invoke(this, afterSaveChangesEventArgs);
@@ -1362,7 +1696,7 @@ more responsive application.
                     $"Parameters '{nameof(indexName)}' and '{nameof(collectionName)}' are mutually exclusive. Please specify only one of them.");
 
             if (isIndex == false && isCollection == false)
-                collectionName = Conventions.GetCollectionName(type);
+                collectionName = Conventions.GetCollectionName(type) ?? Constants.Documents.Collections.AllDocumentsCollection;
 
             return (indexName, collectionName);
         }

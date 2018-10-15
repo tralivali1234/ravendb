@@ -9,6 +9,7 @@ using System.Security.Cryptography.X509Certificates;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Jint;
 using Raven.Client;
 using Raven.Client.Documents;
 using Raven.Client.ServerWide;
@@ -24,6 +25,7 @@ using Sparrow;
 using Sparrow.Json;
 using Sparrow.Logging;
 using Sparrow.LowMemory;
+using Sparrow.Platform;
 using Sparrow.Utils;
 using Size = Sparrow.Size;
 using SizeClient = Raven.Client.Util.Size;
@@ -69,8 +71,9 @@ namespace Raven.Server.Utils.Cli
                         break;
                     case "%M":
                         {
+                            var workingSetText = PlatformDetails.RunningOnPosix == false ? "WS" : "RSS";
                             var memoryStats = MemoryStatsWithMemoryMappedInfo();
-                            msg.Append($"WS:{memoryStats.WorkingSet}");
+                            msg.Append($"{workingSetText}:{memoryStats.WorkingSet}");
                             msg.Append($"|UM:{memoryStats.TotalUnmanagedAllocations}");
                             msg.Append($"|M:{memoryStats.ManagedMemory}");
                             msg.Append($"|MP:{memoryStats.TotalMemoryMapped}");
@@ -110,6 +113,7 @@ namespace Raven.Server.Utils.Cli
             Clear,
             ResetServer,
             Stats,
+            TopThreads,
             Info,
             Gc,
             TrustServerCert,
@@ -126,6 +130,7 @@ namespace Raven.Server.Utils.Cli
             CreateDb,
             Logout,
             Print,
+            OpenBrowser,
 
             UnknownCommand
         }
@@ -174,7 +179,7 @@ namespace Raven.Server.Utils.Cli
         private class SingleAction
         {
             public int NumOfArgs;
-            public Func<List<string>, RavenCli, bool> DelegateFync;
+            public Func<List<string>, RavenCli, bool> DelegateFunc;
             public bool Experimental { get; set; }
         }
 
@@ -272,6 +277,23 @@ namespace Raven.Server.Utils.Cli
             return char.ToLower(k).Equals('y');
         }
 
+        private static bool CommandOpenBrowser(List<string> args, RavenCli cli)
+        {
+            if (cli._consoleColoring == false)
+            {
+                WriteText("'openBrowser' command not supported on remote pipe connection", WarningColor, cli);
+                return true;
+            }
+
+            var url = cli._server.ServerStore.GetNodeHttpServerUrl();
+            WriteText("Opening Studio at: ", TextColor, cli, newLine: false);
+            WriteText(url, UserInputColor, cli);
+
+            BrowserHelper.OpenStudioInBrowser(url, onError: errorMessage => WriteError($"{errorMessage}", cli));
+
+            return true;
+        }
+
         private static bool CommandResetServer(List<string> args, RavenCli cli)
         {
             WriteText("", TextColor, cli);
@@ -298,6 +320,62 @@ namespace Raven.Server.Utils.Cli
             var prevLogMode = LoggingSource.Instance.LogMode;
             LoggingSource.Instance.SetupLogMode(LogMode.None, cli._server.Configuration.Logs.Path.FullPath);
             Program.WriteServerStatsAndWaitForEsc(cli._server);
+            LoggingSource.Instance.SetupLogMode(prevLogMode, cli._server.Configuration.Logs.Path.FullPath);
+            Console.WriteLine($"LogMode set back to {prevLogMode}.");
+            return true;
+        }
+
+        private static bool CommandTopThreads(List<string> args, RavenCli cli)
+        {
+            if (cli._consoleColoring == false)
+            {
+                // beware not to allow this from remote - will disable local console!                
+                WriteText("'topThreads' command not supported on remote pipe connection.", TextColor, cli);
+                return true;
+            }
+
+            var maxTopThreads = 10;
+            var updateIntervalInMs = 1000;
+            var cpuUsageThreshold = 0d;
+
+            if (args?.Count > 0)
+            {
+                const string errorMessage = "Usage: topThreads [max-top-threads] [update-interval-ms] [higher-cpu-then]";
+                if (args.Count > 3)
+                {
+                    WriteError(errorMessage, cli);
+                    return false;
+                }
+
+                if (int.TryParse(args[0], out maxTopThreads) == false || maxTopThreads <= 0)
+                {
+                    WriteError(errorMessage, cli);
+                    return false;
+                }
+
+                if (args.Count > 1 && 
+                    int.TryParse(args[1], out updateIntervalInMs) == false &&
+                    updateIntervalInMs <= 0)
+                {
+                    WriteError(errorMessage, cli);
+                    return false;
+                }
+
+                if (args.Count > 2 &&
+                    double.TryParse(args[2], out cpuUsageThreshold) == false &&
+                    cpuUsageThreshold <= 0)
+                {
+                    WriteError(errorMessage, cli);
+                    return false;
+                }
+            }
+            
+            Console.ResetColor();
+
+            LoggingSource.Instance.DisableConsoleLogging();
+            var prevLogMode = LoggingSource.Instance.LogMode;
+            LoggingSource.Instance.SetupLogMode(LogMode.None, cli._server.Configuration.Logs.Path.FullPath);
+            Program.WriteThreadsInfoAndWaitForEsc(cli._server, maxTopThreads, updateIntervalInMs, cpuUsageThreshold);
             LoggingSource.Instance.SetupLogMode(prevLogMode, cli._server.Configuration.Logs.Path.FullPath);
             Console.WriteLine($"LogMode set back to {prevLogMode}.");
             return true;
@@ -346,7 +424,7 @@ namespace Raven.Server.Utils.Cli
             var genNum = args == null || args.Count == 0 ? 2 : Convert.ToInt32(args.First());
 
             WriteText("Before collecting, managed memory used: ", TextColor, cli, newLine: false);
-            WriteText(new Size(GC.GetTotalMemory(false), SizeUnit.Bytes).ToString(), ConsoleColor.Cyan, cli);
+            WriteText(new Size(MemoryInformation.GetManagedMemoryInBytes(), SizeUnit.Bytes).ToString(), ConsoleColor.Cyan, cli);
             var startTime = DateTime.UtcNow;
             WriteText("Garbage Collecting... ", TextColor, cli, newLine: false);
 
@@ -371,7 +449,7 @@ namespace Raven.Server.Utils.Cli
 
             WriteText("Collected.", ConsoleColor.Green, cli);
             WriteText("After collecting, managed memory used:  ", TextColor, cli, newLine: false);
-            WriteText(new Size(GC.GetTotalMemory(false), SizeUnit.Bytes).ToString(), ConsoleColor.Cyan, cli, newLine: false);
+            WriteText(new Size(MemoryInformation.GetManagedMemoryInBytes(), SizeUnit.Bytes).ToString(), ConsoleColor.Cyan, cli, newLine: false);
             WriteText(" at ", TextColor, cli, newLine: false);
             WriteText(actionTime.TotalSeconds + " Seconds", ConsoleColor.Cyan, cli);
             return true;
@@ -401,7 +479,7 @@ namespace Raven.Server.Utils.Cli
         private static bool CommandLog(List<string> args, RavenCli cli)
         {
             var withConsole = !(args.Count == 2 && args[1].Equals("no-console"));
-                        
+
             switch (args.First())
             {
                 case "on":
@@ -460,14 +538,14 @@ namespace Raven.Server.Utils.Cli
 
         public static string GetInfoText()
         {
-            var memoryInfo = MemoryInformation.GetMemoryInfo();
+            var memoryInfo = MemoryInformation.GetMemInfoUsingOneTimeSmapsReader();
             using (var currentProcess = Process.GetCurrentProcess())
             {
                 return $" Build {ServerVersion.Build}, Version {ServerVersion.Version}, SemVer {ServerVersion.FullVersion}, Commit {ServerVersion.CommitHash}" +
                        Environment.NewLine +
                        $" PID {currentProcess.Id}, {IntPtr.Size * 8} bits, {ProcessorInfo.ProcessorCount} Cores, Arch: {RuntimeInformation.OSArchitecture}" +
                        Environment.NewLine +
-                       $" {memoryInfo.TotalPhysicalMemory} Physical Memory, {memoryInfo.AvailableMemory} Available Memory" +
+                       $" {memoryInfo.TotalPhysicalMemory} Physical Memory, {memoryInfo.AvailableMemory} Available Memory, {memoryInfo.AvailableWithoutTotalCleanMemory} Calculated Available Memory" +
                        Environment.NewLine +
                        $" {RuntimeSettings.Describe()}";
             }
@@ -495,6 +573,8 @@ namespace Raven.Server.Utils.Cli
                 return false;
             }
 
+            WriteText($"Experimental features are now {(isOn ? "enabled" : "disabled")}.", TextColor, cli);
+
             return isOn; // here rc is not an exit code, it is a setter to _experimental
         }
 
@@ -511,11 +591,11 @@ namespace Raven.Server.Utils.Cli
 
             var name = args[0];
             var path = args[1];
-            
+
             X509Certificate2 cert;
             try
             {
-                cert = args.Count == 3 ? new X509Certificate2(path, args[2]) : new X509Certificate2(path);
+                cert = args.Count == 3 ? new X509Certificate2(path, args[2], X509KeyStorageFlags.MachineKeySet) : new X509Certificate2(path, (string)null, X509KeyStorageFlags.MachineKeySet);
             }
             catch (Exception e)
             {
@@ -559,7 +639,7 @@ namespace Raven.Server.Utils.Cli
                     Thumbprint = cert.Thumbprint,
                     NotAfter = cert.NotAfter
                 };
-                
+
                 try
                 {
                     if (cli._server.ServerStore.CurrentRachisState == RachisState.Passive)
@@ -579,7 +659,7 @@ namespace Raven.Server.Utils.Cli
                 }
                 catch (Exception e)
                 {
-                    WriteError($"Failed to store cerrificate {cert.Thumbprint} in the server." + e, cli);
+                    WriteError($"Failed to store certificate {cert.Thumbprint} in the server." + e, cli);
                     return false;
                 }
 
@@ -606,7 +686,7 @@ namespace Raven.Server.Utils.Cli
             try
             {
                 certBytes = File.ReadAllBytes(path);
-                cert = password != null ? new X509Certificate2(certBytes, password) : new X509Certificate2(certBytes);
+                cert = password != null ? new X509Certificate2(certBytes, password, X509KeyStorageFlags.MachineKeySet) : new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
             }
             catch (Exception e)
             {
@@ -645,14 +725,14 @@ namespace Raven.Server.Utils.Cli
                     Thumbprint = cert.Thumbprint,
                     NotAfter = cert.NotAfter
                 };
-                
+
                 try
                 {
-                    AdminCertificatesHandler.PutCertificateCollectionInCluster(certDef, certBytes, password,  cli._server.ServerStore, ctx).Wait();
+                    AdminCertificatesHandler.PutCertificateCollectionInCluster(certDef, certBytes, password, cli._server.ServerStore, ctx).Wait();
                 }
                 catch (Exception e)
                 {
-                    WriteError($"Failed to put cerrificate {cert.Thumbprint} in the server." + e, cli);
+                    WriteError($"Failed to put certificate {cert.Thumbprint} in the server." + e, cli);
                     return false;
                 }
 
@@ -708,7 +788,7 @@ namespace Raven.Server.Utils.Cli
             }
             catch (Exception e)
             {
-                WriteError("Failed save the generated certificate to path: "+ certPath + e, cli);
+                WriteError("Failed save the generated certificate to path: " + certPath + e, cli);
                 return false;
             }
 
@@ -716,16 +796,15 @@ namespace Raven.Server.Utils.Cli
 
             return true;
         }
-        
+
         private static bool CommandReplaceClusterCert(List<string> args, RavenCli cli)
         {
-            if (args.Count < 2 || args.Count > 4)
+            if (args.Count < 1 || args.Count > 3)
             {
-                WriteError("Usage: replaceClusterCert [-replaceImmediately] <name> <path-to-pfx> [password]", cli);
+                WriteError("Usage: replaceClusterCert [-replaceImmediately] <path-to-pfx> [password]", cli);
                 return false;
             }
 
-            string name;
             string path;
             string password = null;
             var replaceImmediately = false;
@@ -733,25 +812,30 @@ namespace Raven.Server.Utils.Cli
             if (args[0].Equals("-replaceImmediately"))
             {
                 replaceImmediately = true;
-                name = args[1];
-                path = args[2];
-                if (args.Count == 4)
-                    password = args[3];
-            }
-            else
-            {
-                name = args[0];
                 path = args[1];
                 if (args.Count == 3)
                     password = args[2];
             }
+            else
+            {
+                path = args[0];
+                if (args.Count == 2)
+                    password = args[1];
+            }
 
             cli._server.ServerStore.EnsureNotPassive();
-            
+
+            // This restriction should be removed when updating to .net core 2.1 when export of collection is fixed.
+            // With export, we'll be able to load the certificate and export it without a password, and propagate it through the cluster.
+            if (string.IsNullOrWhiteSpace(password) == false)
+                throw new NotSupportedException("Replacing the cluster certificate with a password protected certificates is currently not supported.");
+
             X509Certificate2 cert;
+            byte[] certBytes;
             try
             {
-                cert = new X509Certificate2(path, password, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+                certBytes = File.ReadAllBytes(path);
+                cert = new X509Certificate2(path, password, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
             }
             catch (Exception e)
             {
@@ -766,7 +850,7 @@ namespace Raven.Server.Utils.Cli
             {
                 var timeoutTask = TimeoutManager.WaitFor(TimeSpan.FromSeconds(60), cli._server.ServerStore.ServerShutdown);
 
-                var replicationTask = cli._server.ServerStore.Server.StartCertificateReplicationAsync(cert, name, replaceImmediately);
+                var replicationTask = cli._server.ServerStore.Server.StartCertificateReplicationAsync(Convert.ToBase64String(certBytes), replaceImmediately);
 
                 Task.WhenAny(replicationTask, timeoutTask).Wait();
                 if (replicationTask.IsCompleted == false)
@@ -791,7 +875,7 @@ namespace Raven.Server.Utils.Cli
             }
 
             var replaceImmediately = args[0] != null && args[0].Equals("-replaceImmediately");
-            
+
             try
             {
                 cli._server.RefreshClusterCertificate(replaceImmediately);
@@ -909,11 +993,12 @@ namespace Raven.Server.Utils.Cli
         {
             WriteText("Before simulating low-mem, memory stats: ", TextColor, cli, newLine: false);
 
+            var workingSetText = PlatformDetails.RunningOnPosix == false ? "Working Set" : "RSS";
             var memoryStats = MemoryStatsWithMemoryMappedInfo();
             var msg = new StringBuilder();
-            msg.Append($"Working Set:{memoryStats.WorkingSet}");
-            msg.Append($" Unmamanged Memory:{memoryStats.TotalUnmanagedAllocations}");
-            msg.Append($" Managed Memory:{memoryStats.ManagedMemory}");
+            msg.Append($"{workingSetText}: {memoryStats.WorkingSet}");
+            msg.Append($" Unmanaged Memory: {memoryStats.TotalUnmanagedAllocations}");
+            msg.Append($" Managed Memory: {memoryStats.ManagedMemory}");
             WriteText(msg.ToString(), ConsoleColor.Cyan, cli);
 
             WriteText("Sending Low Memory simulation signal... ", TextColor, cli, newLine: false);
@@ -922,9 +1007,9 @@ namespace Raven.Server.Utils.Cli
 
             WriteText("After sending low mem simulation event, memory stats: ", TextColor, cli, newLine: false);
             msg.Clear();
-            msg.Append($"Working Set:{memoryStats.WorkingSet}");
-            msg.Append($" Unmamanged Memory:{memoryStats.TotalUnmanagedAllocations}");
-            msg.Append($" Managed Memory:{memoryStats.ManagedMemory}");
+            msg.Append($"Working Set: {memoryStats.WorkingSet}");
+            msg.Append($" Unmanaged Memory: {memoryStats.TotalUnmanagedAllocations}");
+            msg.Append($" Managed Memory: {memoryStats.ManagedMemory}");
             WriteText(msg.ToString(), ConsoleColor.Cyan, cli);
 
             return true;
@@ -936,33 +1021,28 @@ namespace Raven.Server.Utils.Cli
             string ManagedMemory,
             string TotalMemoryMapped) MemoryStatsWithMemoryMappedInfo()
         {
-            var stats = MemoryInformation.MemoryStats();
-
             long totalMemoryMapped = 0;
             foreach (var mapping in NativeMemory.FileMapping)
             {
-                var maxMapped = 0L;
-                foreach (var singleMapping in mapping.Value)
+                foreach (var singleMapping in mapping.Value.Value.Info)
                 {
-                    maxMapped = Math.Max(maxMapped, singleMapping.Value);
+                    totalMemoryMapped += singleMapping.Value;
                 }
-
-                totalMemoryMapped += maxMapped;
             }
 
             return (
-                SizeClient.Humane(stats.WorkingSet),
-                SizeClient.Humane(stats.TotalUnmanagedAllocations),
-                SizeClient.Humane(stats.ManagedMemory),
+                SizeClient.Humane(MemoryInformation.GetWorkingSetInBytes()),
+                SizeClient.Humane(MemoryInformation.GetUnManagedAllocationsInBytes()),
+                SizeClient.Humane(MemoryInformation.GetManagedMemoryInBytes()),
                 SizeClient.Humane(totalMemoryMapped));
         }
 
         private static bool CommandImportDir(List<string> args, RavenCli cli)
         {
             // ImportDir <databaseName> <path-to-dir>
-            WriteText($"ImportDir for database {args[0]} from dir `{args[1]}` to {cli._server.WebUrl}", ConsoleColor.Yellow, cli);
+            WriteText($"ImportDir for database {args[0]} from dir `{args[1]}` to {cli._server.ServerStore.GetNodeHttpServerUrl()}", ConsoleColor.Yellow, cli);
 
-            var url = $"{cli._server.WebUrl}/databases/{args[0]}/smuggler/import-dir?dir={args[1]}";
+            var url = $"{cli._server.ServerStore.GetNodeHttpServerUrl()}/databases/{args[0]}/smuggler/import-dir?dir={args[1]}";
             using (var client = new HttpClient())
             {
                 WriteText("Sending at " + DateTime.UtcNow, TextColor, cli);
@@ -978,7 +1058,7 @@ namespace Raven.Server.Utils.Cli
             // CreateDb <databaseName> <DataDir>
             WriteText($"Create database {args[0]} with DataDir `{args[1]}`", ConsoleColor.Yellow, cli);
 
-            var port = new Uri(cli._server.WebUrl).Port;
+            var port = new Uri(cli._server.ServerStore.GetNodeHttpServerUrl()).Port;
 
             using (var store = new DocumentStore
             {
@@ -993,7 +1073,7 @@ namespace Raven.Server.Utils.Cli
                         ["DataDir"] = args[1]
                     }
                 };
-                var res = store.Maintenance.Server.SendAsync(new CreateDatabaseOperation(doc)).Result;
+                var res = store.Maintenance.Server.Send(new CreateDatabaseOperation(doc));
                 WriteText("Database creation results = " + res.Name, TextColor, cli);
             }
             return true;
@@ -1013,7 +1093,8 @@ namespace Raven.Server.Utils.Cli
                 new[] {"helpPrompt", "Detailed prompt command usage"},
                 new[] {"clear", "Clear screen"},
                 new[] {"stats", "Online server's memory consumption stats, request ratio and documents count"},
-                new[] {"log [http-]<on|off|information/operations> [no-console]", "set log on/off or to specific mode. filter requests using http-on/offlog. no-console to avoid printing in CLI"},
+                new[] {"threadsInfo", "Online server's threads info (CPU, priority, state"},
+                new[] {"log [http-]<on|off|information/operations> [no-console]", "set log on/off or to specific mode. filter requests using http-on/off log. no-console to avoid printing in CLI"},
                 new[] {"info", "Print system info and current stats"},
                 new[] {"logo [no-clear]", "Clear screen and print initial logo"},
                 new[] {"gc [gen]", "Collect garbage of specified gen : 0, 1 or default 2"},
@@ -1022,6 +1103,7 @@ namespace Raven.Server.Utils.Cli
                 new[] {"experimental <on|off>", "Set if to allow experimental cli commands. WARNING: Use with care!"},
                 new[] {"script <server|database> [database]", "Execute script on server or specified database. WARNING: Use with care!"},
                 new[] {"logout", "Logout (applicable only on piped connection)"},
+                new[] {"openBrowser", "Open the RavenDB Studio using the default browser"},
                 new[] {"resetServer", "Restarts the server (shutdown and re-run)"},
                 new[] {"shutdown", "Shutdown the server"},
                 new[] {"help", "This help screen"},
@@ -1068,32 +1150,34 @@ namespace Raven.Server.Utils.Cli
 
         private readonly Dictionary<Command, SingleAction> _actions = new Dictionary<Command, SingleAction>
         {
-            [Command.Prompt] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandPrompt },
-            [Command.HelpPrompt] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandHelpPrompt },
-            [Command.Stats] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandStats },
-            [Command.Gc] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandGc },
-            [Command.Log] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandLog },
-            [Command.Clear] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandClear },
-            [Command.TrustServerCert] = new SingleAction { NumOfArgs = 2, DelegateFync = CommandTrustServerCert },
-            [Command.TrustClientCert] = new SingleAction { NumOfArgs = 2, DelegateFync = CommandTrustClientCert },
-            [Command.GenerateClientCert] = new SingleAction { NumOfArgs = 2, DelegateFync = CommandGenerateClientCert },
-            [Command.ReplaceClusterCert] = new SingleAction { NumOfArgs = 2, DelegateFync = CommandReplaceClusterCert},
-            [Command.TriggerCertificateRefresh] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandTriggerCertificateRefresh},
-            [Command.Info] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandInfo },
-            [Command.Logo] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandLogo },
-            [Command.Experimental] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandExperimental },
-            [Command.Script] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandScript },
-            [Command.LowMem] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandLowMem },
-            [Command.Timer] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandTimer },
-            [Command.ResetServer] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandResetServer },
-            [Command.Logout] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandLogout },
-            [Command.Shutdown] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandShutdown },
-            [Command.Help] = new SingleAction { NumOfArgs = 0, DelegateFync = CommandHelp },
+            [Command.Prompt] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandPrompt },
+            [Command.HelpPrompt] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandHelpPrompt },
+            [Command.Stats] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandStats },
+            [Command.TopThreads] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandTopThreads },
+            [Command.Gc] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandGc },
+            [Command.Log] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandLog },
+            [Command.Clear] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandClear },
+            [Command.TrustServerCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandTrustServerCert },
+            [Command.TrustClientCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandTrustClientCert },
+            [Command.GenerateClientCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandGenerateClientCert },
+            [Command.ReplaceClusterCert] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandReplaceClusterCert },
+            [Command.TriggerCertificateRefresh] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandTriggerCertificateRefresh },
+            [Command.Info] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandInfo },
+            [Command.Logo] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandLogo },
+            [Command.Experimental] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandExperimental },
+            [Command.Script] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandScript },
+            [Command.LowMem] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandLowMem },
+            [Command.Timer] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandTimer },
+            [Command.OpenBrowser] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandOpenBrowser },
+            [Command.ResetServer] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandResetServer },
+            [Command.Logout] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandLogout },
+            [Command.Shutdown] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandShutdown },
+            [Command.Help] = new SingleAction { NumOfArgs = 0, DelegateFunc = CommandHelp },
 
             // experimental, will not appear in 'help':
-            [Command.ImportDir] = new SingleAction { NumOfArgs = 2, DelegateFync = CommandImportDir, Experimental = true },
-            [Command.CreateDb] = new SingleAction { NumOfArgs = 2, DelegateFync = CommandCreateDb, Experimental = true },
-            [Command.Print] = new SingleAction { NumOfArgs = 1, DelegateFync = CommandPrint, Experimental = true }, // test cli
+            [Command.ImportDir] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandImportDir, Experimental = true },
+            [Command.CreateDb] = new SingleAction { NumOfArgs = 2, DelegateFunc = CommandCreateDb, Experimental = true },
+            [Command.Print] = new SingleAction { NumOfArgs = 1, DelegateFunc = CommandPrint, Experimental = true }, // test cli
         };
 
         public bool Start(RavenServer server, TextWriter textWriter, TextReader textReader, bool consoleColoring)
@@ -1103,7 +1187,7 @@ namespace Raven.Server.Utils.Cli
             _reader = textReader;
             _consoleColoring = consoleColoring;
 
-            var parentProcessId = server.Configuration.Testing.ParentProcessId;
+            var parentProcessId = server.Configuration.Embedded.ParentProcessId;
             if (parentProcessId != null)
             {
                 void OnParentProcessExit(object o, EventArgs e)
@@ -1131,7 +1215,7 @@ namespace Raven.Server.Utils.Cli
             }
             catch (Exception ex)
             {
-                // incase of cli failure - prevent server from going down, and switch to a (very) simple fallback cli
+                // in case of cli failure - prevent server from going down, and switch to a (very) simple fallback cli
                 WriteText("\nERROR in CLI:" + ex, ErrorColor, this, newLine: false);
                 WriteText("\n\nSwitching to simple cli...", ErrorColor, this, newLine: false);
 
@@ -1247,7 +1331,7 @@ namespace Raven.Server.Utils.Cli
                         {
                             if (_experimental == false)
                             {
-                                WriteError($"{parsedCommand.Command} is experimental, and can be executed only if expermintal option set to on", this);
+                                WriteError($"{parsedCommand.Command} is experimental, and can be executed only if experimental option is set to on", this);
                                 lastRc = false;
                                 continue;
                             }
@@ -1264,7 +1348,7 @@ namespace Raven.Server.Utils.Cli
                                 continue;
                             }
                         }
-                        lastRc = cmd.DelegateFync.Invoke(parsedCommand.Args, this);
+                        lastRc = cmd.DelegateFunc.Invoke(parsedCommand.Args, this);
 
                         if (parsedCommand.Command == Command.Prompt && lastRc)
                             _promptArgs = parsedCommand.Args;
@@ -1372,7 +1456,6 @@ namespace Raven.Server.Utils.Cli
                     break;
             }
 
-
             return cmd;
         }
 
@@ -1416,9 +1499,12 @@ namespace Raven.Server.Utils.Cli
                 }
                 if (words.Count == 0)
                 {
-                    if (_actions[parsedLine.ParsedCommands.Last().Command].NumOfArgs > 0)
+                    var numOfArgs = _actions[parsedLine.ParsedCommands.Last().Command].NumOfArgs;
+                    if (numOfArgs > 0)
                     {
-                        parsedLine.ErrorMsg = $"Missing argument(s) after command : {parsedLine.ParsedCommands.Last().Command} (should get at least {_actions[parsedLine.ParsedCommands.Last().Command].NumOfArgs} arguments but got none)";
+                        parsedLine.ErrorMsg = $"Missing argument(s) after command : " +
+                                              $"{parsedLine.ParsedCommands.Last().Command} " +
+                                              $"(should get at least {numOfArgs} argument{(numOfArgs > 1 ? "s" : string.Empty)} but got none)";
                         return false;
                     }
                     return true;
@@ -1479,9 +1565,12 @@ namespace Raven.Server.Utils.Cli
                 parsedLine.ParsedCommands.Last().Args = args;
                 if (lastAction == null)
                 {
-                    if (args.Count < _actions[parsedLine.ParsedCommands.Last().Command].NumOfArgs)
+                    var numOfArgs = _actions[parsedLine.ParsedCommands.Last().Command].NumOfArgs;
+                    if (args.Count < numOfArgs)
                     {
-                        parsedLine.ErrorMsg = $"Missing argument(s) after command : {parsedLine.ParsedCommands.Last().Command} (should get at least {_actions[parsedLine.ParsedCommands.Last().Command].NumOfArgs} arguments but got {args.Count})";
+                        parsedLine.ErrorMsg = $"Missing argument(s) after command : " +
+                                              $"{parsedLine.ParsedCommands.Last().Command} " +
+                                              $"(should get at least {numOfArgs} argument{(numOfArgs > 1 ? "s" : string.Empty)} but got {args.Count})";
                         return false;
                     }
                     return true;

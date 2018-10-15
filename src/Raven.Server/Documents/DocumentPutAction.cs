@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
@@ -11,9 +12,9 @@ using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Voron;
 using Voron.Data.Tables;
-using Voron.Exceptions;
 using System.Linq;
 using Raven.Client.Documents.Operations.Revisions;
+using Raven.Client.Exceptions;
 using Sparrow;
 using static Raven.Server.Documents.DocumentsStorage;
 
@@ -41,7 +42,7 @@ namespace Raven.Server.Documents
             if (context.Transaction == null)
             {
                 ThrowRequiresTransaction();
-                return default(PutOperationResults); // never hit
+                return default; // never hit
             }
 
 #if DEBUG
@@ -83,6 +84,7 @@ namespace Raven.Server.Documents
                     // null - means, don't care, don't check
                     // "" / empty - means, must be new
                     // anything else - must match exactly
+
                     if (expectedChangeVector != null) 
                     {
                         var oldChangeVector = TableValueToChangeVector(context, (int)DocumentsTable.ChangeVector, ref oldValue);
@@ -97,22 +99,33 @@ namespace Raven.Server.Documents
 
                     var oldFlags = TableValueToFlags((int)DocumentsTable.Flags, ref oldValue);
 
-                    if ((nonPersistentFlags & NonPersistentDocumentFlags.ByAttachmentUpdate) != NonPersistentDocumentFlags.ByAttachmentUpdate &&
-                        (nonPersistentFlags & NonPersistentDocumentFlags.FromReplication) != NonPersistentDocumentFlags.FromReplication)
+                    if ((nonPersistentFlags & NonPersistentDocumentFlags.FromReplication) != NonPersistentDocumentFlags.FromReplication)
                     {
-                        if ((oldFlags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
+                        if ((nonPersistentFlags & NonPersistentDocumentFlags.ByAttachmentUpdate) != NonPersistentDocumentFlags.ByAttachmentUpdate &&
+                            (oldFlags & DocumentFlags.HasAttachments) == DocumentFlags.HasAttachments)
                         {
                             flags |= DocumentFlags.HasAttachments;
                         }
+
+                        if ((nonPersistentFlags & NonPersistentDocumentFlags.ByCountersUpdate) != NonPersistentDocumentFlags.ByCountersUpdate &&
+                            (oldFlags & DocumentFlags.HasCounters) == DocumentFlags.HasCounters)
+                        {
+                            flags |= DocumentFlags.HasCounters;
+                        }
                     }
+
                 }
 
                 var result = BuildChangeVectorAndResolveConflicts(context, id, lowerId, newEtag, document, changeVector, expectedChangeVector, flags, oldValue);
 
-                if (string.IsNullOrEmpty(result.ChangeVector))
-                    ChangeVectorUtils.ThrowConflictingEtag(id, changeVector, newEtag, _documentsStorage.Environment.Base64Id, _documentDatabase.ServerStore.NodeTag);
+                if (flags.Contain(DocumentFlags.FromClusterTransaction) == false)
+                {
+                    if (string.IsNullOrEmpty(result.ChangeVector))
+                        ChangeVectorUtils.ThrowConflictingEtag(id, changeVector, newEtag, _documentsStorage.Environment.Base64Id, _documentDatabase.ServerStore.NodeTag);
 
-                changeVector = result.ChangeVector;
+                    changeVector = result.ChangeVector;
+                }
+
                 nonPersistentFlags |= result.NonPersistentFlags;
                 if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.Resolved))
                 {
@@ -140,7 +153,26 @@ namespace Raven.Server.Documents
                         AttachmentsStorage.AssertAttachments(document, flags);
 #endif
                     }
-                    
+
+                    if (ShouldRecreateCounters(context, id, oldDoc, document, ref flags, nonPersistentFlags))
+                    {
+#if DEBUG
+                        if (document.DebugHash != documentDebugHash)
+                        {
+                            throw new InvalidDataException("The incoming document " + id + " has changed _during_ the put process, " +
+                                                           "this is likely because you are trying to save a document that is already stored and was moved");
+                        }
+#endif
+                        document = context.ReadObject(document, id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
+#if DEBUG
+                        documentDebugHash = document.DebugHash;
+                        document.BlittableValidation();
+                        BlittableJsonReaderObject.AssertNoModifications(document, id, assertChildren: true);
+                        AssertMetadataWasFiltered(document);
+                        CountersStorage.AssertCounters(document, flags);
+#endif
+                    }
+
                     if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false && 
                         (flags.Contain(DocumentFlags.Resolved) || 
                         _documentDatabase.DocumentsStorage.RevisionsStorage.Configuration != null
@@ -150,8 +182,7 @@ namespace Raven.Server.Documents
                             ref flags, out RevisionsCollectionConfiguration configuration);
                         if (shouldVersion)
                         {
-                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, document, flags, nonPersistentFlags,
-                                changeVector, modifiedTicks, configuration, collectionName);
+                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, document, flags, nonPersistentFlags, changeVector, modifiedTicks, configuration, collectionName);
                         }
                     }
                 }
@@ -285,7 +316,7 @@ namespace Raven.Server.Documents
                     string nodeTag = _documentDatabase.ServerStore.NodeTag;
 
                     // PERF: we are creating an string and mutating it for performance reasons.
-                    //       while nasty this shouldnt have any side effects because value didn't
+                    //       while nasty this shouldn't have any side effects because value didn't
                     //       escape yet the function, so while not pretty it works (and it's safe).      
                     string value = new string('0', id.Length + 1 + 19 + nodeTag.Length);
                     fixed (char* valuePtr = value)
@@ -388,12 +419,96 @@ namespace Raven.Server.Documents
                 {
                     // Make sure the user did not changed the value of @attachments in the @metadata
                     // In most cases it won't be changed so we can use this value 
-                    // instead of recreating the document's blitable from scratch
+                    // instead of recreating the document's blittable from scratch
                     if (document.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false ||
                         metadata.TryGet(Constants.Documents.Metadata.Attachments, out BlittableJsonReaderArray attachments) == false ||
                         attachments.Equals(oldAttachments) == false)
                     {
                         RecreateAttachments(context, lowerId, document, metadata, ref flags);
+                        return true;
+                    }
+                }
+            }
+
+            return false;
+        }
+
+        private void RecreateCounters(DocumentsOperationContext context, string id, BlittableJsonReaderObject document,
+            BlittableJsonReaderObject metadata, ref DocumentFlags flags)
+        {
+            var countersStorage = context.DocumentDatabase.DocumentsStorage.CountersStorage;
+            var onDiskCounters = countersStorage.GetCountersForDocument(context, id).ToList();
+
+            if (onDiskCounters.Count == 0)
+            {
+                if (metadata != null)
+                {
+                    metadata.Modifications = new DynamicJsonValue(metadata);
+                    metadata.Modifications.Remove(Constants.Documents.Metadata.Counters);
+                    document.Modifications = new DynamicJsonValue(document)
+                    {
+                        [Constants.Documents.Metadata.Key] = metadata
+                    };
+                }
+
+                flags &= ~DocumentFlags.HasCounters;
+                return;
+            }
+
+            flags |= DocumentFlags.HasCounters;
+
+            if (metadata == null)
+            {
+                document.Modifications = new DynamicJsonValue(document)
+                {
+                    [Constants.Documents.Metadata.Key] = new DynamicJsonValue
+                    {
+                        [Constants.Documents.Metadata.Counters] = onDiskCounters
+                    }
+                };
+            }
+            else
+            {
+                metadata.Modifications = new DynamicJsonValue(metadata)
+                {
+                    [Constants.Documents.Metadata.Counters] = new DynamicJsonArray(onDiskCounters)
+                };
+
+                document.Modifications = new DynamicJsonValue(document)
+                {
+                    [Constants.Documents.Metadata.Key] = metadata
+                };
+
+            }
+        }
+
+        private bool ShouldRecreateCounters(DocumentsOperationContext context, string id, BlittableJsonReaderObject oldDoc,
+            BlittableJsonReaderObject document, ref DocumentFlags flags, NonPersistentDocumentFlags nonPersistentFlags)
+        {
+            if ((nonPersistentFlags & NonPersistentDocumentFlags.ResolveCountersConflict) == NonPersistentDocumentFlags.ResolveCountersConflict)
+            {
+                document.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata);
+                RecreateCounters(context, id, document, metadata, ref flags);
+                return true;
+            }
+
+            if ((flags & DocumentFlags.HasCounters) == DocumentFlags.HasCounters &&
+                (nonPersistentFlags & NonPersistentDocumentFlags.FromReplication) != NonPersistentDocumentFlags.FromReplication &&
+                (nonPersistentFlags & NonPersistentDocumentFlags.ByCountersUpdate) != NonPersistentDocumentFlags.ByCountersUpdate)
+            {
+                if (oldDoc != null &&
+                    oldDoc.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject oldMetadata) &&
+                    oldMetadata.TryGet(Constants.Documents.Metadata.Counters, out BlittableJsonReaderArray oldCounters))
+                {
+                    // Make sure the user did not change the value of @counters in the @metadata
+                    // In most cases it won't be changed so we can use this value 
+                    // instead of recreating the document's blittable from scratch
+                    if (document.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false ||
+                        metadata.TryGet(Constants.Documents.Metadata.Counters, out BlittableJsonReaderArray counters) == false ||
+                        counters.Length != oldCounters.Length ||
+                        !counters.All(oldCounters.Contains) )
+                    {
+                        RecreateCounters(context, id, document, metadata, ref flags);
                         return true;
                     }
                 }
@@ -463,17 +578,28 @@ namespace Raven.Server.Documents
         [Conditional("DEBUG")]
         public static void AssertMetadataWasFiltered(BlittableJsonReaderObject data)
         {
-            if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false)
-                return;
+            var originalNoCacheValue = data.NoCache;
 
-            var names = metadata.GetPropertyNames();
-            if (names.Contains(Constants.Documents.Metadata.Id, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.LastModified, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.IndexScore, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.ChangeVector, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.Flags, StringComparer.OrdinalIgnoreCase))
+            data.NoCache = true;
+
+            try
             {
-                throw new InvalidOperationException("Document's metadata should filter properties on before put to storage." + Environment.NewLine + data);
+                if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false)
+                    return;
+
+                var names = metadata.GetPropertyNames();
+                if (names.Contains(Constants.Documents.Metadata.Id, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.LastModified, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.IndexScore, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.ChangeVector, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.Flags, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("Document's metadata should filter properties on before put to storage." + Environment.NewLine + data);
+                }
+            }
+            finally
+            {
+                data.NoCache = originalNoCacheValue;
             }
         }
     }

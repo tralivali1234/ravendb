@@ -62,8 +62,6 @@ class cmpXchg extends viewModelBase {
         super.activate(args);
 
         continueTest.default.init(args);
-        //TODO: this.updateHelpLink("");
-
     }
 
     fetchValues(skip: number): JQueryPromise<pagedResult<Raven.Server.Web.System.CompareExchangeHandler.CompareExchangeListItem>> {
@@ -129,6 +127,8 @@ class cmpXchg extends viewModelBase {
         if (selection.length === 0) {
             throw new Error("No elements to delete");
         }
+
+        eventsCollector.default.reportEvent("cmpXchg", "delete");
         
         const deleteDialog = new deleteCompareExchangeConfirm(selection.map(x => x.Key));
 

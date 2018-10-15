@@ -7,6 +7,8 @@ import uploadCertificateCommand = require("commands/auth/uploadCertificateComman
 import deleteCertificateCommand = require("commands/auth/deleteCertificateCommand");
 import replaceClusterCertificateCommand = require("commands/auth/replaceClusterCertificateCommand");
 import updateCertificatePermissionsCommand = require("commands/auth/updateCertificatePermissionsCommand");
+import getServerCertificateSetupModeCommand = require("commands/auth/getServerCertificateSetupModeCommand");
+import forceRenewServerCertificateCommand = require("commands/auth/forceRenewServerCertificateCommand");
 import getNextOperationId = require("commands/database/studio/getNextOperationId");
 import notificationCenter = require("common/notifications/notificationCenter");
 import getClusterDomainsCommand = require("commands/auth/getClusterDomainsCommand");
@@ -16,6 +18,7 @@ import popoverUtils = require("common/popoverUtils");
 import messagePublisher = require("common/messagePublisher");
 import eventsCollector = require("common/eventsCollector");
 import changesContext = require("common/changesContext");
+import accessManager = require("common/shell/accessManager");
 
 interface unifiedCertificateDefinitionWithCache extends unifiedCertificateDefinition {
     expirationClass: string;
@@ -29,18 +32,25 @@ class certificates extends viewModelBase {
         processing: ko.observable<boolean>(false)
     };
     
+    nameFilter = ko.observable<string>("");
+    clearanceFilter = ko.observable<Raven.Client.ServerWide.Operations.Certificates.SecurityClearance>();
+    
     model = ko.observable<certificateModel>();
     showDatabasesSelector: KnockoutComputed<boolean>;
     canExportClusterCertificates: KnockoutComputed<boolean>;
     canReplaceClusterCertificate: KnockoutComputed<boolean>;
     certificates = ko.observableArray<unifiedCertificateDefinition>();
     serverCertificateThumbprint = ko.observable<string>();
+    serverCertificateSetupMode = ko.observable<Raven.Server.Commercial.SetupMode>();
+    wellKnownAdminCerts = ko.observableArray<string>([]);
+    wellKnownAdminCertsVisible = ko.observable<boolean>(false);
     
     domainsForServerCertificate = ko.observableArray<string>([]);
     
     usingHttps = location.protocol === "https:";
     
     resolveDatabasesAccess = certificateModel.resolveDatabasesAccess;
+    accessManager = accessManager.default.certificatesView;
 
     importedFileName = ko.observable<string>();
     
@@ -55,19 +65,29 @@ class certificates extends viewModelBase {
     generateCertPayload = ko.observable<string>();
 
     clearanceLabelFor = certificateModel.clearanceLabelFor;
+    securityClearanceTypes = certificateModel.securityClearanceTypes;
     
     constructor() {
         super();
 
         this.bindToCurrentInstance("onCloseEdit", "save", "enterEditCertificateMode", 
             "deletePermission", "addNewPermission", "fileSelected", "copyThumbprint",
-            "useDatabase", "deleteCertificate");
+            "useDatabase", "deleteCertificate", "renewServerCertificate", "showRenewCertificateButton");
         this.initObservables();
         this.initValidation();
+        
+        this.nameFilter.throttle(300).subscribe(() => this.filterCertificates());
+        this.clearanceFilter.subscribe(() => this.filterCertificates());
     }
     
     activate() {
-        return this.loadCertificates();
+        this.loadCertificates();
+        
+        return new getServerCertificateSetupModeCommand()
+            .execute()
+            .done((setupMode: Raven.Server.Commercial.SetupMode) => {
+                this.serverCertificateSetupMode(setupMode); 
+             });
     }
     
     compositionComplete() {
@@ -87,8 +107,32 @@ class certificates extends viewModelBase {
         });
     }
     
+    private filterCertificates() {
+        const filter = this.nameFilter().toLocaleLowerCase();
+        const clearance = this.clearanceFilter();
+        
+        this.certificates().forEach(certificate => {
+            const nameMatch = !certificate || certificate.Name.toLocaleLowerCase().includes(filter);
+            const clearanceMatch = !clearance || certificate.SecurityClearance === clearance;
+            const thumbprintMatch = !certificate || _.some(certificate.Thumbprints, x => x.toLocaleLowerCase().includes(filter));
+            certificate.Visible((nameMatch || thumbprintMatch) && clearanceMatch);
+        });
+        
+        const wellKnownAdminCerts = this.wellKnownAdminCerts();
+        
+        if (wellKnownAdminCerts.length) {
+            const clearanceMatch = !clearance || clearance === "ClusterAdmin";
+            const thumbprintMatch = _.some(wellKnownAdminCerts, x => x.toLocaleLowerCase().includes(filter));
+            this.wellKnownAdminCertsVisible(thumbprintMatch && clearanceMatch);
+        } else {
+            this.wellKnownAdminCertsVisible(false);
+        }
+    }
+    
     private onAlert(alert: Raven.Server.NotificationCenter.Notifications.AlertRaised) {
-        if (alert.AlertType === "Certificates_ReplaceError" || alert.AlertType === "Certificates_ReplaceSuccess") {
+        if (alert.AlertType === "Certificates_ReplaceError" ||
+            alert.AlertType === "Certificates_ReplaceSuccess" ||
+            alert.AlertType === "Certificates_EntireClusterReplaceSuccess") {
             this.loadCertificates();
         }
     }
@@ -96,7 +140,14 @@ class certificates extends viewModelBase {
     private initPopover() {
         popoverUtils.longWithHover($(".certificate-file-label small"),
             {
-                content: 'Select .pfx store file with single or multiple certificates. All of them will be imported under a single name.',
+                content: () => {
+                    switch (this.model().mode()) {
+                        case "replace":
+                            return 'Certificate file cannot be password protected.';
+                        case "upload":
+                            return 'Select .pfx store file with single or multiple certificates. All of them will be imported under a single name.';
+                    }
+                },
                 placement: "top"
             });
     }
@@ -125,6 +176,17 @@ class certificates extends viewModelBase {
         this.newPermissionDatabaseName.extend({
             required: true
         });
+    }    
+    
+    showRenewCertificateButton(thumbprints: string[]) {
+        return ko.pureComputed(() => {
+            return _.includes(thumbprints, this.serverCertificateThumbprint()) && this.serverCertificateSetupMode() === 'LetsEncrypt';
+        });
+    }
+    
+    renewServerCertificate() {
+        return new forceRenewServerCertificateCommand()
+            .execute();
     }
     
     enterEditCertificateMode(itemToEdit: unifiedCertificateDefinition) {
@@ -280,14 +342,13 @@ class certificates extends viewModelBase {
                             });
                 }
             });
-        
     }
     
     private loadCertificates() {
         return new getCertificatesCommand(true)
             .execute()
             .done(certificatesInfo => {
-                const mergedCertificates = [] as Array<unifiedCertificateDefinition>;
+                let mergedCertificates = [] as Array<unifiedCertificateDefinition>;
                 
                 const secondaryCertificates = [] as Array<Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition>;
                 
@@ -296,6 +357,7 @@ class certificates extends viewModelBase {
                         secondaryCertificates.push(cert);
                     } else {
                         (cert as unifiedCertificateDefinition).Thumbprints = [cert.Thumbprint];
+                        (cert as unifiedCertificateDefinition).Visible = ko.observable<boolean>(true);
                         mergedCertificates.push(cert as unifiedCertificateDefinition);
                     }
                 });
@@ -308,8 +370,11 @@ class certificates extends viewModelBase {
                     primaryCert.Thumbprints.push(cert.Thumbprint);
                 });
                 
+                mergedCertificates = _.sortBy(mergedCertificates, x => x.Name.toLocaleLowerCase());
                 this.updateCache(mergedCertificates);
-                this.certificates(mergedCertificates); 
+                this.certificates(mergedCertificates);
+                this.wellKnownAdminCerts(certificatesInfo.WellKnownAdminCerts || []);
+                this.filterCertificates();
             });
     }
     
@@ -385,6 +450,29 @@ class certificates extends viewModelBase {
         copyToClipboard.copy(thumbprint, "Thumbprint was copied to clipboard.");
     }
     
+    canDelete(securityClearance: Raven.Client.ServerWide.Operations.Certificates.SecurityClearance) {
+        return ko.pureComputed(() => {
+            if (!this.accessManager.canDeleteClusterAdminCertificate() && securityClearance === "ClusterAdmin") {
+                return false;
+            }
+            
+            if (!this.accessManager.canDeleteClusterNodeCertificate() && securityClearance === "ClusterNode") {
+                return false;
+            }
+            
+            return true; 
+        });
+    }
+
+    canGenerateCertificateForSecurityClearanceType(securityClearance: Raven.Client.ServerWide.Operations.Certificates.SecurityClearance) {
+        return ko.pureComputed(() => {
+            if (!this.accessManager.canGenerateClientCertificateForAdmin() && securityClearance === "ClusterAdmin") {
+                return false;
+            }
+
+            return true;
+        });
+    }
 }
 
 export = certificates;

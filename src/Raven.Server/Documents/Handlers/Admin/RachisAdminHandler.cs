@@ -45,42 +45,55 @@ namespace Raven.Server.Documents.Handlers.Admin
                 HttpContext.Response.Headers["Reached-Leader"] = "true";
 
                 var commandJson = await context.ReadForMemoryAsync(RequestBodyStream(), "external/rachis/command");
-                var command = CommandBase.CreateFrom(commandJson);
-
-                switch (command)
-                {
-                    case AddOrUpdateCompareExchangeBatchCommand batchCmpExchange:
-                        batchCmpExchange.ContextToWriteResult = context;
-                        break;
-                    case CompareExchangeCommandBase cmpExchange:
-                        cmpExchange.ContextToWriteResult = context;
-                        break;
-                }
-
-                var isClusterAdmin = IsClusterAdmin();
-                command.VerifyCanExecuteCommand(ServerStore, context, isClusterAdmin);
-
-                var (etag, result) = await ServerStore.Engine.PutAsync(command);
-                HttpContext.Response.StatusCode = (int)HttpStatusCode.OK;
-                var ms = context.CheckoutMemoryStream();
                 try
                 {
-                    using (var writer = new BlittableJsonTextWriter(context, ms))
+                    var command = CommandBase.CreateFrom(commandJson);
+                    switch (command)
                     {
-                        context.Write(writer, new DynamicJsonValue
-                        {
-                            [nameof(ServerStore.PutRaftCommandResult.RaftCommandIndex)] = etag,
-                            [nameof(ServerStore.PutRaftCommandResult.Data)] = result
-                        });
-                        writer.Flush();
+                        case AddOrUpdateCompareExchangeBatchCommand batchCmpExchange:
+                            batchCmpExchange.ContextToWriteResult = context;
+                            break;
+                        case CompareExchangeCommandBase cmpExchange:
+                            cmpExchange.ContextToWriteResult = context;
+                            break;
                     }
-                    // now that we know that we properly serialized it
-                    ms.Position = 0;
-                    await ms.CopyToAsync(ResponseBodyStream());
+
+                    var isClusterAdmin = IsClusterAdmin();
+                    command.VerifyCanExecuteCommand(ServerStore, context, isClusterAdmin);
+
+                    var (etag, result) = await ServerStore.Engine.PutAsync(command);
+                    HttpContext.Response.StatusCode = (int)HttpStatusCode.OK;
+                    var ms = context.CheckoutMemoryStream();
+                    try
+                    {
+                        using (var writer = new BlittableJsonTextWriter(context, ms))
+                        {
+                            context.Write(writer, new DynamicJsonValue
+                            {
+                                [nameof(ServerStore.PutRaftCommandResult.RaftCommandIndex)] = etag,
+                                [nameof(ServerStore.PutRaftCommandResult.Data)] = result,
+                            });
+                            writer.Flush();
+                        }
+
+                        // now that we know that we properly serialized it
+                        ms.Position = 0;
+                        await ms.CopyToAsync(ResponseBodyStream());
+                    }
+                    finally
+                    {
+                        context.ReturnMemoryStream(ms);
+                    }
                 }
-                finally
+                catch (NotLeadingException e)
                 {
-                    context.ReturnMemoryStream(ms);
+                    HttpContext.Response.Headers["Reached-Leader"] = "false";
+                    throw new NoLeaderException("Lost the leadership, cannot accept commands.", e);
+                }
+                catch (InvalidOperationException e)
+                {
+                    RequestRouter.AssertClientVersion(HttpContext, e);
+                    throw;
                 }
             }
         }
@@ -100,11 +113,11 @@ namespace Raven.Server.Documents.Handlers.Admin
             }
         }
 
-        [RavenAction("/admin/cluster/observer/suspend", "POST", AuthorizationStatus.ClusterAdmin)]
+        [RavenAction("/admin/cluster/observer/suspend", "POST", AuthorizationStatus.Operator)]
         public Task SuspendObserver()
         {
             SetupCORSHeaders();
-            
+
             if (ServerStore.IsLeader())
             {
                 var suspend = GetBoolValueQueryString("value");
@@ -112,13 +125,13 @@ namespace Raven.Server.Documents.Handlers.Admin
                 {
                     Server.ServerStore.Observer.Suspended = suspend.Value;
                 }
-                
+
                 NoContentStatus();
                 return Task.CompletedTask;
             }
-            
+
             RedirectToLeader();
-            
+
             return Task.CompletedTask;
         }
 
@@ -133,14 +146,15 @@ namespace Raven.Server.Documents.Handlers.Admin
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
                     var res = ServerStore.Observer.ReadDecisionsForDatabase();
-                    var json = new DynamicJsonValue{
+                    var json = new DynamicJsonValue
+                    {
                         [nameof(ClusterObserverDecisions.LeaderNode)] = Server.ServerStore.NodeTag,
                         [nameof(ClusterObserverDecisions.Term)] = Server.ServerStore.Engine.CurrentLeader?.Term,
                         [nameof(ClusterObserverDecisions.Suspended)] = Server.ServerStore.Observer.Suspended,
                         [nameof(ClusterObserverDecisions.Iteration)] = res.Iteration,
                         [nameof(ClusterObserverDecisions.ObserverLog)] = new DynamicJsonArray(res.List)
                     };
-                    
+
                     context.Write(writer, json);
                     writer.Flush();
                     return Task.CompletedTask;
@@ -150,7 +164,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             return Task.CompletedTask;
         }
 
-        [RavenAction("/admin/cluster/log", "GET",AuthorizationStatus.Operator)]
+        [RavenAction("/admin/cluster/log", "GET", AuthorizationStatus.Operator)]
         public Task GetLogs()
         {
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
@@ -181,6 +195,8 @@ namespace Raven.Server.Documents.Handlers.Admin
                     var memoryInformation = MemoryInformation.GetMemoryInfo();
                     json[nameof(NodeInfo.InstalledMemoryInGb)] = memoryInformation.InstalledMemory.GetDoubleValue(SizeUnit.Gigabytes);
                     json[nameof(NodeInfo.UsableMemoryInGb)] = memoryInformation.TotalPhysicalMemory.GetDoubleValue(SizeUnit.Gigabytes);
+                    json[nameof(NodeInfo.BuildInfo)] = LicenseManager.BuildInfo;
+                    json[nameof(NodeInfo.OsInfo)] = LicenseManager.OsInfo;
                     json[nameof(NodeInfo.ServerId)] = ServerStore.GetServerId().ToString();
                     json[nameof(NodeInfo.CurrentState)] = ServerStore.CurrentRachisState;
                 }
@@ -228,7 +244,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
                     var loadLicenseLimits = ServerStore.LoadLicenseLimits();
-                    var nodeLicenseDetails = loadLicenseLimits == null ? 
+                    var nodeLicenseDetails = loadLicenseLimits == null ?
                         null : DynamicJsonValue.Convert(loadLicenseLimits.NodeLicenseDetails);
                     var json = new DynamicJsonValue
                     {
@@ -292,12 +308,20 @@ namespace Raven.Server.Documents.Handlers.Admin
             return Task.CompletedTask;
         }
 
+        [RavenAction("/admin/cluster/bootstrap", "POST", AuthorizationStatus.ClusterAdmin)]
+        public Task Bootstrap()
+        {
+            ServerStore.EnsureNotPassive();
+            return NoContent();
+        }
+
         [RavenAction("/admin/cluster/node", "PUT", AuthorizationStatus.ClusterAdmin)]
         public async Task AddNode()
         {
             SetupCORSHeaders();
 
             var nodeUrl = GetQueryStringValueAndAssertIfSingleAndNotEmpty("url");
+            var tag = GetStringQueryString("tag", false);
             var watcher = GetBoolValueQueryString("watcher", false);
             var assignedCores = GetIntValueQueryString("assignedCores", false);
             if (assignedCores <= 0)
@@ -328,7 +352,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 }
 
                 nodeInfo = infoCmd.Result;
-                
+
                 if (ServerStore.IsPassive() && nodeInfo.TopologyId != null)
                 {
                     throw new TopologyMismatchException("You can't add new node to an already existing cluster");
@@ -358,7 +382,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                     ClusterTopology clusterTopology;
                     using (ctx.OpenReadTransaction())
                     {
-                        clusterTopology = ServerStore.GetClusterTopology(ctx);                        
+                        clusterTopology = ServerStore.GetClusterTopology(ctx);
                         topologyId = clusterTopology.TopologyId;
                     }
 
@@ -368,9 +392,9 @@ namespace Raven.Server.Documents.Handlers.Admin
                         throw new InvalidOperationException($"Can't add a new node on {nodeUrl} to cluster because this url is already used by node {possibleNode.NodeTag}");
                     }
 
-                    if (nodeInfo.ServerId == ServerStore.GetServerId())                    
+                    if (nodeInfo.ServerId == ServerStore.GetServerId())
                         throw new InvalidOperationException($"Can't add a new node on {nodeUrl} to cluster because it's a synonym of the current node URL:{ServerStore.GetNodeHttpServerUrl()}");
-                    
+
                     if (nodeInfo.TopologyId != null)
                     {
                         if (topologyId != nodeInfo.TopologyId)
@@ -388,16 +412,16 @@ namespace Raven.Server.Documents.Handlers.Admin
                         }
                     }
 
-                    var nodeTag = nodeInfo.NodeTag == RachisConsensus.InitialTag ? null : nodeInfo.NodeTag;
+                    var nodeTag = nodeInfo.NodeTag == RachisConsensus.InitialTag ? tag : nodeInfo.NodeTag;
                     CertificateDefinition oldServerCert = null;
                     X509Certificate2 certificate = null;
 
                     if (remoteIsHttps)
                     {
                         if (nodeInfo.Certificate == null)
-                            throw  new InvalidOperationException($"Cannot add node {nodeTag} with url {nodeUrl} to cluster because it has no certificate while trying to use HTTPS");
+                            throw new InvalidOperationException($"Cannot add node {nodeTag} with url {nodeUrl} to cluster because it has no certificate while trying to use HTTPS");
 
-                        certificate = new X509Certificate2(Convert.FromBase64String(nodeInfo.Certificate));
+                        certificate = new X509Certificate2(Convert.FromBase64String(nodeInfo.Certificate), (string)null, X509KeyStorageFlags.MachineKeySet);
 
                         var now = DateTime.UtcNow;
                         if (certificate.NotBefore.ToUniversalTime() > now)
@@ -444,8 +468,8 @@ namespace Raven.Server.Documents.Handlers.Admin
                             await ServerStore.Cluster.WaitForIndexNotification(res.Index);
                         }
                     }
-                        
-                    await ServerStore.AddNodeToClusterAsync(nodeUrl, nodeTag, validateNotInTopology:false, asWatcher: watcher ?? false);
+
+                    await ServerStore.AddNodeToClusterAsync(nodeUrl, nodeTag, validateNotInTopology: true, asWatcher: watcher ?? false);
 
                     using (ctx.OpenReadTransaction())
                     {
@@ -459,7 +483,7 @@ namespace Raven.Server.Documents.Handlers.Admin
 
                             var modifiedServerCert = JsonDeserializationServer.CertificateDefinition(ServerStore.Cluster.Read(ctx, key));
 
-                            if(modifiedServerCert == null)
+                            if (modifiedServerCert == null)
                                 throw new ConcurrencyException("After adding the certificate, it was removed, shouldn't happen unless another admin removed it midway through.");
 
                             if (oldServerCert == null)
@@ -483,7 +507,9 @@ namespace Raven.Server.Documents.Handlers.Admin
                             AssignedCores = assignedCores.Value,
                             NumberOfCores = nodeInfo.NumberOfCores,
                             InstalledMemoryInGb = nodeInfo.InstalledMemoryInGb,
-                            UsableMemoryInGb = nodeInfo.UsableMemoryInGb
+                            UsableMemoryInGb = nodeInfo.UsableMemoryInGb,
+                            BuildInfo = nodeInfo.BuildInfo,
+                            OsInfo = nodeInfo.OsInfo
                         };
                         await ServerStore.LicenseManager.CalculateLicenseLimits(nodeDetails, forceFetchingNodeInfo: true, waitToUpdate: true);
                     }
@@ -504,6 +530,15 @@ namespace Raven.Server.Documents.Handlers.Admin
             ServerStore.EnsureNotPassive();
             if (ServerStore.IsLeader())
             {
+                if (nodeTag == ServerStore.Engine.Tag)
+                {
+                    // cannot remove the leader, let's change the leader
+                    ServerStore.Engine.CurrentLeader?.StepDown();
+                    await ServerStore.Engine.WaitForState(RachisState.Follower, HttpContext.RequestAborted);
+                    RedirectToLeader();
+                    return;
+                }
+
                 await ServerStore.RemoveFromClusterAsync(nodeTag);
                 await ServerStore.LicenseManager.CalculateLicenseLimits(forceFetchingNodeInfo: true, waitToUpdate: true);
                 NoContentStatus();
@@ -536,7 +571,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             RedirectToLeader();
         }
 
-        [RavenAction("/admin/cluster/timeout", "POST", AuthorizationStatus.ClusterAdmin)]
+        [RavenAction("/admin/cluster/timeout", "POST", AuthorizationStatus.Operator)]
         public Task TimeoutNow()
         {
             SetupCORSHeaders();
@@ -547,7 +582,7 @@ namespace Raven.Server.Documents.Handlers.Admin
         }
 
 
-        [RavenAction("/admin/cluster/reelect", "POST", AuthorizationStatus.ClusterAdmin)]
+        [RavenAction("/admin/cluster/reelect", "POST", AuthorizationStatus.Operator)]
         public Task EnforceReelection()
         {
             SetupCORSHeaders();
@@ -563,7 +598,7 @@ namespace Raven.Server.Documents.Handlers.Admin
         }
 
         /* Promote a non-voter to a promotable */
-        [RavenAction("/admin/cluster/promote", "POST", AuthorizationStatus.ClusterAdmin)]
+        [RavenAction("/admin/cluster/promote", "POST", AuthorizationStatus.Operator)]
         public async Task PromoteNode()
         {
             if (ServerStore.LeaderTag == null)
@@ -588,7 +623,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 if (topology.Watchers.ContainsKey(nodeTag) == false)
                 {
                     throw new InvalidOperationException(
-                        $"Failed to promote node {nodeTag} beacuse {nodeTag} is not a watcher in the cluster topology");
+                        $"Failed to promote node {nodeTag} because {nodeTag} is not a watcher in the cluster topology");
                 }
 
                 var url = topology.GetUrlFromTag(nodeTag);
@@ -598,7 +633,7 @@ namespace Raven.Server.Documents.Handlers.Admin
         }
 
         /* Demote a voter (member/promotable) node to a non-voter  */
-        [RavenAction("/admin/cluster/demote", "POST", AuthorizationStatus.ClusterAdmin)]
+        [RavenAction("/admin/cluster/demote", "POST", AuthorizationStatus.Operator)]
         public async Task DemoteNode()
         {
             if (ServerStore.LeaderTag == null)
@@ -619,7 +654,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             if (nodeTag == ServerStore.LeaderTag)
             {
                 throw new InvalidOperationException(
-                    $"Failed to demote node {nodeTag} beacuse {nodeTag} is the current leader in the cluster topology. In order to demote {nodeTag} perform a Step-Down first");
+                    $"Failed to demote node {nodeTag} because {nodeTag} is the current leader in the cluster topology. In order to demote {nodeTag} perform a Step-Down first");
             }
 
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
@@ -629,13 +664,13 @@ namespace Raven.Server.Documents.Handlers.Admin
                 if (topology.Promotables.ContainsKey(nodeTag) == false && topology.Members.ContainsKey(nodeTag) == false)
                 {
                     throw new InvalidOperationException(
-                        $"Failed to demote node {nodeTag} beacuse {nodeTag} is not a voter in the cluster topology");
+                        $"Failed to demote node {nodeTag} because {nodeTag} is not a voter in the cluster topology");
                 }
 
                 var url = topology.GetUrlFromTag(nodeTag);
                 await ServerStore.Engine.ModifyTopologyAsync(nodeTag, url, Leader.TopologyModification.NonVoter);
                 NoContentStatus();
-            }           
+            }
         }
 
         private void RedirectToLeader()
@@ -652,7 +687,7 @@ namespace Raven.Server.Documents.Handlers.Admin
             var url = topology.GetUrlFromTag(ServerStore.LeaderTag);
             if (string.Equals(url, ServerStore.GetNodeHttpServerUrl(), StringComparison.OrdinalIgnoreCase))
             {
-                throw new NoLeaderException($"This node is not the leader, but the current toplogy does mark it as the leader. Such confusion is usually an indication of a network or configuration problem.");
+                throw new NoLeaderException($"This node is not the leader, but the current topology does mark it as the leader. Such confusion is usually an indication of a network or configuration problem.");
             }
             var leaderLocation = url + HttpContext.Request.Path + HttpContext.Request.QueryString;
             HttpContext.Response.StatusCode = (int)HttpStatusCode.TemporaryRedirect;

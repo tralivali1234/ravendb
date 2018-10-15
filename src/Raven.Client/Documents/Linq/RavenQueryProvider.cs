@@ -11,7 +11,9 @@ using System.Linq.Expressions;
 using System.Reflection;
 using System.Threading;
 using System.Threading.Tasks;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Queries.Highlighting;
 using Raven.Client.Documents.Session;
 using Raven.Client.Extensions;
 
@@ -28,24 +30,24 @@ namespace Raven.Client.Documents.Linq
         private readonly string _collectionName;
         private readonly IDocumentQueryGenerator _queryGenerator;
         private readonly QueryStatistics _queryStatistics;
-#if FEATURE_HIGHLIGHTING
-        private readonly QueryHighlightings _highlightings;
-#endif
+        private readonly LinqQueryHighlightings _highlightings;
         private readonly bool _isMapReduce;
+        private DocumentConventions _conventions;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RavenQueryProvider{T}"/> class.
         /// </summary>
         public RavenQueryProvider(
+#if FEATURE_HIGHLIGHTING
+            QueryHighlightings highlightings,
+#endif
             IDocumentQueryGenerator queryGenerator,
             string indexName,
             string collectionName,
             Type originalQueryType,
             QueryStatistics queryStatistics,
-#if FEATURE_HIGHLIGHTING
-            QueryHighlightings highlightings,
-#endif
-            bool isMapReduce)
+            LinqQueryHighlightings highlightings,
+            bool isMapReduce, DocumentConventions conventions)
         {
             FieldsToFetch = new HashSet<FieldToFetch>();
             OriginalQueryType = originalQueryType;
@@ -54,10 +56,9 @@ namespace Raven.Client.Documents.Linq
             _indexName = indexName;
             _collectionName = collectionName;
             _queryStatistics = queryStatistics;
-#if FEATURE_HIGHLIGHTING
             _highlightings = highlightings;
-#endif
             _isMapReduce = isMapReduce;
+            _conventions = conventions;
         }
 
         /// <summary>
@@ -103,10 +104,9 @@ namespace Raven.Client.Documents.Linq
                 _collectionName,
                 OriginalQueryType,
                 _queryStatistics,
-#if FEATURE_HIGHLIGHTING
                 _highlightings,
-#endif
-                _isMapReduce);
+                _isMapReduce,
+                _conventions);
 
             ravenQueryProvider.Customize(_customizeQuery);
 
@@ -132,13 +132,11 @@ namespace Raven.Client.Documents.Linq
             a.Init(
                 this,
                 _queryStatistics,
-#if FEATURE_HIGHLIGHTING
                 _highlightings,
-#endif
                 _indexName,
                 _collectionName,
                 expression,
-                (InMemoryDocumentSessionOperations)_queryGenerator,
+                _queryGenerator.Session,
                 _isMapReduce);
 
             return a;
@@ -154,9 +152,7 @@ namespace Raven.Client.Documents.Linq
                 {
                     this,
                     _queryStatistics,
-#if FEATURE_HIGHLIGHTING
                     _highlightings,
-#endif
                     _indexName,
                     _collectionName,
                     expression,
@@ -164,7 +160,7 @@ namespace Raven.Client.Documents.Linq
                     _isMapReduce
                 };
                 var queryInspectorInstance = Activator.CreateInstance(queryInspectorGenericType);
-                var methodInfo = queryInspectorGenericType.GetMethod("Init");
+                var methodInfo = queryInspectorGenericType.GetMethod(nameof(RavenQueryInspector<T>.Init));
                 methodInfo.Invoke(queryInspectorInstance, args);
                 return (IQueryable)queryInspectorInstance;
             }
@@ -294,9 +290,17 @@ namespace Raven.Client.Documents.Linq
 
         protected virtual RavenQueryProviderProcessor<TS> GetQueryProviderProcessor<TS>()
         {
-            return new RavenQueryProviderProcessor<TS>(_queryGenerator, _customizeQuery, _afterQueryExecuted, _indexName, _collectionName,
+            return new RavenQueryProviderProcessor<TS>(
+                _queryGenerator,
+                _customizeQuery,
+                _afterQueryExecuted,
+                _highlightings,
+                _indexName,
+                _collectionName,
                 FieldsToFetch,
-                _isMapReduce, OriginalQueryType);
+                _isMapReduce, 
+                OriginalQueryType, 
+                _conventions);
         }
 
         /// <summary>

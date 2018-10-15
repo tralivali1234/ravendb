@@ -13,18 +13,23 @@ using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 using Microsoft.Extensions.Primitives;
 using Raven.Client;
+using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Documents.Operations.Counters;
+using Raven.Client.Exceptions;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.TrafficWatch;
+using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
-using ConcurrencyException = Voron.Exceptions.ConcurrencyException;
+using Sparrow.Utils;
 using DeleteDocumentCommand = Raven.Server.Documents.TransactionCommands.DeleteDocumentCommand;
 using PatchRequest = Raven.Server.Documents.Patch.PatchRequest;
 
@@ -56,6 +61,42 @@ namespace Raven.Server.Documents.Handlers
             }
         }
 
+        [RavenAction("/databases/*/docs/size", "GET", AuthorizationStatus.ValidUser)]
+        public Task GetDocSize()
+        {
+            var id = GetQueryStringValueAndAssertIfSingleAndNotEmpty("id");
+
+            using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+            using (context.OpenReadTransaction())
+            {
+                var document = Database.DocumentsStorage.GetDocumentMetrics(context, id);
+                if (document == null)
+                {
+                    HttpContext.Response.StatusCode = (int)HttpStatusCode.NotFound;
+                    return Task.CompletedTask;
+                }
+                
+                HttpContext.Response.StatusCode = (int)HttpStatusCode.OK;
+
+                var documentSizeDetails = new DocumentSizeDetails
+                {
+                    DocId = id,
+                    ActualSize = document.Value.ActualSize,
+                    HumaneActualSize = Sizes.Humane(document.Value.ActualSize),
+                    AllocatedSize = document.Value.AllocatedSize,
+                    HumaneAllocatedSize = Sizes.Humane(document.Value.AllocatedSize)
+                };
+                
+                using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+                {
+                    context.Write(writer, documentSizeDetails.ToJson());
+                    writer.Flush();
+                }
+
+                return Task.CompletedTask;
+            }
+        }
+
         [RavenAction("/databases/*/docs", "GET", AuthorizationStatus.ValidUser)]
         public async Task Get()
         {
@@ -70,7 +111,8 @@ namespace Raven.Server.Documents.Handlers
                 else
                     await GetDocumentsAsync(context, metadataOnly);
 
-                
+                if (TrafficWatchManager.HasRegisteredClients)
+                    AddStringToHttpContext(ids.ToString(), TrafficWatchChangeType.Documents);
             }
         }
 
@@ -92,7 +134,14 @@ namespace Raven.Server.Documents.Handlers
                 }
 
                 context.OpenReadTransaction();
-                await GetDocumentsByIdAsync(context, new StringValues(ids), metadataOnly);
+
+                // init here so it can be passed to TW
+                var idsStringValues = new StringValues(ids);
+
+                if (TrafficWatchManager.HasRegisteredClients)
+                    AddStringToHttpContext(idsStringValues.ToString(), TrafficWatchChangeType.Documents);
+
+                await GetDocumentsByIdAsync(context, idsStringValues, metadataOnly);
             }
         }
 
@@ -159,6 +208,9 @@ namespace Raven.Server.Documents.Handlers
             var documents = new List<Document>(ids.Count);
             var includes = new List<Document>(includePaths.Count * ids.Count);
             var includeDocs = new IncludeDocumentsCommand(Database.DocumentsStorage, context, includePaths);
+
+            GetCountersQueryString(Database, context, out var includeCounters);
+
             foreach (var id in ids)
             {
                 var document = Database.DocumentsStorage.Get(context, id);
@@ -170,6 +222,7 @@ namespace Raven.Server.Documents.Handlers
 
                 documents.Add(document);
                 includeDocs.Gather(document);
+                includeCounters?.Fill(document);
             }
 
             includeDocs.Fill(includes);
@@ -185,14 +238,31 @@ namespace Raven.Server.Documents.Handlers
 
             HttpContext.Response.Headers[Constants.Headers.Etag] = "\"" + actualEtag + "\"";
 
-            int numberOfResults = 0;            
-         
-            numberOfResults = await WriteDocumentsJsonAsync(context, metadataOnly, documents, includes, numberOfResults);         
+            int numberOfResults = 0;
+
+            numberOfResults = await WriteDocumentsJsonAsync(context, metadataOnly, documents, includes, includeCounters?.Results, numberOfResults);
 
             AddPagingPerformanceHint(PagingOperationType.Documents, nameof(GetDocumentsByIdAsync), HttpContext.Request.QueryString.Value, numberOfResults, documents.Count, sw.ElapsedMilliseconds);
         }
 
-        private async Task<int> WriteDocumentsJsonAsync(JsonOperationContext context, bool metadataOnly, IEnumerable<Document> documentsToWrite, List<Document> includes, int numberOfResults)
+        private void GetCountersQueryString(DocumentDatabase database, DocumentsOperationContext context, out IncludeCountersCommand includeCounters)
+        {
+            includeCounters = null;
+
+            var counters = GetStringValuesQueryString("counter", required: false);
+            if (counters.Count == 0)
+                return;
+
+            if (counters.Count == 1 &&
+                counters[0] == Constants.Counters.All)
+            {
+                counters = new string[0];
+            }
+
+            includeCounters = new IncludeCountersCommand(database, context, counters);
+        }
+
+        private async Task<int> WriteDocumentsJsonAsync(JsonOperationContext context, bool metadataOnly, IEnumerable<Document> documentsToWrite, List<Document> includes, Dictionary<string, List<CounterDetail>> counters ,int numberOfResults)
         {
             using (var writer = new AsyncBlittableJsonTextWriter(context, ResponseBodyStream(), Database.DatabaseShutdown))
             {
@@ -212,11 +282,18 @@ namespace Raven.Server.Documents.Handlers
                     writer.WriteEndObject();
                 }
 
+                if (counters?.Count > 0)
+                {
+                    writer.WriteComma();
+                    writer.WritePropertyName(nameof(GetDocumentsResult.CounterIncludes));
+                    await writer.WriteCountersAsync(context, counters);
+                }
+
                 writer.WriteEndObject();
                 await writer.OuterFlushAsync();
             }
             return numberOfResults;
-        }        
+        }
 
         [RavenAction("/databases/*/docs", "DELETE", AuthorizationStatus.ValidUser)]
         public async Task Delete()
@@ -243,7 +320,7 @@ namespace Raven.Server.Documents.Handlers
                 // We HAVE to read the document in full, trying to parallelize the doc read
                 // and the identity generation needs to take into account that the identity 
                 // generation can fail and will leave the reading task hanging if we abort
-                // easier to just do in syncronously
+                // easier to just do in synchronously
                 var doc = await context.ReadForDiskAsync(RequestBodyStream(), id).ConfigureAwait(false);
 
                 if (id[id.Length - 1] == '|')
@@ -325,7 +402,7 @@ namespace Raven.Server.Documents.Handlers
                         // testing patching is rare enough not to optimize it
                         using (context.OpenWriteTransaction())
                         {
-                            command.Execute(context);
+                            command.Execute(context, null);
                         }
                     }
 
@@ -408,7 +485,7 @@ namespace Raven.Server.Documents.Handlers
                     case "csharp":
                         break;
                     default:
-                        throw new NotImplementedException($"Document code generator isn't implemeted for {lang}");
+                        throw new NotImplementedException($"Document code generator isn't implemented for {lang}");
                 }
 
                 using (var writer = new StreamWriter(ResponseBodyStream()))
@@ -423,15 +500,41 @@ namespace Raven.Server.Documents.Handlers
         }
     }
 
+    public class DocumentSizeDetails : IDynamicJson
+    {
+        public string DocId { get; set; }
+        public int ActualSize { get; set; }
+        public string HumaneActualSize { get; set; }
+        public int AllocatedSize { get; set; }
+        public string HumaneAllocatedSize { get; set; }
+            
+        public virtual DynamicJsonValue ToJson()
+        {
+            return new DynamicJsonValue
+            {
+                [nameof(DocId)] = DocId,
+                [nameof(ActualSize)] = ActualSize,
+                [nameof(HumaneActualSize)] = HumaneActualSize,
+                [nameof(AllocatedSize)] = AllocatedSize,
+                [nameof(HumaneAllocatedSize)] = HumaneAllocatedSize
+            };
+        }
+    }
+    
     public class MergedPutCommand : TransactionOperationsMerger.MergedTransactionCommand, IDisposable
     {
-        private readonly string _id;
+        private string _id;
         private readonly LazyStringValue _expectedChangeVector;
         private readonly BlittableJsonReaderObject _document;
         private readonly DocumentDatabase _database;
 
         public ExceptionDispatchInfo ExceptionDispatchInfo;
         public DocumentsStorage.PutOperationResults PutResult;
+
+        public static string GenerateNonConflictingId(DocumentDatabase database, string prefix)
+        {
+            return prefix + database.DocumentsStorage.GenerateNextEtag().ToString("D19") + "-" + Guid.NewGuid().ToBase64Unpadded();
+        }
 
         public MergedPutCommand(BlittableJsonReaderObject doc, string id, LazyStringValue changeVector, DocumentDatabase database)
         {
@@ -441,11 +544,26 @@ namespace Raven.Server.Documents.Handlers
             _database = database;
         }
 
-        public override int Execute(DocumentsOperationContext context)
+        protected override int ExecuteCmd(DocumentsOperationContext context)
         {
             try
             {
                 PutResult = _database.DocumentsStorage.Put(context, _id, _expectedChangeVector, _document);
+            }
+            catch (Voron.Exceptions.VoronConcurrencyErrorException)
+            {
+                // RavenDB-10581 - If we have a concurrency error on "doc-id/" 
+                // this means that we have existing values under the current etag
+                // we'll generate a new (random) id for them. 
+
+                // The TransactionMerger will re-run us when we ask it to as a 
+                // separate transaction
+                if (_id?.EndsWith('/') == true)
+                {
+                    _id = GenerateNonConflictingId(_database, _id);
+                    RetryOnError = true;
+                }
+                throw;
             }
             catch (ConcurrencyException e)
             {
@@ -457,6 +575,28 @@ namespace Raven.Server.Documents.Handlers
         public void Dispose()
         {
             _document?.Dispose();
+        }
+
+        public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+        {
+            return new MergedPutCommandDto()
+            {
+                Id = _id,
+                ExpectedChangeVector = _expectedChangeVector,
+                Document = _document
+            };
+        }
+
+        public class MergedPutCommandDto : TransactionOperationsMerger.IReplayableCommandDto<MergedPutCommand>
+        {
+            public string Id { get; set; }
+            public LazyStringValue ExpectedChangeVector { get; set; }
+            public BlittableJsonReaderObject Document { get; set; }
+
+            public MergedPutCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+            {
+                return new MergedPutCommand(Document, Id, ExpectedChangeVector, database);
+            }
         }
     }
 }

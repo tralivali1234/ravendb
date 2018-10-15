@@ -1,20 +1,22 @@
-﻿@chart-documents-color: #66418c;
-@chart-index-color: #14717b;
-@chart-indexes-color: #219aa0;
-@chart-subscriptions-color: #d1711b;
-@chart-configuration-color: #c73774;
+﻿@chart-data-color: @color-5-2;
+@chart-documents-color: @color-5-1;
+@chart-reserved-color: @color-5;
+@chart-journal-color: @color-4-3;
+@chart-journals-color: @color-4-2;
+@chart-structure-color: @color-4-1;
+@chart-stream-color: @color-4;
+@chart-index-color: @color-3-3;
+@chart-indexes-color: @color-3-2;
+@chart-tables-color: @color-3-1;
+@chart-table_data-color: @color-3;
+@chart-table-color: @color-2;
+@chart-temp-files-color: @color-1-3;
+@chart-subscriptions-color: @color-1-2;
+@chart-trees-color: @color-1-1;
+@chart-tree-color: @color-1;
+@chart-configuration-color: @color-5-3;
 @chart-free-color: @gray-darker;
-@chart-reserved-color: #435d78;
-@chart-data-color: #8d6cab;
-@chart-tables-color: #7cb82f;
-@chart-table_data-color: #4dcb80;
-@chart-table-color: #e69c41;
-@chart-tree-color: #af1923;
-@chart-trees-color: #dd5143;
-@chart-jurnal-color: #046293;
-@chart-jurnals-color: #008cc9;
-@chart-structure-color: #80ced0;
-@chart-stream-color: #24cae0;
+
 
 #storage-report {
 
@@ -184,18 +186,34 @@
         }
 
         &.journal {
-            fill: @chart-jurnal-color;
+            fill: @chart-journal-color;
 
             &:hover {
-                fill: lighten(@chart-jurnal-color,5%);
+                fill: lighten(@chart-journal-color,5%);
             }
         }
 
         &.journals {
-            fill: @chart-jurnals-color;
+            fill: @chart-journals-color;
 
             &:hover {
-                fill: lighten(@chart-jurnals-color,5%);
+                fill: lighten(@chart-journals-color,5%);
+            }
+        }
+        
+        &.temp {
+            fill: @chart-temp-files-color;
+            
+            &:hover {
+                fill: lighten(@chart-temp-files-color,5%);
+            }
+        }
+
+        &.tempFiles {
+            fill: @chart-temp-files-color;
+
+            &:hover {
+                fill: lighten(@chart-temp-files-color,5%);
             }
         }
 
@@ -370,18 +388,26 @@
             }
 
             &.journal {
-                background-color: @chart-jurnal-color;
+                background-color: @chart-journal-color;
 
                 &:hover {
-                    background-color: lighten(@chart-jurnal-color,5%);
+                    background-color: lighten(@chart-journal-color,5%);
                 }
             }
 
             &.journals {
-                background-color: @chart-jurnals-color;
+                background-color: @chart-journals-color;
 
                 &:hover {
-                    background-color: lighten(@chart-jurnals-color,5%);
+                    background-color: lighten(@chart-journals-color,5%);
+                }
+            }
+            
+            &.tempFiles {
+                background-color: @chart-temp-files-color;
+
+                &:hover {
+                    background-color: lighten(@chart-temp-files-color,5%);
                 }
             }
 

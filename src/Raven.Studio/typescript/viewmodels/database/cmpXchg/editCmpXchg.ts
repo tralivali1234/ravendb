@@ -51,18 +51,18 @@ class editCmpXchg extends viewModelBase {
     }
 
     canActivate(args: any) {
-        super.canActivate(args);
-
-        if (args && args.key) {
-            return this.activateByKey(args.key);
-        } else {
-            return $.Deferred().resolve({ can: true });
-        }
+        return $.when<any>(super.canActivate(args))
+            .then(() => {
+                if (args && args.key) {
+                    return this.activateByKey(args.key);
+                } else {
+                    return $.Deferred().resolve({ can: true });
+                }
+            });
     }
 
     activate(navigationArgs: { database: string, key: string }) {
         super.activate(navigationArgs);
-        //TODO: this.updateHelpLink('');
 
         if (!navigationArgs || !navigationArgs.key) {
             return this.editNewValue();
@@ -305,6 +305,7 @@ class editCmpXchg extends viewModelBase {
     
     private onDeleteCompleted(success: boolean) {
         if (success) {
+            this.dirtyFlag().reset();
             router.navigate(appUrl.forCmpXchg(this.activeDatabase()));
         } else {
             this.displayExternalChange(true);

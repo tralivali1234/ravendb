@@ -6,7 +6,6 @@ using System.IO;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Sparrow.Binary;
-using Sparrow.Collections;
 using Sparrow.Json.Parsing;
 
 namespace Sparrow.Json
@@ -20,6 +19,7 @@ namespace Sparrow.Json
         private readonly int _propCount;
         private readonly long _currentOffsetSize;
         private readonly long _currentPropertyIdSize;
+        private readonly bool _isRoot;
         private byte* _objStart;
 
         public DynamicJsonValue Modifications;
@@ -49,6 +49,7 @@ namespace Sparrow.Json
             if (size == 0)
                 ThrowOnZeroSize(size);
 
+            _isRoot = true;
             _buffer = buffer;
             _mem = mem; // get beginning of memory pointer
             _size = size; // get document size
@@ -112,6 +113,7 @@ namespace Sparrow.Json
         public BlittableJsonReaderObject(int pos, BlittableJsonReaderObject parent, BlittableJsonToken type)
             : base(parent._context)
         {
+            _isRoot = false;
             _parent = parent;
             _mem = parent._mem;
             _size = parent._size;
@@ -127,7 +129,8 @@ namespace Sparrow.Json
                 _propNamesDataOffsetSize = sizeof(short);
             else if (propNamesOffsetFlag == BlittableJsonToken.OffsetSizeInt)
                 _propNamesDataOffsetSize = sizeof(int);
-            else ThrowOutOfRangeException(propNamesOffsetFlag);
+            else
+                ThrowOutOfRangeException(propNamesOffsetFlag);
 
             _objStart = _mem + pos;
             byte propCountOffset;
@@ -316,7 +319,7 @@ namespace Sparrow.Json
                     {
                         if (ChangeTypeToString(result, out string timeSpanString) == false)
                             ThrowFormatException(result, result.GetType().FullName, "string");
-                        if (TimeSpan.TryParseExact(timeSpanString, "c", CultureInfo.InvariantCulture, out TimeSpan timeSpan) == false) 
+                        if (TimeSpan.TryParseExact(timeSpanString, "c", CultureInfo.InvariantCulture, out TimeSpan timeSpan) == false)
                             ThrowFormatException(result, result.GetType().FullName, "TimeSpan");
                         obj = (T)(object)timeSpan;
                     }
@@ -339,11 +342,10 @@ namespace Sparrow.Json
                                 obj = (T)Convert.ChangeType(lazyNumberValue, type);
                                 break;
                             case LazyCompressedStringValue lazyCompressStringValue:
-                                if (typeof(T) == typeof(LazyStringValue))
-                                {
+                                if (type == typeof(LazyStringValue))
                                     obj = (T)(object)lazyCompressStringValue.ToLazyStringValue();
-                                }
-                                obj = (T)Convert.ChangeType(lazyCompressStringValue.ToString(), type);
+                                else
+                                    obj = (T)Convert.ChangeType(lazyCompressStringValue.ToString(), type);
                                 break;
                             default:
                                 obj = (T)Convert.ChangeType(result, type);
@@ -479,9 +481,11 @@ namespace Sparrow.Json
                 AddToCache(name, result, index);
             }
 
-            Return: return opResult;
+Return:
+            return opResult;
 
-            ThrowDisposed: ThrowObjectDisposed();
+ThrowDisposed:
+            ThrowObjectDisposed();
             result = null;
             return false;
         }
@@ -522,18 +526,18 @@ namespace Sparrow.Json
             if (index < 0 || index >= _propCount)
                 ThrowOutOfRangeException();
 
-            var metadataSize = (_currentOffsetSize + _currentPropertyIdSize + sizeof(byte));
-            BlittableJsonToken token;
-            int position;
-            int propertyId;
-            GetPropertyTypeAndPosition(index, metadataSize, out token, out position, out propertyId);
+            var metadataSize = _currentOffsetSize + _currentPropertyIdSize + sizeof(byte);
+            
+            GetPropertyTypeAndPosition(index, metadataSize, 
+                out var token, 
+                out var position, 
+                out var propertyId);
 
             var stringValue = GetPropertyName(propertyId);
 
             prop.Token = token;
             prop.Name = stringValue;
-            object result;
-            if (_objectsPathCacheByIndex != null && _objectsPathCacheByIndex.TryGetValue(index, out result))
+            if (_objectsPathCacheByIndex != null && _objectsPathCacheByIndex.TryGetValue(index, out var result))
             {
                 prop.Value = result;
                 return;
@@ -575,7 +579,7 @@ namespace Sparrow.Json
             long metadataSize = currentOffsetSize + currentPropertyIdSize + sizeof(byte);
             byte* metadataPtr = _metadataPtr;
 
-            int mid = comparer.LastFoundAt ?? (min + max) / 2;
+            int mid = (min + max) / 2;
             if (mid > max)
                 mid = max;
 
@@ -603,7 +607,8 @@ namespace Sparrow.Json
 
             } while (min <= max);
 
-            NotFound: return -1;
+NotFound:
+            return -1;
         }
 
         /// <summary>
@@ -676,7 +681,7 @@ namespace Sparrow.Json
                 var propRelativePos = (int)(_propNames - propertyNameOffset - _mem);
                 var size = ReadVariableSizeInt(propRelativePos, out var offset);
 
-                hash = Hashing.XXHash64.Calculate( _mem + propRelativePos + offset, (ulong)size, hash);
+                hash = Hashing.XXHash64.Calculate(_mem + propRelativePos + offset, (ulong)size, hash);
             }
             return hash;
         }
@@ -777,6 +782,11 @@ namespace Sparrow.Json
                 "Attempted to copy a nested object. This will actually copy the whole object, which is probably not what you wanted.");
         }
 
+        public BlittableJsonReaderObject CloneOnTheSameContext()
+        {
+            return Clone(_context);
+        }
+
         public BlittableJsonReaderObject Clone(JsonOperationContext context)
         {
             if (_parent != null)
@@ -797,7 +807,7 @@ namespace Sparrow.Json
                     cloned.Modifications.Properties.Enqueue(property);
                 }
             }
-            
+
             return cloned;
         }
 
@@ -970,19 +980,18 @@ namespace Sparrow.Json
                         ReadVariableSizeLong(propValueOffset);
                         break;
                     case BlittableJsonToken.LazyNumber:
-                        var floatLen = ReadNumber(_mem + objStartOffset - propOffset, 1);
-                        var floatStringBuffer = new string(' ', floatLen);
-                        fixed (char* pChars = floatStringBuffer)
-                        {
-                            for (int j = 0; j < floatLen; j++)
-                            {
-                                pChars[j] = (char)ReadNumber((_mem + objStartOffset - propOffset + 1 + j), sizeof(byte));
-                            }
-                        }
-                        double _double;
-                        var result = double.TryParse(floatStringBuffer, NumberStyles.Float, CultureInfo.InvariantCulture, out _double);
-                        if (!(result))
-                            ThrowInvalidDouble(floatStringBuffer);
+                        var numberLength = ReadVariableSizeInt(propValueOffset, out byte lengthOffset);
+                        var escCount = ReadVariableSizeInt(propValueOffset + lengthOffset + numberLength, out byte escOffset);
+
+                        // if number has any non-ascii symbols, we rull it out immediately
+                        if (escCount > 0)
+                            ThrowInvalidNumber(propValueOffset);
+
+                        var numberCharsStart = _mem + objStartOffset - propOffset + lengthOffset;
+
+                        // try and validate number using double's validation
+                        if (_context.TryParseDouble(numberCharsStart, numberLength, out _) == false)
+                            ThrowInvalidNumber(propValueOffset);
                         break;
                     case BlittableJsonToken.String:
                         StringValidation(propValueOffset);
@@ -1050,9 +1059,9 @@ namespace Sparrow.Json
             throw new InvalidDataException("Compressed string not valid");
         }
 
-        private static void ThrowInvalidDouble(string floatStringBuffer)
+        private void ThrowInvalidNumber(int numberPosition)
         {
-            throw new InvalidDataException("Double not valid (" + floatStringBuffer + ")");
+            throw new InvalidDataException("Number not valid (" + ReadStringLazily(numberPosition).ToString() + ")");
         }
 
         private static void ThrowInvalidPropertiesId()
@@ -1111,7 +1120,7 @@ namespace Sparrow.Json
 
         public override int GetHashCode()
         {
-            return _size ^ _propCount;
+            return _isRoot ? _size ^ _propCount : _propCount;
         }
 
         [Conditional("DEBUG")]

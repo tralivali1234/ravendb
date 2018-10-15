@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Util;
+using Raven.Server.Documents.Indexes.MapReduce.Exceptions;
 using Raven.Server.Exceptions;
 using Raven.Server.Utils.Stats;
 
@@ -104,7 +105,15 @@ namespace Raven.Server.Documents.Indexes
 
         public int MapAttempts => _stats.MapAttempts;
 
+        public int MapErrors => _stats.MapErrors;
+
+        public int ReduceAttempts => _stats.ReduceAttempts;
+
+        public int ReduceErrors => _stats.ReduceErrors;
+
         public int ErrorsCount => _stats.Errors?.Count ?? 0;
+
+        public int NumberOfKeptReduceErrors => _stats.NumberOfKeptReduceErrors;
 
         public void AddAllocatedBytes(long sizeInBytes)
         {
@@ -139,6 +148,11 @@ namespace Raven.Server.Documents.Indexes
         public void AddAnalyzerError(IndexAnalyzerException iae)
         {
             _stats.AddAnalyzerError(iae);
+        }
+
+        public void AddExcessiveNumberOfReduceErrors(ExcessiveNumberOfReduceErrorsException e)
+        {
+            _stats.AddExcessiveNumberOfReduceErrors(e);
         }
 
         public void AddMapError(string key, string message)
@@ -184,10 +198,13 @@ namespace Raven.Server.Documents.Indexes
             if (_stats.ReduceDetails == null)
                 _stats.ReduceDetails = new ReduceRunDetails();
 
+            if (_stats.ReduceDetails.TreesReduceDetails == null)
+                _stats.ReduceDetails.TreesReduceDetails = new TreesReduceDetails();
+
             if (isLeaf)
-                _stats.ReduceDetails.NumberOfModifiedLeafs++;
+                _stats.ReduceDetails.TreesReduceDetails.NumberOfModifiedLeafs++;
             else
-                _stats.ReduceDetails.NumberOfModifiedBranches++;
+                _stats.ReduceDetails.TreesReduceDetails.NumberOfModifiedBranches++;
         }
 
         public void RecordCompressedLeafPage()
@@ -195,7 +212,10 @@ namespace Raven.Server.Documents.Indexes
             if (_stats.ReduceDetails == null)
                 _stats.ReduceDetails = new ReduceRunDetails();
 
-            _stats.ReduceDetails.NumberOfCompressedLeafs++;
+            if (_stats.ReduceDetails.TreesReduceDetails == null)
+                _stats.ReduceDetails.TreesReduceDetails = new TreesReduceDetails();
+
+            _stats.ReduceDetails.TreesReduceDetails.NumberOfCompressedLeafs++;
         }
 
         public void RecordReduceAttempts(int numberOfEntries)
@@ -220,8 +240,26 @@ namespace Raven.Server.Documents.Indexes
                 Name = name
             };
 
+            if (_stats.ReduceDetails != null && name == "Reduce")
+            {
+                operation.ReduceDetails = new ReduceRunDetails
+                {
+                    ProcessWorkingSet = _stats.ReduceDetails.ProcessWorkingSet,
+                    ProcessPrivateMemory = _stats.ReduceDetails.ProcessPrivateMemory,
+                    CurrentlyAllocated = _stats.ReduceDetails.CurrentlyAllocated,
+                    ReduceAttempts = _stats.ReduceAttempts,
+                    ReduceSuccesses = _stats.ReduceSuccesses,
+                    ReduceErrors = _stats.ReduceErrors,
+                };
+            }
+
             if (_stats.ReduceDetails != null && name == IndexingOperation.Reduce.TreeScope)
-                operation.ReduceDetails = _stats.ReduceDetails;
+            {
+                operation.ReduceDetails = new ReduceRunDetails
+                {
+                    TreesReduceDetails = _stats.ReduceDetails.TreesReduceDetails
+                };
+            }
 
             if (_stats.MapDetails != null && name == "Map")
                 operation.MapDetails = _stats.MapDetails;
@@ -255,6 +293,23 @@ namespace Raven.Server.Documents.Indexes
                 _stats.MapDetails = new MapRunDetails();
 
             _stats.MapDetails.CurrentlyAllocated = allocations;
+        }
+
+        public void RecordReduceMemoryStats(long currentProcessWorkingSet, long currentProcessPrivateMemorySize)
+        {
+            if (_stats.ReduceDetails == null)
+                _stats.ReduceDetails = new ReduceRunDetails();
+
+            _stats.ReduceDetails.ProcessWorkingSet = currentProcessWorkingSet;
+            _stats.ReduceDetails.ProcessPrivateMemory = currentProcessPrivateMemorySize;
+        }
+
+        public void RecordReduceAllocations(long allocations)
+        {
+            if (_stats.ReduceDetails == null)
+                _stats.ReduceDetails = new ReduceRunDetails();
+
+            _stats.ReduceDetails.CurrentlyAllocated = allocations;
         }
 
         public void RecordCommitStats(int numberOfModifiedPages, int numberOf4KbsWrittenToDisk)

@@ -123,7 +123,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                         foreach (var item in _suggestionsWriters)
                         {
                             var writer = item.Value;
-                            writer.AddDocument(_converter.Document, _state);
+                            writer.AddDocument(_converter.Document, _analyzer, _state);
                         }
                     }
                 }

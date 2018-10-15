@@ -13,7 +13,8 @@ class operation extends abstractNotification {
     status = ko.observable<Raven.Client.Documents.Operations.OperationStatus>();
     killable = ko.observable<boolean>();
     taskType = ko.observable<Raven.Server.Documents.Operations.Operations.OperationType>();
-
+    detailedDescription = ko.observable<Raven.Client.Documents.Operations.IOperationDetailedDescription>();
+    
     startTime = ko.observable<moment.Moment>();
     endTime = ko.observable<moment.Moment>();
     duration: KnockoutComputed<string>;
@@ -22,6 +23,8 @@ class operation extends abstractNotification {
     isCompleted: KnockoutComputed<boolean>;
     isCanceled: KnockoutComputed<boolean>;
     isPercentageProgress: KnockoutComputed<boolean>;
+    onUpdateCallbacks: Array<() => void> = [];
+    headerIconAddonClass: KnockoutComputed<string>;
 
     constructor(db: database, dto: Raven.Server.NotificationCenter.Notifications.OperationChanged) {
         super(db, dto);
@@ -29,6 +32,10 @@ class operation extends abstractNotification {
         this.operationId(dto.OperationId);
         this.updateWith(dto);
         this.initializeObservables();
+    }
+    
+    invokeOnUpdateHandlers() {
+        this.onUpdateCallbacks.forEach(c => c());
     }
 
     updateWith(incomingChanges: Raven.Server.NotificationCenter.Notifications.OperationChanged) {
@@ -41,6 +48,7 @@ class operation extends abstractNotification {
         this.result(stateDto.Result);
         this.status(stateDto.Status);
         this.taskType(incomingChanges.TaskType);
+        this.detailedDescription(incomingChanges.DetailedDescription);
                 
         this.startTime(incomingChanges.StartTime ? moment.utc(incomingChanges.StartTime) : null);  
         this.endTime(incomingChanges.EndTime ? moment.utc(incomingChanges.EndTime) : null);
@@ -67,6 +75,19 @@ class operation extends abstractNotification {
             }
 
             return progress.hasOwnProperty("Processed") && progress.hasOwnProperty("Total");
+        });
+        
+        this.headerIconAddonClass = ko.pureComputed(() => {
+            switch (this.status()) {
+                case "Completed":
+                    return "icon-addon-tick";
+                case "Faulted":
+                    return "icon-addon-danger";
+                case "Canceled":
+                    return "icon-addon-warning";
+                default:
+                    return null;
+            }
         });
 
         // override event date - for operations we use end date (if available), or start start

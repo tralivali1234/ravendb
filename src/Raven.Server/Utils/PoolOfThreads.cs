@@ -2,6 +2,7 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
 using System.Reflection;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using Sparrow.Binary;
@@ -39,6 +40,26 @@ namespace Raven.Server.Utils
                 throw new ArgumentException("MinimumFreeCommittedMemory must be positive, but was: " + min);
 
             _minimumFreeCommittedMemory = min;
+        }
+
+        public void SetThreadsAffinityIfNeeded()
+        {
+            foreach (var pooledThread in _pool)
+            {
+                try
+                {
+                    var numberOfCoresToReduce = pooledThread.NumberOfCoresToReduce;
+                    if (numberOfCoresToReduce == null)
+                        continue;
+
+                    pooledThread.SetThreadAffinity(numberOfCoresToReduce.Value, pooledThread.ThreadMask);
+                }
+                catch (Exception e)
+                {
+                    if (_log.IsOperationsEnabled)
+                        _log.Operations("Failed to set thread affinity", e);
+                }
+            }
         }
 
         private readonly ConcurrentQueue<PooledThread> _pool = new ConcurrentQueue<PooledThread>();
@@ -112,9 +133,12 @@ namespace Raven.Server.Utils
             private string _name;
             private readonly PoolOfThreads _parent;
             private LongRunningWork _workIsDone;
-            private ulong _currentUnmangedThreadId;
+            private ulong _currentUnmanagedThreadId;
             private ProcessThread _currentProcessThread;
             private Process _currentProcess;
+
+            public int? NumberOfCoresToReduce { get; private set; }
+            public long? ThreadMask { get; private set; }
 
             public DateTime StartedAt { get; internal set; }
 
@@ -154,46 +178,9 @@ namespace Raven.Server.Utils
                     while (true)
                     {
                         _waitForWork.WaitOne();
-                        _workIsDone.ManagedThreadId = Thread.CurrentThread.ManagedThreadId;
-                        if (_action == null)
-                            return; // should only happen when we shutdown
 
-                        ResetCurrentThreadName();
-                        Thread.CurrentThread.Name = _name;
-
-                        try
-                        {
-                            LongRunningWork.Current = _workIsDone;
-                            _action(_state);
-                        }
-                        finally
-                        {
-                            _workIsDone.Set();
-                            LongRunningWork.Current = null;
-                        }
-                        _action = null;
-                        _state = null;
-                        _workIsDone = null;
-
-                        ThreadLocalCleanup.Run();
-
-                        ResetCurrentThreadName();
-                        Thread.CurrentThread.Name = "Available Pool Thread";
-
-                        if (ResetThreadPriority() == false)
+                        if (DoWork() == false)
                             return;
-
-                        if (ResetThreadAffinity() == false)
-                            return;
-
-                        _waitForWork.Reset();
-                        lock (_parent)
-                        {
-                            if (_parent._disposed)
-                                return;
-
-                            _parent._pool.Enqueue(this);
-                        }
                     }
                 }
                 finally
@@ -202,10 +189,75 @@ namespace Raven.Server.Utils
                 }
             }
 
+            //https://github.com/dotnet/coreclr/issues/20156
+            [MethodImpl(MethodImplOptions.NoInlining)]
+            private bool DoWork()
+            {
+                _workIsDone.ManagedThreadId = Thread.CurrentThread.ManagedThreadId;
+
+                if (_action == null)
+                {
+                    // should only happen when we shutdown
+                    return false;
+                }
+
+                ResetCurrentThreadName();
+                Thread.CurrentThread.Name = _name;
+
+                try
+                {
+                    LongRunningWork.Current = _workIsDone;
+                    _action(_state);
+                }
+                catch (Exception e)
+                {
+                    if (_log.IsOperationsEnabled)
+                    {
+                        _log.Operations($"An uncaught exception occurred in '{_name}' and killed the process", e);
+                    }
+
+                    throw;
+                }
+                finally
+                {
+                    _workIsDone.Set();
+                    LongRunningWork.Current = null;
+                }
+
+                _action = null;
+                _state = null;
+                _workIsDone = null;
+
+                ThreadLocalCleanup.Run();
+
+                ResetCurrentThreadName();
+                Thread.CurrentThread.Name = "Available Pool Thread";
+
+                if (ResetThreadPriority() == false)
+                    return false;
+
+                if (ResetThreadAffinity() == false)
+                    return false;
+
+                _waitForWork.Reset();
+                lock (_parent)
+                {
+                    if (_parent._disposed)
+                        return false;
+
+                    _parent._pool.Enqueue(this);
+                }
+
+                return true;
+            }
+
             private bool ResetThreadAffinity()
             {
                 if (PlatformDetails.RunningOnMacOsx)
                     return true;
+
+                NumberOfCoresToReduce = null;
+                ThreadMask = null;
 
                 try
                 {
@@ -263,7 +315,7 @@ namespace Raven.Server.Utils
                     return;
                 }
 
-                _currentUnmangedThreadId = PlatformDetails.GetCurrentThreadId();
+                _currentUnmanagedThreadId = PlatformDetails.GetCurrentThreadId();
                 _currentProcess = Process.GetCurrentProcess();
 
                 if (PlatformDetails.RunningOnLinux)
@@ -275,7 +327,7 @@ namespace Raven.Server.Utils
 
                 foreach (ProcessThread pt in _currentProcess.Threads)
                 {
-                    if (pt.Id == (uint)_currentUnmangedThreadId)
+                    if (pt.Id == (uint)_currentUnmanagedThreadId)
                     {
                         _currentProcessThread = pt;
                         break;
@@ -283,7 +335,7 @@ namespace Raven.Server.Utils
                 }
 
                 if (_currentProcessThread == null)
-                    throw new InvalidOperationException("Unable to get the current process thread: " + _currentUnmangedThreadId + ", this should not be possible");
+                    throw new InvalidOperationException("Unable to get the current process thread: " + _currentUnmanagedThreadId + ", this should not be possible");
             }
 
 
@@ -298,6 +350,9 @@ namespace Raven.Server.Utils
             {
                 if (PlatformDetails.RunningOnMacOsx)
                     return;
+
+                NumberOfCoresToReduce = numberOfCoresToReduce;
+                ThreadMask = threadMask;
 
                 if (numberOfCoresToReduce <= 0 && threadMask == null)
                     return;
@@ -375,10 +430,10 @@ namespace Raven.Server.Utils
             private void SetLinuxThreadAffinity(long affinity)
             {
                 var ulongAffinity = (ulong)affinity;
-                var result = Syscall.sched_setaffinity((int)_currentUnmangedThreadId, new IntPtr(sizeof(ulong)), ref ulongAffinity);
+                var result = Syscall.sched_setaffinity((int)_currentUnmanagedThreadId, new IntPtr(sizeof(ulong)), ref ulongAffinity);
                 if (result != 0)
                     throw new InvalidOperationException(
-                        $"Failed to set affinity for thread: {_currentUnmangedThreadId}, " +
+                        $"Failed to set affinity for thread: {_currentUnmanagedThreadId}, " +
                         $"affinity: {affinity}, result: {result}, error: {Marshal.GetLastWin32Error()}");
             }
         }

@@ -99,9 +99,9 @@ namespace Raven.Server.Documents.Operations
             OperationType operationType,
             Func<Action<IOperationProgress>, Task<IOperationResult>> taskFactory,
             long id,
+            IOperationDetailedDescription detailedDescription = null,
             OperationCancelToken token = null)
         {
-
             var operationState = new OperationState
             {
                 Status = OperationStatus.InProgress
@@ -117,7 +117,8 @@ namespace Raven.Server.Documents.Operations
             {
                 Description = description,
                 TaskType = operationType,
-                StartTime = SystemTime.UtcNow
+                StartTime = SystemTime.UtcNow,
+                DetailedDescription = detailedDescription
             };
 
             var operation = new Operation
@@ -190,7 +191,7 @@ namespace Raven.Server.Documents.Operations
 
         private void RaiseNotifications(OperationStatusChange change, Operation operation)
         {
-            var operationChanged = OperationChanged.Create(_name,change.OperationId, operation.Description, change.State, operation.Killable);
+            var operationChanged = OperationChanged.Create(_name, change.OperationId, operation.Description, change.State, operation.Killable);
 
             operation.NotifyCenter(operationChanged, x => _notificationCenter.Add(x));
 
@@ -229,7 +230,7 @@ namespace Raven.Server.Documents.Operations
                     }
                     catch (Exception)
                     {
-                        // we explictly don't care about this during shutdown
+                        // we explicitly don't care about this during shutdown
                     }
                 });
             }
@@ -241,6 +242,8 @@ namespace Raven.Server.Documents.Operations
         public IEnumerable<Operation> GetAll() => _active.Values.Union(_completed.Values);
 
         public ICollection<Operation> GetActive() => _active.Values;
+
+        public bool HasActive => _active.Count > 0;
 
         public class Operation
         {
@@ -278,7 +281,7 @@ namespace Raven.Server.Documents.Operations
 
             public void NotifyCenter(OperationChanged notification, Action<OperationChanged> addToNotificationCenter)
             {
-                if (!ShouldThrottleMessage(notification))
+                if (ShouldThrottleMessage(notification) == false)
                 {
                     addToNotificationCenter(notification);
                     return;
@@ -339,15 +342,17 @@ namespace Raven.Server.Documents.Operations
             public OperationType TaskType;
             public DateTime StartTime;
             public DateTime? EndTime;
+            public IOperationDetailedDescription DetailedDescription;
 
             public DynamicJsonValue ToJson()
             {
                 return new DynamicJsonValue
                 {
-                    ["Description"] = Description,
-                    ["TaskType"] = TaskType.ToString(),
-                    ["StartTime"] = StartTime,
-                    ["EndTime"] = EndTime
+                    [nameof(Description)] = Description,
+                    [nameof(TaskType)] = TaskType.ToString(),
+                    [nameof(StartTime)] = StartTime,
+                    [nameof(EndTime)] = EndTime,
+                    [nameof(DetailedDescription)] = DetailedDescription?.ToJson()
                 };
             }
         }
@@ -357,11 +362,11 @@ namespace Raven.Server.Documents.Operations
             [Description("Setup")]
             Setup,
 
-            [Description("Update by index")]
-            UpdateByIndex,
+            [Description("Update by Query")]
+            UpdateByQuery,
 
-            [Description("Delete by index")]
-            DeleteByIndex,
+            [Description("Delete by Query")]
+            DeleteByQuery,
 
             [Description("Database export")]
             DatabaseExport,
@@ -372,8 +377,8 @@ namespace Raven.Server.Documents.Operations
             [Description("Collection import from csv")]
             CollectionImportFromCsv,
 
-            [Description("Database migration")]
-            DatabaseMigration,
+            [Description("RavenDB Database migration")]
+            DatabaseMigrationRavenDb,
 
             [Description("Database Restore")]
             DatabaseRestore,
@@ -389,12 +394,24 @@ namespace Raven.Server.Documents.Operations
 
             [Description("Bulk Insert")]
             BulkInsert,
-            
+
+            [Description("Replay Transaction Commands")]
+            ReplayTransactionCommands,
+
             [Description("Certificate generation")]
             CertificateGeneration,
             
             [Description("Migration from v3.x")]
-            MigrationFromLegacyData
+            MigrationFromLegacyData,
+
+            [Description("Database Backup")]
+            DatabaseBackup,
+            
+            [Description("Migration from SQL")]
+            MigrationFromSql,
+
+            [Description("Database Migration")]
+            DatabaseMigration
         }
     }
 }

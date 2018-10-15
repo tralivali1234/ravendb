@@ -18,8 +18,6 @@ namespace Raven.Server.Documents.Indexes.Static
 
     public abstract class StaticIndexBase
     {
-        private LuceneDocumentConverter _createFieldsConverter;
-
         private readonly Dictionary<string, CollectionName> _collectionsCache = new Dictionary<string, CollectionName>(StringComparer.OrdinalIgnoreCase);
 
         public readonly Dictionary<string, List<IndexingFunc>> Maps = new Dictionary<string, List<IndexingFunc>>(StringComparer.OrdinalIgnoreCase);
@@ -36,7 +34,7 @@ namespace Raven.Server.Documents.Indexes.Static
 
         public string[] OutputFields;
 
-        public string[] GroupByFields;
+        public CompiledIndexField[] GroupByFields;
 
         public void AddMap(string collection, IndexingFunc map)
         {
@@ -98,6 +96,9 @@ namespace Raven.Server.Documents.Indexes.Static
                     {
                         items.Add(LoadDocument(enumerator.Current, collectionName));
                     }
+                    if (items.Count == 0)
+                        return DynamicNullObject.Null;
+
                     return new DynamicArray(items);
                 }
             }
@@ -107,37 +108,57 @@ namespace Raven.Server.Documents.Indexes.Static
                 keyOrEnumerable.GetType().FullName + ": " + keyOrEnumerable);
         }
 
+        protected IEnumerable<AbstractField> CreateField(string name, object value, CreateFieldOptions options)
+        {
+            // IMPORTANT: Do not delete this method, it is used by the indexes code when using CreateField
+
+            options = options ?? CreateFieldOptions.Default;
+
+            IndexFieldOptions allFields = null;
+            var scope = CurrentIndexingScope.Current;
+            if (scope.IndexDefinition is MapIndexDefinition mapIndexDefinition)
+                mapIndexDefinition.IndexDefinition.Fields.TryGetValue(Constants.Documents.Indexing.Fields.AllFields, out allFields);
+
+            var field = IndexField.Create(name, new IndexFieldOptions
+            {
+                Storage = options.Storage,
+                TermVector = options.TermVector,
+                Indexing = options.Indexing
+            }, allFields);
+
+            if (scope.CreateFieldConverter == null)
+                scope.CreateFieldConverter = new LuceneDocumentConverter(new IndexField[] { });
+
+            var result = new List<AbstractField>();
+            scope.CreateFieldConverter.GetRegularFields(new StaticIndexLuceneDocumentWrapper(result), field, value, CurrentIndexingScope.Current.IndexContext);
+            return result;
+        }
+
         protected IEnumerable<AbstractField> CreateField(string name, object value, bool stored = false, bool? analyzed = null)
         {
-            // IMPORTANT: Do not delete this method, it is used by the indexes code when using LoadDocument
-            FieldIndexing? index;
+            // IMPORTANT: Do not delete this method, it is used by the indexes code when using CreateField
+
+            FieldIndexing? indexing;
 
             switch (analyzed)
             {
                 case true:
-                    index = FieldIndexing.Search;
+                    indexing = FieldIndexing.Search;
                     break;
                 case false:
-                    index = FieldIndexing.Exact;
+                    indexing = FieldIndexing.Exact;
                     break;
                 default:
-                    index = null;
+                    indexing = null;
                     break;
             }
 
-            var field = IndexField.Create(name, new IndexFieldOptions
+            return CreateField(name, value, new CreateFieldOptions
             {
                 Storage = stored ? FieldStorage.Yes : FieldStorage.No,
-                TermVector = FieldTermVector.No,
-                Indexing = index
-            }, null);
-
-            if (_createFieldsConverter == null)
-                _createFieldsConverter = new LuceneDocumentConverter(new IndexField[] { });
-
-            var result = new List<AbstractField>();
-            _createFieldsConverter.GetRegularFields(new StaticIndexLuceneDocumentWrapper(result), field, value, CurrentIndexingScope.Current.IndexContext);
-            return result;
+                Indexing = indexing,
+                TermVector = FieldTermVector.No
+            });
         }
 
         public IEnumerable<AbstractField> CreateSpatialField(string name, object lat, object lng)
@@ -179,7 +200,7 @@ namespace Raven.Server.Documents.Indexes.Static
             return spatialField.CreateIndexableFields(shapeWkt);
         }
 
-        private static SpatialField GetOrCreateSpatialField(string name)
+        internal static SpatialField GetOrCreateSpatialField(string name)
         {
             if (CurrentIndexingScope.Current == null)
                 throw new InvalidOperationException("Indexing scope was not initialized.");
@@ -200,6 +221,24 @@ namespace Raven.Server.Documents.Indexes.Static
             var json = (DynamicBlittableJson)doc;
             json.EnsureMetadata();
             return json;
+        }
+
+        public dynamic AttachmentsFor(dynamic doc)
+        {
+            var metadata = MetadataFor(doc);
+            var attachments = metadata[Constants.Documents.Metadata.Attachments];
+            return attachments != null
+                ? attachments
+                : new DynamicArray(Enumerable.Empty<object>());
+        }
+
+        public dynamic CounterNamesFor(dynamic doc)
+        {
+            var metadata = MetadataFor(doc);
+            var counters = metadata[Constants.Documents.Metadata.Counters];
+            return counters != null
+                ? counters
+                : new DynamicArray(Enumerable.Empty<object>());
         }
 
         private struct StaticIndexLuceneDocumentWrapper : ILuceneDocumentWrapper

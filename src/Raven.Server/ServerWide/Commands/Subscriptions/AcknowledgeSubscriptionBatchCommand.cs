@@ -18,7 +18,7 @@ namespace Raven.Server.ServerWide.Commands.Subscriptions
         public bool HasHighlyAvailableTasks;
         public DateTime LastTimeServerMadeProgressWithDocuments;
 
-        // for serializtion
+        // for serialization
         private AcknowledgeSubscriptionBatchCommand() : base(null) { }
 
         public AcknowledgeSubscriptionBatchCommand(string databaseName) : base(databaseName)
@@ -49,9 +49,9 @@ namespace Raven.Server.ServerWide.Commands.Subscriptions
                 return context.ReadObject(existingValue, SubscriptionName);
             }
 
-            if (LastKnownSubscriptionChangeVector != subscription.ChangeVectorForNextBatchStartingPoint)
-                throw new SubscriptionChangeVectorUpdateConcurrencyException($"Can't acknowledge subscription with name {subscriptionName} due to inconsistency in change vector progress. Probably there was an admin intervention that changed the change vector value");
-
+            if (LastKnownSubscriptionChangeVector != subscription.ChangeVectorForNextBatchStartingPoint)            
+                throw new SubscriptionChangeVectorUpdateConcurrencyException($"Can't acknowledge subscription with name {subscriptionName} due to inconsistency in change vector progress. Probably there was an admin intervention that changed the change vector value. Stored value: {subscription.ChangeVectorForNextBatchStartingPoint}, received value: {LastKnownSubscriptionChangeVector}");                
+            
             subscription.ChangeVectorForNextBatchStartingPoint = ChangeVector;
             subscription.NodeTag = NodeTag;
             subscription.LastBatchAckTime = LastTimeServerMadeProgressWithDocuments;

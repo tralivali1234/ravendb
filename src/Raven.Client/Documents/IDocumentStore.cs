@@ -138,9 +138,9 @@ namespace Raven.Client.Documents
         /// <summary>
         /// Executes the index creation.
         /// </summary>
-        Task ExecuteIndexAsync(AbstractIndexCreationTask task, string database = null, CancellationToken token = default(CancellationToken));
+        Task ExecuteIndexAsync(AbstractIndexCreationTask task, string database = null, CancellationToken token = default);
 
-        Task ExecuteIndexesAsync(IEnumerable<AbstractIndexCreationTask> tasks, string database = null, CancellationToken token = default(CancellationToken));
+        Task ExecuteIndexesAsync(IEnumerable<AbstractIndexCreationTask> tasks, string database = null, CancellationToken token = default);
 
         /// <summary>
         /// Gets the conventions.
@@ -153,7 +153,7 @@ namespace Raven.Client.Documents
         /// </summary>
         string[] Urls { get; }
 
-        BulkInsertOperation BulkInsert(string database = null);
+        BulkInsertOperation BulkInsert(string database = null, CancellationToken token = default);
 
         /// <summary>
         /// Provides methods to manage data subscriptions.
@@ -167,9 +167,9 @@ namespace Raven.Client.Documents
         MaintenanceOperationExecutor Maintenance { get; }
 
         OperationExecutor Operations { get; }
-
+        
         DatabaseSmuggler Smuggler { get; }
 
-        IDisposable SetRequestTimeout(TimeSpan timeout, string database = null);
+        IDisposable SetRequestTimeout(TimeSpan timeout, string database = null);        
     }
 }

@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.IO.Pipelines;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Security.Authentication;
@@ -7,23 +8,22 @@ using System.Threading.Tasks;
 using Microsoft.AspNetCore.Http.Features;
 using Microsoft.AspNetCore.Http.Features.Authentication;
 using Microsoft.AspNetCore.Server.Kestrel.Core.Adapter.Internal;
-using Microsoft.AspNetCore.Server.Kestrel.Internal.System.IO.Pipelines;
 using Sparrow.Logging;
 
 namespace Raven.Server.Https
 {
     public class AuthenticatingAdapter : IConnectionAdapter
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<AuthenticatingAdapter>("Raven/Server");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<AuthenticatingAdapter>("Server");
 
         private readonly RavenServer _server;
         private readonly HttpsConnectionAdapter _httpsConnectionAdapter;
-        private static readonly Func<RawStream, IPipeReader> GetInput;
+        private static readonly Func<RawStream, PipeReader> GetInput;
 
         static AuthenticatingAdapter()
         {
             var field = typeof(RawStream).GetField("_input", BindingFlags.Instance | BindingFlags.NonPublic);
-            var getter = new DynamicMethod("GetInput", typeof(IPipeReader), new[]
+            var getter = new DynamicMethod("GetInput", typeof(PipeReader), new[]
             {
                 typeof(RawStream),
             });
@@ -32,8 +32,8 @@ namespace Raven.Server.Https
             ilGenerator.Emit(OpCodes.Ldarg_0);
             ilGenerator.Emit(OpCodes.Ldfld, field);
             ilGenerator.Emit(OpCodes.Ret);
-            GetInput = (Func<RawStream, IPipeReader>)getter.CreateDelegate(
-                typeof(Func<RawStream, IPipeReader>));
+            GetInput = (Func<RawStream, PipeReader>)getter.CreateDelegate(
+                typeof(Func<RawStream, PipeReader>));
         }
 
         public AuthenticatingAdapter(RavenServer server, HttpsConnectionAdapter httpsConnectionAdapter)
@@ -69,13 +69,13 @@ namespace Raven.Server.Https
                 var result = await input.ReadAsync();
                 try
                 {
-                    if (result.Buffer.First.TryGetArray(out var bytes) && bytes.Count > 0)
+                    if (result.Buffer.First.IsEmpty == false)
                     {
-                        var b = bytes.Array[bytes.Offset];
+                        var b = result.Buffer.First.Span[0];
                         if (b >= 'A' && b <= 'Z')
                         {
                             // this is a good indication that we have been connected using HTTP, instead of HTTPS
-                            // because the first characeter is a valid ASCII value. However, in SSL2, the first bit
+                            // because the first character is a valid ASCII value. However, in SSL2, the first bit
                             // is always on, and in SSL 3 / TLS 1.0 - 1.2 the first byte is 22.
                             // https://stackoverflow.com/questions/3897883/how-to-detect-an-incoming-ssl-https-handshake-ssl-wire-format
                             context.Features.Set<IHttpAuthenticationFeature>(new RavenServer.AuthenticateConnection
@@ -88,7 +88,7 @@ namespace Raven.Server.Https
                 }
                 finally
                 {
-                    input.Advance(result.Buffer.Start, result.Buffer.Start);
+                    input.AdvanceTo(result.Buffer.Start, result.Buffer.Start);
                 }
             }
 
@@ -99,7 +99,7 @@ namespace Raven.Server.Https
                 {
                     context.Features.Set<IHttpAuthenticationFeature>(new RavenServer.AuthenticateConnection
                     {
-                        WrongProtocolMessage = "RavenDB requires clients to connect using TLS 1.2, but the client used: '" + c.SslProtocol +"'."
+                        WrongProtocolMessage = "RavenDB requires clients to connect using TLS 1.2, but the client used: '" + c.SslProtocol + "'."
                     });
 
                     return c;
@@ -109,13 +109,6 @@ namespace Raven.Server.Https
             var tls = context.Features.Get<ITlsConnectionFeature>();
             var certificate = tls?.ClientCertificate;
             var authenticationStatus = _server.AuthenticateConnectionCertificate(certificate);
-            var info = context.Features.Get<IHttpConnectionFeature>();
-            if (Logger.IsInfoEnabled &&
-                authenticationStatus.Status != RavenServer.AuthenticationStatus.Allowed &&
-                authenticationStatus.Status != RavenServer.AuthenticationStatus.Operator &&
-                authenticationStatus.Status != RavenServer.AuthenticationStatus.ClusterAdmin)
-                Logger.Info($"Received TLS connection request from {info?.RemoteIpAddress}:{info?.RemotePort} with client certificate: {certificate?.SubjectName?.Name}. " +
-                            $"Authentication status: {authenticationStatus.Status}.");
 
             // build the token
             context.Features.Set<IHttpAuthenticationFeature>(authenticationStatus);

@@ -18,6 +18,7 @@ namespace Raven.Server.Documents.Handlers
 {
     public class ChangesHandler : DatabaseRequestHandler
     {
+        private static readonly string StudioMarker = "fromStudio";
         [RavenAction("/databases/*/changes", "GET", AuthorizationStatus.ValidUser, SkipUsagesCount = true)]
         public async Task GetChanges()
         {
@@ -92,9 +93,10 @@ namespace Raven.Server.Documents.Handlers
 
         private async Task HandleConnection(WebSocket webSocket, JsonOperationContext context)
         {
+            var fromStudio = GetBoolValueQueryString(StudioMarker, false) ?? false;
             var throttleConnection = GetBoolValueQueryString("throttleConnection", false).GetValueOrDefault(false);
 
-            var connection = new ChangesClientConnection(webSocket, Database);
+            var connection = new ChangesClientConnection(webSocket, Database, fromStudio);
             Database.Changes.Connect(connection);
             var sendTask = connection.StartSendingNotifications(throttleConnection);
             var debugTag = "changes/" + connection.Id;
@@ -103,7 +105,7 @@ namespace Raven.Server.Documents.Handlers
             {
                 try
                 {
-                    var segments = new[] {segment1, segment2};
+                    var segments = new[] { segment1, segment2 };
                     int index = 0;
                     var receiveAsync = webSocket.ReceiveAsync(segments[index].Buffer, Database.DatabaseShutdown);
                     var jsonParserState = new JsonParserState();
@@ -143,7 +145,9 @@ namespace Raven.Server.Documents.Handlers
                                         throw new ArgumentNullException(nameof(command), "Command argument is mandatory");
 
                                     reader.TryGet("Param", out string commandParameter);
-                                    connection.HandleCommand(command, commandParameter);
+                                    reader.TryGet("Params", out BlittableJsonReaderArray commandParameters);
+
+                                    connection.HandleCommand(command, commandParameter, commandParameters);
 
                                     if (reader.TryGet("CommandId", out int commandId))
                                     {
@@ -160,13 +164,23 @@ namespace Raven.Server.Documents.Handlers
                     if (Logger.IsInfoEnabled)
                         Logger.Info("Client was disconnected", ex);
                 }
-                catch
+                catch (Exception ex)
                 {
 #pragma warning disable 4014
                     sendTask.IgnoreUnobservedExceptions();
 #pragma warning restore 4014
 
-                    throw;
+                    // if we received close from the client, we want to ignore it and close the websocket (dispose does it)
+                    if (ex is WebSocketException webSocketException
+                        && webSocketException.WebSocketErrorCode == WebSocketError.InvalidState
+                        && webSocket.State == WebSocketState.CloseReceived)
+                    {
+                        // ignore
+                    }
+                    else
+                    {
+                        throw;
+                    }
                 }
                 finally
                 {

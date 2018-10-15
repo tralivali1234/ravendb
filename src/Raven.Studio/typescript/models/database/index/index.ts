@@ -1,6 +1,6 @@
 import appUrl = require("common/appUrl");
 import indexProgress = require("models/database/index/indexProgress");
-
+import collectionsTracker = require("common/helpers/database/collectionsTracker");
 
 class index {
     static readonly SideBySideIndexPrefix = "ReplacementOf/";
@@ -53,6 +53,7 @@ class index {
     isPausedState: KnockoutComputed<boolean>;
 
     isFaulty: KnockoutComputed<boolean>;
+    isSideBySide: KnockoutComputed<boolean>;
     globalIndexingStatus: KnockoutObservable<Raven.Client.Documents.Indexes.IndexRunningStatus>;
     canBePaused: KnockoutComputed<boolean>;
     canBeResumed: KnockoutComputed<boolean>;
@@ -168,6 +169,10 @@ class index {
             return this.type === faultyType;
         });
 
+        this.isSideBySide = ko.pureComputed(() => {            
+            return this.name.startsWith(index.SideBySideIndexPrefix);
+        });
+        
         this.badgeClass = ko.pureComputed(() => {
             if (this.isFaulty()) {
                 return "state-danger";
@@ -228,14 +233,24 @@ class index {
     }
 
     getGroupName() {
-        const collections = this.collectionNames;
+        const collections = this.collectionNames.map(c => {
+            // If collection already exists - use its exact name
+            const x = collectionsTracker.default.collections().find(x => x.name.toLowerCase() === c.toLowerCase());
+            if (x) {
+                return x.name;
+            }
+            // If collection does not exist - capitalize to be standard looking 
+            else {
+                return _.capitalize(c);
+            }
+        });
+
         if (collections && collections.length) {
             return collections.slice(0).sort((l, r) => l.toLowerCase() > r.toLowerCase() ? 1 : -1).join(", ");
         } else {
             return index.DefaultIndexGroupName;
         }
     }
-
 }
 
 export = index; 

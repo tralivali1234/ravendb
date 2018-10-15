@@ -3,6 +3,7 @@ using System.IO;
 using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
+using NetTopologySuite.Features;
 using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Tcp;
 using Raven.Client.Util;
@@ -21,39 +22,67 @@ namespace Raven.Server.Web.System
         [RavenAction("/admin/test-connection", "POST", AuthorizationStatus.Operator)]
         public async Task TestConnection()
         {
+            
             var url = GetQueryStringValueAndAssertIfSingleAndNotEmpty("url");
+            var database = GetStringQueryString("database", required:false); // can be null
             url = UrlHelper.TryGetLeftPart(url);
-            DynamicJsonValue result;
+            DynamicJsonValue result = null;
+
+            Task<TcpConnectionInfo> connectionInfo = null;
 
             try
             {
-                var timeout = TimeoutManager.WaitFor(ServerStore.Configuration.Cluster.OperationTimeout.AsTimeSpan);
-                Task<TcpConnectionInfo> connectionInfo;
-                using (var cts = new CancellationTokenSource(Server.Configuration.Cluster.OperationTimeout.AsTimeSpan))
+                try
                 {
-                    connectionInfo = ReplicationUtils.GetTcpInfoAsync(url, null, "Test-Connection", Server.Certificate.Certificate,
-                        cts.Token);
-                }
-                if (await Task.WhenAny(timeout, connectionInfo) == timeout)
-                {
-                    throw new TimeoutException($"Waited for {ServerStore.Configuration.Cluster.OperationTimeout.AsTimeSpan} to receive tcp info from {url} and got no response");
-                }
-                result = await ConnectToClientNodeAsync(connectionInfo.Result, ServerStore.Engine.TcpConnectionTimeout, LoggingSource.Instance.GetLogger("testing-connection", "testing-connection"));
-            }
-            catch (Exception e)
-            {
-                result = new DynamicJsonValue
-                {
-                    [nameof(NodeConnectionTestResult.Success)] = false,
-                    [nameof(NodeConnectionTestResult.Error)] = $"An exception was thrown while trying to connect to {url} : {e}"
-                };
-            }
+                    var timeout = TimeoutManager.WaitFor(ServerStore.Configuration.Cluster.OperationTimeout.AsTimeSpan);
 
-            using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
-            using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
-            {
-                context.Write(writer, result);
+                    using (var cts = new CancellationTokenSource(Server.Configuration.Cluster.OperationTimeout.AsTimeSpan))
+                    {
+                        connectionInfo = ReplicationUtils.GetTcpInfoAsync(url, database, "Test-Connection", Server.Certificate.Certificate,
+                            cts.Token);
+                    }
+                    Task timeoutTask = await Task.WhenAny(timeout, connectionInfo);
+                    if (timeoutTask == timeout)
+                    {
+                        throw new TimeoutException($"Waited for {ServerStore.Configuration.Cluster.OperationTimeout.AsTimeSpan} to receive tcp info from {url} and got no response");
+                    }
+                    await connectionInfo;
+                }
+                catch (Exception e)
+                {
+                    result = new DynamicJsonValue
+                    {
+                        [nameof(NodeConnectionTestResult.Success)] = false,
+                        [nameof(NodeConnectionTestResult.HTTPSuccess)] = false,
+                        [nameof(NodeConnectionTestResult.Error)] = $"An exception was thrown while trying to connect to {url} : {e}"
+                    };
+                    return;
+                }
+
+                try
+                {
+                    result = await ConnectToClientNodeAsync(connectionInfo.Result, ServerStore.Engine.TcpConnectionTimeout, LoggingSource.Instance.GetLogger("testing-connection", "testing-connection"), database);
+                }
+                catch (Exception e)
+                {
+                    result = new DynamicJsonValue
+                    {
+                        [nameof(NodeConnectionTestResult.Success)] = false,
+                        [nameof(NodeConnectionTestResult.HTTPSuccess)] = true,
+                        [nameof(NodeConnectionTestResult.TcpServerUrl)] = connectionInfo.Result.Url,
+                        [nameof(NodeConnectionTestResult.Error)] = $"Was able to connect to url {url}, but exception was thrown while trying to connect to TCP port {connectionInfo.Result.Url}: {e}"
+                    };
+                    return;
+                }
             }
+            finally
+            {
+                using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+                using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+                {
+                    context.Write(writer, result);
+                }
+            }            
         }
 
 
@@ -64,7 +93,7 @@ namespace Raven.Server.Web.System
             return (tcpClient, connection);
         }
 
-        private async Task<DynamicJsonValue> ConnectToClientNodeAsync(TcpConnectionInfo tcpConnectionInfo, TimeSpan timeout, Logger log)
+        private async Task<DynamicJsonValue> ConnectToClientNodeAsync(TcpConnectionInfo tcpConnectionInfo, TimeSpan timeout, Logger log, string database)
         {
             var (tcpClient, connection) = await ConnectAndGetNetworkStreamAsync(tcpConnectionInfo, timeout, log);
             using (tcpClient)
@@ -74,7 +103,7 @@ namespace Raven.Server.Web.System
                 using (ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext ctx))
                 using (var writer = new BlittableJsonTextWriter(ctx, connection))
                 {
-                    WriteOperationHeaderToRemote(writer);
+                    WriteOperationHeaderToRemote(writer, TcpConnectionHeaderMessage.OperationTypes.TestConnection, database);
                     using (var responseJson = await ctx.ReadForMemoryAsync(connection, $"TestConnectionHandler/{tcpConnectionInfo.Url}/Read-Handshake-Response"))
                     {
                         var headerResponse = JsonDeserializationServer.TcpConnectionHeaderResponse(responseJson);
@@ -88,9 +117,9 @@ namespace Raven.Server.Web.System
                                 result["Error"] = $"Connection to {tcpConnectionInfo.Url} failed because of authorization failure: {headerResponse.Message}";
                                 break;
                             case TcpConnectionStatus.TcpVersionMismatch:
-                                WriteOperationHeaderToRemote(writer, drop:true);
+                                WriteOperationHeaderToRemote(writer, TcpConnectionHeaderMessage.OperationTypes.Drop, database);
                                 result["Success"] = false;
-                                result["Error"] = $"Connection to {tcpConnectionInfo.Url} failed because of mismatching tcp version {headerResponse.Message}";
+                                result["Error"] = $"Connection to {tcpConnectionInfo.Url} failed because of mismatching tcp version: {headerResponse.Message}";
                                 break;
                         }
                     }
@@ -100,19 +129,18 @@ namespace Raven.Server.Web.System
             }
         }
 
-        private void WriteOperationHeaderToRemote(BlittableJsonTextWriter writer, bool drop = false)
+        private void WriteOperationHeaderToRemote(BlittableJsonTextWriter writer, TcpConnectionHeaderMessage.OperationTypes operation, string databaseName)
         {
-            var operation = drop ? TcpConnectionHeaderMessage.OperationTypes.Drop : TcpConnectionHeaderMessage.OperationTypes.Heartbeats;
             writer.WriteStartObject();
             {
                 writer.WritePropertyName(nameof(TcpConnectionHeaderMessage.Operation));
                 writer.WriteString(operation.ToString());
                 writer.WriteComma();
                 writer.WritePropertyName(nameof(TcpConnectionHeaderMessage.OperationVersion));
-                writer.WriteInteger(TcpConnectionHeaderMessage.HeartbeatsTcpVersion);
+                writer.WriteInteger(TcpConnectionHeaderMessage.GetOperationTcpVersion(operation));
                 writer.WriteComma();
                 writer.WritePropertyName(nameof(TcpConnectionHeaderMessage.DatabaseName));
-                writer.WriteNull();
+                writer.WriteString(databaseName);
             }
             writer.WriteEndObject();
             writer.Flush();
@@ -122,6 +150,8 @@ namespace Raven.Server.Web.System
     public class NodeConnectionTestResult
     {
         public bool Success;
+        public bool HTTPSuccess;
+        public string TcpServerUrl;
         public string Error;
     }
 }

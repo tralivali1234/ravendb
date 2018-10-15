@@ -96,7 +96,6 @@ namespace Sparrow.Json
 
         public int[] EscapePositions;
         public AllocatedMemoryData AllocatedMemoryData;
-        public int? LastFoundAt;        
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public LazyStringValue(string str, byte* buffer, int size, JsonOperationContext context)
@@ -248,7 +247,7 @@ namespace Sparrow.Json
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public static implicit operator byte[](LazyStringValue self)
+        public static implicit operator byte[] (LazyStringValue self)
         {
             var valueAsString = (string)self;
             return Convert.FromBase64String(valueAsString);
@@ -348,6 +347,30 @@ namespace Sparrow.Json
             IsDisposed = true;
         }
 
+        public bool Contains(char value)
+        {
+            if (IsDisposed)
+                ThrowAlreadyDisposed();
+
+            if (_string != null)
+                return _string.Contains(value);
+
+            return ToString().Contains(value);
+        }
+
+#if NETCOREAPP
+        public bool Contains(char value, StringComparison comparisonType)
+        {
+            if (IsDisposed)
+                ThrowAlreadyDisposed();
+
+            if (_string != null)
+                return _string.Contains(value, comparisonType);
+
+            return ToString().Contains(value, comparisonType);
+        }
+#endif
+
         public bool Contains(string value)
         {
             if (IsDisposed)
@@ -358,6 +381,19 @@ namespace Sparrow.Json
 
             return ToString().Contains(value);
         }
+
+#if NETCOREAPP
+        public bool Contains(string value, StringComparison comparisonType)
+        {
+            if (IsDisposed)
+                ThrowAlreadyDisposed();
+
+            if (_string != null)
+                return _string.Contains(value, comparisonType);
+
+            return ToString().Contains(value, comparisonType);
+        }
+#endif
 
         public bool EndsWith(string value)
         {
@@ -411,6 +447,19 @@ namespace Sparrow.Json
         {
             return IndexOf(value, 0, Length);
         }
+
+#if NETCOREAPP
+        public int IndexOf(char value, StringComparison comparisonType)
+        {
+            if (IsDisposed)
+                ThrowAlreadyDisposed();
+
+            if (_string != null)
+                return _string.IndexOf(value, comparisonType);
+
+            return ToString().IndexOf(value, comparisonType);
+        }
+#endif
 
         public int IndexOf(char value, int startIndex)
         {
@@ -527,7 +576,7 @@ namespace Sparrow.Json
 
         public int LastIndexOf(char value)
         {
-            return LastIndexOf(value, Length, Length);
+            return LastIndexOf(value, Length - 1, Length);
         }
 
         public int LastIndexOf(char value, int startIndex)
@@ -543,7 +592,7 @@ namespace Sparrow.Json
             if (_string != null)
                 return _string.LastIndexOf(value, startIndex, count);
 
-            ValidateIndexes(Length - startIndex, count);
+            ValidateIndexes(Length - startIndex - 1, count);
 
             if (_lazyStringTempBuffer == null || _lazyStringTempBuffer.Length < Length)
                 _lazyStringTempBuffer = new char[Bits.NextPowerOf2(Length)];
@@ -551,7 +600,7 @@ namespace Sparrow.Json
             fixed (char* pChars = _lazyStringTempBuffer)
                 Encodings.Utf8.GetChars(Buffer, Size, pChars, Length);
 
-            for (int i = startIndex; i > startIndex - count; i++)
+            for (int i = startIndex; i > startIndex - count; i--)
             {
                 if (_lazyStringTempBuffer[i] == value)
                     return i;
@@ -595,7 +644,7 @@ namespace Sparrow.Json
 
         public int LastIndexOfAny(char[] anyOf)
         {
-            return LastIndexOfAny(anyOf, Length, Length);
+            return LastIndexOfAny(anyOf, Length - 1, Length);
         }
 
         public int LastIndexOfAny(char[] anyOf, int startIndex)
@@ -607,10 +656,11 @@ namespace Sparrow.Json
         {
             if (IsDisposed)
                 ThrowAlreadyDisposed();
+
             if (_string != null)
                 return _string.LastIndexOfAny(anyOf, startIndex, count);
 
-            ValidateIndexes(Length - startIndex, count);
+            ValidateIndexes(Length - startIndex - 1, count);
 
             if (_lazyStringTempBuffer == null || _lazyStringTempBuffer.Length < Length)
                 _lazyStringTempBuffer = new char[Bits.NextPowerOf2(Length)];
@@ -618,7 +668,7 @@ namespace Sparrow.Json
             fixed (char* pChars = _lazyStringTempBuffer)
                 Encodings.Utf8.GetChars(Buffer, Size, pChars, Length);
 
-            for (int i = startIndex; i > startIndex - count; i++)
+            for (int i = startIndex; i > startIndex - count; i--)
             {
                 if (anyOf.Contains(_lazyStringTempBuffer[i]))
                     return i;
@@ -907,7 +957,7 @@ namespace Sparrow.Json
                     return GetReversedStringFromBuffer(buffer);
                 }
             }
-            
+
             return GetReversedStringFromBuffer(buffer);
         }
 
@@ -929,6 +979,7 @@ namespace Sparrow.Json
             _buffer = buffer;
             _string = str;
             _length = -1;
+            EscapePositions = null;
             IsDisposed = false;
             AllocatedMemoryData = null;
         }
@@ -943,6 +994,6 @@ namespace Sparrow.Json
             return b < 32 || (b >= 127 && b <= 159);
         }
 
-                
+
     }
 }

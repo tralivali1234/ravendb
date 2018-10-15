@@ -4,7 +4,9 @@
 // </copyright>
 //-----------------------------------------------------------------------
 
+using System;
 using System.Collections.Generic;
+using System.Linq;
 using Raven.Client.Documents.Session.Operations;
 using Raven.Client.Json;
 
@@ -13,7 +15,7 @@ namespace Raven.Client.Documents.Session
     /// <summary>
     /// Implements Unit of Work for accessing the RavenDB server
     /// </summary>
-    public class DocumentSessionRevisions : AdvancedSessionExtentionBase, IRevisionsSessionOperations
+    public class DocumentSessionRevisions : AdvancedSessionExtensionBase, IRevisionsSessionOperations
     {
         public DocumentSessionRevisions(InMemoryDocumentSessionOperations session) : base(session)
         {
@@ -56,6 +58,15 @@ namespace Raven.Client.Documents.Session
             RequestExecutor.Execute(command, Context, sessionInfo: SessionInfo);
             operation.SetResult(command.Result);
             return operation.GetRevisions<T>();
+        }
+
+        public T Get<T>(string id, DateTime date)
+        {
+            var operation = new GetRevisionOperation(Session, id, date);
+            var command = operation.CreateRequest();
+            RequestExecutor.Execute(command, Context, sessionInfo: SessionInfo);
+            operation.SetResult(command.Result);
+            return operation.GetRevisionsFor<T>().FirstOrDefault();
         }
     }
 }

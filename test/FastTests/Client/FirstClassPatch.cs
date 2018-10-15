@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Threading.Tasks;
+using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Session;
 using Xunit;
 
@@ -37,6 +38,12 @@ namespace FastTests.Client
         {
             public string Name { get; set; }
             public string Kind { get; set; }
+        }
+
+        private class Customer
+        {
+            public string Name { get; set; }
+            public List<AttachmentDetails> Attachments { get; set; }
         }
 
         [Fact]
@@ -233,6 +240,63 @@ namespace FastTests.Client
         }
 
         [Fact]
+        public void CanAddToArrayUsingParamsOverload()
+        {
+            var stuff = new Stuff[1];
+            stuff[0] = new Stuff { Key = 6 };
+            var user = new User { Stuff = stuff, Numbers = new[] { 1, 2 } };
+
+            using (var store = GetDocumentStore())
+            {
+                using (var session = store.OpenSession())
+                {
+                    session.Store(user);
+                    session.SaveChanges();
+                }
+
+                using (var session = store.OpenSession())
+                {
+                    var loaded = session.Load<User>(_docId);
+
+                    var items = new[]
+                    {
+                        new Stuff
+                        {
+                            Key = 102
+                        },
+                        new Stuff
+                        {
+                            Phone = "123456"
+                        }
+                    };
+
+                    session.Advanced.Patch(loaded, u => u.Stuff, roles => roles.Add(items));
+                    session.SaveChanges();
+                }
+
+                using (var session = store.OpenSession())
+                {
+                    var loaded = session.Load<User>(_docId);
+
+                    var numbers = new List<int> { 3, 4 };
+
+                    session.Advanced.Patch(loaded, u => u.Numbers, roles => roles.Add(numbers.ToArray()));
+                    session.SaveChanges();
+                }
+
+                using (var session = store.OpenSession())
+                {
+                    var loaded = session.Load<User>(_docId);
+
+                    Assert.Equal(loaded.Stuff[1].Key, 102);
+                    Assert.Equal(loaded.Stuff[2].Phone, "123456");
+                    Assert.Equal(loaded.Numbers[2], 3);
+                    Assert.Equal(loaded.Numbers[3], 4);
+                }
+            }
+        }
+
+        [Fact]
         public void CanRemoveFromArray()
         {
             var stuff = new Stuff[2];
@@ -308,7 +372,6 @@ namespace FastTests.Client
             }
         }
 
-
         [Fact]
         public void ShouldMergePatchCalls()
         {
@@ -362,6 +425,77 @@ namespace FastTests.Client
                     Assert.Equal(1, ((InMemoryDocumentSessionOperations)session).DeferredCommandsCount);
 
                     session.SaveChanges();
+                }
+            }
+        }
+
+        [Fact]
+        public void CanRemoveAllFromArray()
+        {
+            var customer = new Customer
+            {
+                Name = "Jerry",
+                Attachments = new List<AttachmentDetails>
+                {
+                    new AttachmentDetails{ Name = "picture", Size = 12}, 
+                    new AttachmentDetails{ Name = "picture", Size = 34 },
+                    new AttachmentDetails{ Name = "file", Size = 56},
+                    new AttachmentDetails{ Name = "file", Size = 78},
+                    new AttachmentDetails{ Name = "file", Size = 99},
+                    new AttachmentDetails{ Name = "video" , Size = 101}
+                }
+            };
+
+            using (var store = GetDocumentStore())
+            {
+                using (var session = store.OpenSession())
+                {
+                    session.Store(customer, "customers/1");
+                    session.SaveChanges();
+                }
+
+                using (var session = store.OpenSession())
+                {
+                    // explicitly specify id & type
+                    session.Advanced.Patch<Customer, AttachmentDetails>(
+                        "customers/1", 
+                        x => x.Attachments, 
+                        x => x.RemoveAll(y => y.Name == "file"));
+
+                    session.SaveChanges();
+                }
+
+                using (var session = store.OpenSession())
+                {
+                    var loaded = session.Load<Customer>("customers/1");
+
+                    Assert.Equal(3, loaded.Attachments.Count);
+
+                    Assert.Equal("picture", loaded.Attachments[0].Name);
+                    Assert.Equal(12, loaded.Attachments[0].Size);
+                    Assert.Equal("picture", loaded.Attachments[1].Name);
+                    Assert.Equal(34, loaded.Attachments[1].Size);
+                    Assert.Equal("video", loaded.Attachments[2].Name);
+                    Assert.Equal(101, loaded.Attachments[2].Size);
+
+                    // infer type & the id from entity
+                    session.Advanced.Patch(
+                        loaded,
+                        x => x.Attachments,
+                        x => x.RemoveAll(y => y.Size < 30 || y.Size > 100));
+
+                    session.SaveChanges();
+                }
+
+                using (var session = store.OpenSession())
+                {
+                    var loaded = session.Load<Customer>("customers/1");
+
+                    Assert.Equal(1, loaded.Attachments.Count);
+
+                    Assert.Equal("picture", loaded.Attachments[0].Name);
+                    Assert.Equal(34, loaded.Attachments[0].Size);
+
                 }
             }
         }
@@ -688,6 +822,77 @@ namespace FastTests.Client
                     Assert.Equal(1, ((InMemoryDocumentSessionOperations)session).DeferredCommandsCount);
 
                     await session.SaveChangesAsync();
+                }
+            }
+        }
+
+        [Fact]
+        public async Task CanRemoveAllFromArrayAsync()
+        {
+            var customer = new Customer
+            {
+                Name = "Jerry",
+                Attachments = new List<AttachmentDetails>
+                {
+                    new AttachmentDetails{ Name = "picture", Size = 12},
+                    new AttachmentDetails{ Name = "picture", Size = 34 },
+                    new AttachmentDetails{ Name = "file", Size = 56},
+                    new AttachmentDetails{ Name = "file", Size = 78},
+                    new AttachmentDetails{ Name = "file", Size = 99},
+                    new AttachmentDetails{ Name = "video" , Size = 101}
+                }
+            };
+
+            using (var store = GetDocumentStore())
+            {
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(customer, "customers/1");
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    // explicitly specify id & type
+                    session.Advanced.Patch<Customer, AttachmentDetails>(
+                        "customers/1",
+                        x => x.Attachments,
+                        x => x.RemoveAll(y => y.Name == "file"));
+
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var loaded = await session.LoadAsync<Customer>("customers/1");
+
+                    Assert.Equal(3, loaded.Attachments.Count);
+
+                    Assert.Equal("picture", loaded.Attachments[0].Name);
+                    Assert.Equal(12, loaded.Attachments[0].Size);
+                    Assert.Equal("picture", loaded.Attachments[1].Name);
+                    Assert.Equal(34, loaded.Attachments[1].Size);
+                    Assert.Equal("video", loaded.Attachments[2].Name);
+                    Assert.Equal(101, loaded.Attachments[2].Size);
+
+                    // infer type & the id from entity
+                    session.Advanced.Patch(
+                        loaded,
+                        x => x.Attachments,
+                        x => x.RemoveAll(y => y.Size < 30 || y.Size > 100));
+
+                    await session.SaveChangesAsync();
+                }
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    var loaded = await session.LoadAsync<Customer>("customers/1");
+
+                    Assert.Equal(1, loaded.Attachments.Count);
+
+                    Assert.Equal("picture", loaded.Attachments[0].Name);
+                    Assert.Equal(34, loaded.Attachments[0].Size);
+
                 }
             }
         }

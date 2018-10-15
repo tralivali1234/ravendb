@@ -26,7 +26,7 @@ namespace SlowTests.Server.Documents.ETL.Raven
                         Name = "Joe Doe"
                     }, "users/1");
 
-                    session.Advanced.Attachments.Store("users/1", "photo.jpg", new MemoryStream(new byte[] {1}));
+                    session.Advanced.Attachments.Store("users/1", "photo.jpg", new MemoryStream(new byte[] { 1 }));
 
                     session.SaveChanges();
                 }
@@ -40,11 +40,12 @@ namespace SlowTests.Server.Documents.ETL.Raven
                     Assert.NotNull(user);
                     Assert.Equal("Joe Doe", user.Name);
 
-                    var attachment = session.Advanced.Attachments.Get("users/1", "photo.jpg");
-
-                    Assert.NotNull(attachment);
-                    Assert.Equal("photo.jpg", attachment.Details.Name);
-                    Assert.Equal(new byte[] {1}, attachment.Stream.ReadData());
+                    using (var attachment = session.Advanced.Attachments.Get("users/1", "photo.jpg"))
+                    {
+                        Assert.NotNull(attachment);
+                        Assert.Equal("photo.jpg", attachment.Details.Name);
+                        Assert.Equal(new byte[] { 1 }, attachment.Stream.ReadData());
+                    }
                 }
 
                 etlDone.Reset();
@@ -89,7 +90,7 @@ namespace SlowTests.Server.Documents.ETL.Raven
                         Name = "Joe Doe"
                     }, "users/1");
 
-                    session.Advanced.Attachments.Store("users/1", "photo.jpg", new MemoryStream(new byte[] {1}));
+                    session.Advanced.Attachments.Store("users/1", "photo.jpg", new MemoryStream(new byte[] { 1 }));
 
                     session.SaveChanges();
                 }
@@ -103,9 +104,9 @@ namespace SlowTests.Server.Documents.ETL.Raven
                     Assert.NotNull(user);
                     Assert.Equal("James Doe", user.Name);
 
-                    var metatata = session.Advanced.GetMetadataFor(user);
+                    var metadata = session.Advanced.GetMetadataFor(user);
 
-                    Assert.False(metatata.ContainsKey(Constants.Documents.Metadata.Attachments));
+                    Assert.False(metadata.ContainsKey(Constants.Documents.Metadata.Attachments));
                 }
             }
         }

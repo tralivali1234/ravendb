@@ -23,6 +23,7 @@ using Raven.Client.ServerWide.Tcp;
 using Raven.Client.Util;
 using Sparrow;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 using Sparrow.Utils;
 
@@ -53,13 +54,11 @@ namespace Raven.Client.Documents.Subscriptions
         internal SubscriptionWorker(SubscriptionWorkerOptions options, IDocumentStore documentStore, string dbName)
         {
             _options = options;
-            _logger = LoggingSource.Instance.GetLogger<SubscriptionWorker<T>>(dbName);
             if (string.IsNullOrEmpty(options.SubscriptionName))
-                throw new ArgumentException("SubscriptionConnectionOptions must specify the SubscriptionName",nameof(options));
+                throw new ArgumentException("SubscriptionConnectionOptions must specify the SubscriptionName", nameof(options));
             _store = documentStore;
             _dbName = dbName ?? documentStore.Database;
-
-
+            _logger = LoggingSource.Instance.GetLogger<SubscriptionWorker<T>>(_dbName);
         }
 
         public void Dispose()
@@ -118,14 +117,16 @@ namespace Raven.Client.Documents.Subscriptions
 
         public Task Run(Action<SubscriptionBatch<T>> processDocuments, CancellationToken ct = default(CancellationToken))
         {
-            if (processDocuments == null) throw new ArgumentNullException(nameof(processDocuments));
+            if (processDocuments == null)
+                throw new ArgumentNullException(nameof(processDocuments));
             _subscriber = (null, processDocuments);
             return Run(ct);
         }
 
         public Task Run(Func<SubscriptionBatch<T>, Task> processDocuments, CancellationToken ct = default(CancellationToken))
         {
-            if (processDocuments == null) throw new ArgumentNullException(nameof(processDocuments));
+            if (processDocuments == null)
+                throw new ArgumentNullException(nameof(processDocuments));
             _subscriber = (processDocuments, null);
             return Run(ct);
         }
@@ -135,11 +136,11 @@ namespace Raven.Client.Documents.Subscriptions
             if (_subscriptionTask != null)
                 throw new InvalidOperationException("The subscription is already running");
 
-            if (ct != default(CancellationToken))
+            if (ct != default)
             {
-                _processingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);    
+                _processingCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
             }
-            
+
             return _subscriptionTask = RunSubscriptionAsync();
 
         }
@@ -150,20 +151,19 @@ namespace Raven.Client.Documents.Subscriptions
         public string CurrentNodeTag => _redirectNode?.ClusterTag;
         public string SubscriptionName => _options?.SubscriptionName;
 
-        private async Task<Stream> ConnectToServer()
+        private async Task<Stream> ConnectToServer(CancellationToken token)
         {
             var command = new GetTcpInfoCommand("Subscription/" + _dbName, _dbName);
 
-            JsonOperationContext context;
             var requestExecutor = _store.GetRequestExecutor(_dbName);
 
-            using (requestExecutor.ContextPool.AllocateOperationContext(out context))
+            using (requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context))
             {
                 if (_redirectNode != null)
                 {
                     try
                     {
-                        await requestExecutor.ExecuteAsync(_redirectNode, null, context, command, shouldRetry: false).ConfigureAwait(false);
+                        await requestExecutor.ExecuteAsync(_redirectNode, null, context, command, shouldRetry: false, sessionInfo: null, token: token).ConfigureAwait(false);
                     }
                     catch (Exception)
                     {
@@ -175,7 +175,7 @@ namespace Raven.Client.Documents.Subscriptions
                 }
                 else
                 {
-                    await requestExecutor.ExecuteAsync(command, context).ConfigureAwait(false);
+                    await requestExecutor.ExecuteAsync(command, context, sessionInfo: null, token: token).ConfigureAwait(false);
                 }
 
                 _tcpClient = await TcpUtils.ConnectAsync(command.Result.Url, requestExecutor.DefaultTimeout).ConfigureAwait(false);
@@ -183,56 +183,76 @@ namespace Raven.Client.Documents.Subscriptions
                 _tcpClient.SendBufferSize = 32 * 1024;
                 _tcpClient.ReceiveBufferSize = 4096;
                 _stream = _tcpClient.GetStream();
-                _stream = await TcpUtils.WrapStreamWithSslAsync(_tcpClient,command.Result, _store.Certificate, requestExecutor.DefaultTimeout).ConfigureAwait(false);
+                _stream = await TcpUtils.WrapStreamWithSslAsync(_tcpClient, command.Result, _store.Certificate, requestExecutor.DefaultTimeout).ConfigureAwait(false);
 
                 var databaseName = _dbName ?? _store.Database;
-                var serializeObject = JsonConvert.SerializeObject(new TcpConnectionHeaderMessage
+
+                var parameters = new TcpNegotiateParameters
                 {
+                    Database = databaseName,
                     Operation = TcpConnectionHeaderMessage.OperationTypes.Subscription,
-                    DatabaseName = databaseName,
-                    OperationVersion = TcpConnectionHeaderMessage.SubscriptionTcpVersion
-                });
-                var header = Encodings.Utf8.GetBytes(serializeObject);
+                    Version = TcpConnectionHeaderMessage.SubscriptionTcpVersion,
+                    ReadResponseAndGetVersionCallback = ReadServerResponseAndGetVersion,
+                    DestinationNodeTag = CurrentNodeTag,
+                    DestinationUrl = command.Result.Url
+                };
+                _supportedFeatures = TcpNegotiation.NegotiateProtocolVersion(context, _stream, parameters);
+
+                if (_supportedFeatures.ProtocolVersion <= 0)
+                {
+                    throw new InvalidOperationException(
+                        $"{_options.SubscriptionName}: TCP negotiation resulted with an invalid protocol version:{_supportedFeatures.ProtocolVersion}");
+                }
 
                 var options = Encodings.Utf8.GetBytes(JsonConvert.SerializeObject(_options));
 
-                await _stream.WriteAsync(header, 0, header.Length).ConfigureAwait(false);
-                await _stream.FlushAsync().ConfigureAwait(false);
-                //Reading reply from server
-                using (var response = context.ReadForMemory(_stream, "Subscription/tcp-header-response"))
-                {
-                    var reply = JsonDeserializationClient.TcpConnectionHeaderResponse(response);
-                    switch (reply.Status)
-                    {
-                        case TcpConnectionStatus.Ok:
-                            break;
-                        case TcpConnectionStatus.AuthorizationFailed:
-                            throw new AuthorizationException($"Cannot access database {databaseName} because " + reply.Message);
-                        case TcpConnectionStatus.TcpVersionMismatch:
-                            //Kindly request the server to drop the connection
-                            serializeObject = JsonConvert.SerializeObject(new TcpConnectionHeaderMessage
-                            {
-                                Operation = TcpConnectionHeaderMessage.OperationTypes.Drop,
-                                DatabaseName = databaseName,
-                                OperationVersion = TcpConnectionHeaderMessage.SubscriptionTcpVersion,
-                                Info = $"Couldn't agree on subscription tcp version ours:{TcpConnectionHeaderMessage.SubscriptionTcpVersion} theirs:{reply.Version}"
-                            });
-                            header = Encodings.Utf8.GetBytes(serializeObject);
-                            await _stream.WriteAsync(header, 0, header.Length).ConfigureAwait(false);
-                            await _stream.FlushAsync().ConfigureAwait(false);
-                            throw new InvalidOperationException($"Can't connect to database {databaseName} because: {reply.Message}");
-                    }
-                        
-                }
-                await _stream.WriteAsync(options, 0, options.Length).ConfigureAwait(false);
+                await _stream.WriteAsync(options, 0, options.Length, token).ConfigureAwait(false);
 
-                await _stream.FlushAsync().ConfigureAwait(false);
+                await _stream.FlushAsync(token).ConfigureAwait(false);
 
                 _subscriptionLocalRequestExecutor?.Dispose();
                 _subscriptionLocalRequestExecutor = RequestExecutor.CreateForSingleNodeWithoutConfigurationUpdates(command.RequestedNode.Url, _dbName, requestExecutor.Certificate, _store.Conventions);
 
                 return _stream;
             }
+        }
+
+        private int ReadServerResponseAndGetVersion(JsonOperationContext context, BlittableJsonTextWriter writer, Stream stream, string url)
+        {
+            //Reading reply from server
+            using (var response = context.ReadForMemory(_stream, "Subscription/tcp-header-response"))
+            {
+                var reply = JsonDeserializationClient.TcpConnectionHeaderResponse(response);
+                switch (reply.Status)
+                {
+                    case TcpConnectionStatus.Ok:
+                        return reply.Version;
+                    case TcpConnectionStatus.AuthorizationFailed:
+                        throw new AuthorizationException($"Cannot access database {_dbName} because " + reply.Message);
+                    case TcpConnectionStatus.TcpVersionMismatch:
+                        if (reply.Version != TcpNegotiation.OutOfRangeStatus)
+                        {
+                            return reply.Version;
+                        }
+                        //Kindly request the server to drop the connection
+                        SendDropMessage(context, writer, reply);
+                        throw new InvalidOperationException($"Can't connect to database {_dbName} because: {reply.Message}");
+                }
+                return reply.Version;
+            }
+        }
+
+        private void SendDropMessage(JsonOperationContext context, BlittableJsonTextWriter writer, TcpConnectionHeaderResponse reply)
+        {
+            context.Write(writer, new DynamicJsonValue
+            {
+                [nameof(TcpConnectionHeaderMessage.DatabaseName)] = _dbName,
+                [nameof(TcpConnectionHeaderMessage.Operation)] = TcpConnectionHeaderMessage.OperationTypes.Drop.ToString(),
+                [nameof(TcpConnectionHeaderMessage.OperationVersion)] = TcpConnectionHeaderMessage.GetOperationTcpVersion(TcpConnectionHeaderMessage.OperationTypes.Drop),
+                [nameof(TcpConnectionHeaderMessage.Info)] =
+                    $"Couldn't agree on subscription TCP version ours:{TcpConnectionHeaderMessage.SubscriptionTcpVersion} theirs:{reply.Version}"
+            });
+            writer.Flush();
         }
 
         private void AssertConnectionState(SubscriptionConnectionServerMessage connectionStatus)
@@ -286,12 +306,11 @@ namespace Raven.Client.Documents.Subscriptions
                 var contextPool = _store.GetRequestExecutor(_dbName).ContextPool;
                 using (var buffer = JsonOperationContext.ManagedPinnedBuffer.LongLivedInstance())
                 {
-                    using (var tcpStream = await ConnectToServer().ConfigureAwait(false))
+                    using (var tcpStream = await ConnectToServer(_processingCts.Token).ConfigureAwait(false))
                     {
                         _processingCts.Token.ThrowIfCancellationRequested();
-                        JsonOperationContext handshakeContext;
                         var tcpStreamCopy = tcpStream;
-                        using (contextPool.AllocateOperationContext(out handshakeContext))
+                        using (contextPool.AllocateOperationContext(out JsonOperationContext handshakeContext))
                         {
                             var connectionStatus = await ReadNextObject(handshakeContext, tcpStreamCopy, buffer).ConfigureAwait(false);
                             if (_processingCts.IsCancellationRequested)
@@ -339,7 +358,7 @@ namespace Raven.Client.Documents.Subscriptions
 
                             _processingCts.Token.ThrowIfCancellationRequested();
 
-                            var lastReceivedChangeVector = batch.Initialize(incomingBatch.Messages);
+                            var lastReceivedChangeVector = batch.Initialize(incomingBatch);
 
 
                             notifiedSubscriber = Task.Run(async () =>
@@ -363,7 +382,7 @@ namespace Raven.Client.Documents.Subscriptions
                                         }
 
                                         if (_options.IgnoreSubscriberErrors == false)
-                                            throw new SubscriberErrorException($"Subscriber threw an exception in subscription '{_options.SubscriptionName}'",ex);
+                                            throw new SubscriberErrorException($"Subscriber threw an exception in subscription '{_options.SubscriptionName}'", ex);
                                     }
 
                                 }
@@ -378,7 +397,7 @@ namespace Raven.Client.Documents.Subscriptions
                                 catch (ObjectDisposedException)
                                 {
                                     //if this happens, this means we are disposing, so don't care..
-                                    //(this peace of code happens asynchronously to external using(tcpStream) statement)
+                                    //(this piece of code happens asynchronously to external using(tcpStream) statement)
                                 }
                             });
                         }
@@ -387,28 +406,37 @@ namespace Raven.Client.Documents.Subscriptions
             }
             catch (OperationCanceledException)
             {
-                // this is thrown when shutting down, it
+                if (_disposed == false)
+                    throw;
+
+                // otherwise this is thrown when shutting down, it
                 // isn't an error, so we don't need to treat
                 // it as such
             }
         }
 
-        private async Task<(List<SubscriptionConnectionServerMessage> Messages, IDisposable ReturnContext)> ReadSingleSubscriptionBatchFromServer(JsonContextPool contextPool, Stream tcpStream, JsonOperationContext.ManagedPinnedBuffer buffer, SubscriptionBatch<T> batch)
+
+        private async Task<BatchFromServer> ReadSingleSubscriptionBatchFromServer(JsonContextPool contextPool, Stream tcpStream, JsonOperationContext.ManagedPinnedBuffer buffer, SubscriptionBatch<T> batch)
         {
-            JsonOperationContext context;
             var incomingBatch = new List<SubscriptionConnectionServerMessage>();
-            var returnContext = contextPool.AllocateOperationContext(out context);
+            var includes = new List<BlittableJsonReaderObject>();
+            IDisposable returnContext = contextPool.AllocateOperationContext(out JsonOperationContext context);
             bool endOfBatch = false;
             while (endOfBatch == false && _processingCts.IsCancellationRequested == false)
             {
-                var receivedMessage = await ReadNextObject(context, tcpStream, buffer).ConfigureAwait(false);
+                SubscriptionConnectionServerMessage receivedMessage = await ReadNextObject(context, tcpStream, buffer).ConfigureAwait(false);
                 if (receivedMessage == null || _processingCts.IsCancellationRequested)
+                {
                     break;
+                }
 
                 switch (receivedMessage.Type)
                 {
                     case SubscriptionConnectionServerMessage.MessageType.Data:
                         incomingBatch.Add(receivedMessage);
+                        break;
+                    case SubscriptionConnectionServerMessage.MessageType.Includes:
+                        includes.Add(receivedMessage.Includes);
                         break;
                     case SubscriptionConnectionServerMessage.MessageType.EndOfBatch:
                         endOfBatch = true;
@@ -431,7 +459,12 @@ namespace Raven.Client.Documents.Subscriptions
                         break;
                 }
             }
-            return (incomingBatch, returnContext);
+            return new BatchFromServer
+            {
+                Messages = incomingBatch,
+                ReturnContext = returnContext,
+                Includes = includes
+            };
         }
 
         private static void ThrowInvalidServerResponse(SubscriptionConnectionServerMessage receivedMessage)
@@ -501,7 +534,11 @@ namespace Raven.Client.Documents.Subscriptions
                     try
                     {
                         if (_processingCts.Token.IsCancellationRequested)
+                        {
+                            if (_disposed == false)
+                                throw;
                             return;
+                        }
 
                         if (_logger.IsInfoEnabled)
                         {
@@ -534,6 +571,7 @@ namespace Raven.Client.Documents.Subscriptions
         }
 
         private DateTime? LastConnectionFailure;
+        private TcpConnectionHeaderMessage.SupportedFeatures _supportedFeatures;
 
         private void AssertLastConnectionFailure()
         {
@@ -544,10 +582,10 @@ namespace Raven.Client.Documents.Subscriptions
             }
 
             if ((DateTime.Now - LastConnectionFailure) > _options.MaxErroneousPeriod)
-            {                
+            {
                 throw new SubscriptionInvalidStateException(
                     $"Subscription connection was in invalid state for more than {_options.MaxErroneousPeriod} and therefore will be terminated");
-                
+
             }
 
 
@@ -559,7 +597,7 @@ namespace Raven.Client.Documents.Subscriptions
             {
                 case SubscriptionDoesNotBelongToNodeException se:
                     AssertLastConnectionFailure();
-                    
+
                     var requestExecutor = _store.GetRequestExecutor(_dbName);
 
                     if (se.AppropriateNode == null)
@@ -569,7 +607,7 @@ namespace Raven.Client.Documents.Subscriptions
                         .FirstOrDefault(x => x.ClusterTag == se.AppropriateNode);
                     _redirectNode = nodeToRedirectTo ?? throw new AggregateException(ex,
                                         new InvalidOperationException($"Could not redirect to {se.AppropriateNode}, because it was not found in local topology, even after retrying"));
-                    
+
                     return true;
                 case SubscriptionChangeVectorUpdateConcurrencyException ce:
                     return true;

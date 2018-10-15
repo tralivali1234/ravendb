@@ -18,7 +18,7 @@ namespace RachisTests.DatabaseCluster
 {
     public class OngoingTasks : ReplicationTestBase
     {
-        [NightlyBuildFact]
+        [Fact]
         public async Task CanGetTaskInfo()
         {
             var clusterSize = 3;
@@ -66,7 +66,7 @@ loadToOrders(orderData);
                     Name = "MyExternalReplication"
                 };
 
-                addWatcherRes = await AddWatcherToReplicationTopology((DocumentStore)store, watcher, new[] { "http://127.0.0.1:9090" });
+                addWatcherRes = await AddWatcherToReplicationTopology((DocumentStore)store, watcher, new []{ leader.WebUrl });
 
                 var backupConfig = new PeriodicBackupConfiguration
                 {
@@ -113,7 +113,8 @@ loadToOrders(orderData);
                 sqlConnectionString = new SqlConnectionString
                 {
                     Name = "abc",
-                    ConnectionString = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3" + $";Initial Catalog=SqlReplication-{store.Database};"
+                    ConnectionString = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3" + $";Initial Catalog=SqlReplication-{store.Database};",
+                    FactoryName = "System.Data.SqlClient"
                 };
                 store.Maintenance.Send(new PutConnectionStringOperation<SqlConnectionString>(sqlConnectionString));
 
@@ -122,7 +123,6 @@ loadToOrders(orderData);
                 {
                     Name = "abc",
                     ConnectionStringName = "abc",
-                    FactoryName = "System.Data.SqlClient",
                     SqlTables =
                     {
                         new SqlEtlTable {TableName = "Orders", DocumentIdColumn = "Id", InsertOnlyMode = false},
@@ -189,7 +189,7 @@ loadToOrders(orderData);
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task CanToggleTaskState()
         {
             var clusterSize = 3;

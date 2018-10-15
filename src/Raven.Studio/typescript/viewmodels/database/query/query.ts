@@ -25,15 +25,47 @@ import virtualGridController = require("widgets/virtualGrid/virtualGridControlle
 import columnPreviewPlugin = require("widgets/virtualGrid/columnPreviewPlugin");
 import textColumn = require("widgets/virtualGrid/columns/textColumn");
 import columnsSelector = require("viewmodels/partial/columnsSelector");
+import showDataDialog = require("viewmodels/common/showDataDialog");
 import endpoints = require("endpoints");
+import actionColumn = require("widgets/virtualGrid/columns/actionColumn");
+import explainQueryDialog = require("viewmodels/database/query/explainQueryDialog");
+import explainQueryCommand = require("commands/database/index/explainQueryCommand");
+import timingsChart = require("common/timingsChart");
 
-type queryResultTab = "results" | "includes";
+type queryResultTab = "results" | "explanations" | "timings";
 
 type stringSearchType = "Starts With" | "Ends With" | "Contains" | "Exact";
 
 type rangeSearchType = "Numeric Double" | "Numeric Long" | "Alphabetical" | "Datetime";
 
 type fetcherType = (skip: number, take: number) => JQueryPromise<pagedResult<document>>;
+
+type explanationItem = {
+    explanations: string[];
+    id: string;
+}
+
+type highlightItem = {
+    Key: string;
+    Fragment: string;
+}
+
+class highlightSection {
+    data = new Map<string, highlightItem[]>();
+    fieldName = ko.observable<string>();
+    totalCount = ko.observable<number>(0);
+}
+
+class perCollectionIncludes {
+    name: string;
+    total = ko.observable<number>(0);
+    items = new Map<string, document>();
+    
+    constructor(name: string) {
+        this.name = name;
+    }
+}
+
 
 class query extends viewModelBase {
 
@@ -68,6 +100,8 @@ class query extends viewModelBase {
     };
 
     previewItem = ko.observable<storedQueryDto>();
+    
+    graph = new timingsChart(".js-timings-container");
 
     previewCode = ko.pureComputed(() => {
         const item = this.previewItem();
@@ -97,21 +131,27 @@ class query extends viewModelBase {
     columnsSelector = new columnsSelector<document>();
 
     queryFetcher = ko.observable<fetcherType>();
-    includesFetcher = ko.observable<fetcherType>();
+    explanationsFetcher = ko.observable<fetcherType>();
     effectiveFetcher = this.queryFetcher;
     
     queryStats = ko.observable<Raven.Client.Documents.Queries.QueryResult<any, any>>();
     staleResult: KnockoutComputed<boolean>;
+    fromCache = ko.observable<boolean>(false);
     dirtyResult = ko.observable<boolean>();
-    currentTab = ko.observable<queryResultTab>("results");
-    includesCache = new Map<string, document>();
+    currentTab = ko.observable<queryResultTab | highlightSection | perCollectionIncludes>("results");
     totalResults: KnockoutComputed<number>;
     hasMoreUnboundedResults = ko.observable<boolean>(false);
-    totalIncludes = ko.observable<number>(0);
+
+    includesCache = ko.observableArray<perCollectionIncludes>([]);
+    highlightsCache = ko.observableArray<highlightSection>([]);
+    explanationsCache = new Map<string, explanationItem>();
+    totalExplanations = ko.observable<number>(0);
+    timings = ko.observable<Raven.Client.Documents.Queries.Timings.QueryTimings>();
 
     canDeleteDocumentsMatchingQuery: KnockoutComputed<boolean>;
     isMapReduceIndex: KnockoutComputed<boolean>;
-    isDynamicIndex: KnockoutComputed<boolean>;
+    isCollectionQuery: KnockoutComputed<boolean>;
+    isDynamicQuery: KnockoutComputed<boolean>;
     isAutoIndex: KnockoutComputed<boolean>;
 
     private columnPreview = new columnPreviewPlugin<document>();
@@ -160,7 +200,6 @@ class query extends viewModelBase {
 
     constructor() {
         super();
-        _.bindAll(this, ...["previewQuery", "removeQuery", "useQuery", "useQueryItem"] as Array<keyof this>);
 
         this.queryCompleter = queryCompleter.remoteCompleter(this.activeDatabase, this.indexes, "Select");
         aceEditorBindingHandler.install();
@@ -169,7 +208,7 @@ class query extends viewModelBase {
         this.initObservables();
         this.initValidation();
 
-        this.bindToCurrentInstance("runRecentQuery");
+        this.bindToCurrentInstance("runRecentQuery", "previewQuery", "removeQuery", "useQuery", "useQueryItem", "goToHighlightsTab", "goToIncludesTab");
     }
 
     private initObservables() {
@@ -238,17 +277,25 @@ class query extends viewModelBase {
 
             const indexes = this.indexes() || [];
             const currentIndex = indexes.find(i => i.Name === indexName);
-            return !!currentIndex && (currentIndex.Type === "AutoMapReduce" || currentIndex.Type === "MapReduce");
+            return !!currentIndex && (currentIndex.Type === "AutoMapReduce" || currentIndex.Type === "MapReduce" || currentIndex.Type === "JavaScriptMapReduce");
         });
 
-        this.isDynamicIndex = ko.pureComputed(() => {
+        this.isCollectionQuery = ko.pureComputed(() => {
             const indexName = this.queriedIndex();
             if (!indexName)
                 return false;
 
+            if (!indexName.startsWith("collection/")) {
+                return false;
+            }
+            
+            // static index can have name starting with 'collection/' - let's check that as well
             const indexes = this.indexes() || [];
-            const currentIndex = indexes.find(i => i.Name === indexName);
-            return !currentIndex;
+            return !indexes.find(x => x.Name === indexName);
+        });
+        
+        this.isDynamicQuery = ko.pureComputed(() => {
+            return queryUtil.isDynamicQuery(this.criteria().queryText());
         });
         
         this.isAutoIndex = ko.pureComputed(() => {
@@ -260,13 +307,12 @@ class query extends viewModelBase {
         });
 
         this.canDeleteDocumentsMatchingQuery = ko.pureComputed(() => {
-            return !this.isMapReduceIndex() && !this.isDynamicIndex();
+            return !this.isMapReduceIndex();
         });
 
         this.containsAsterixQuery = ko.pureComputed(() => this.criteria().queryText().includes("*.*"));
 
         this.staleResult = ko.pureComputed(() => {
-            //TODO: return false for test index
             const stats = this.queryStats();
             return stats ? stats.IsStale : false;
         });
@@ -282,7 +328,7 @@ class query extends viewModelBase {
         criteria.showFields.subscribe(() => this.runQuery());   
       
         criteria.indexEntries.subscribe((checked) => {
-            if (checked && this.isDynamicIndex()) {
+            if (checked && this.isCollectionQuery()) {
                 criteria.indexEntries(false);
             } else {
                 // run index entries option only if not dynamic index
@@ -302,7 +348,6 @@ class query extends viewModelBase {
             
             return stats.TotalResults || 0;
         });
-        
 
          /* TODO
         this.showSuggestions = ko.computed<boolean>(() => {
@@ -337,12 +382,13 @@ class query extends viewModelBase {
         });
     }
 
-    canActivate(args: any) {
-        super.canActivate(args);
+    canActivate(args: any): boolean | JQueryPromise<canActivateResultDto> {
+        return $.when<any>(super.canActivate(args))
+            .then(() => {
+                this.loadSavedQueries();
 
-        this.loadSavedQueries();
-
-        return true;
+                return { can: true };
+            }); 
     }
 
     activate(indexNameOrRecentQueryHash?: string) {
@@ -395,23 +441,36 @@ class query extends viewModelBase {
             enableInlinePreview: true
         });
 
+        const highlightingProvider = new documentBasedColumnsProvider(this.activeDatabase(), grid, {
+            enableInlinePreview: false
+        });
+
         if (!this.queryFetcher())
             this.queryFetcher(() => $.when({
                 items: [] as document[],
                 totalResultCount: 0
             }));
         
-        this.includesFetcher(() => {
-            const allIncludes = Array.from(this.includesCache.values());
-            return $.when({
-                items: allIncludes.map(x => new document(x)),
-                totalResultCount: allIncludes.length
-            });
+        this.explanationsFetcher(() => {
+           const allExplanations = Array.from(this.explanationsCache.values());
+           
+           return $.when({
+               items: allExplanations.map(x => new document(x)),
+               totalResultCount: allExplanations.length
+           });
         });
-
+        
         this.columnsSelector.init(grid,
             (s, t, c) => this.effectiveFetcher()(s, t),
-            (w, r) => documentsProvider.findColumns(w, r), (results: pagedResult<document>) => documentBasedColumnsProvider.extractUniquePropertyNames(results));
+            (w, r) => {
+                if (this.currentTab() === "results") {
+                    return documentsProvider.findColumns(w, r);
+                } else if (this.currentTab() === "explanations") {
+                    return this.explanationsColumns(grid);
+                } else {
+                    return highlightingProvider.findColumns(w, r);
+                }
+            }, (results: pagedResult<document>) => documentBasedColumnsProvider.extractUniquePropertyNames(results));
 
         grid.headerVisible(true);
 
@@ -421,6 +480,12 @@ class query extends viewModelBase {
 
         this.columnPreview.install("virtual-grid", ".js-query-tooltip", 
             (doc: document, column: virtualColumn, e: JQueryEventObject, onValue: (context: any, valueToCopy: string) => void) => {
+            if (this.currentTab() === "explanations" && column.header === "Explanation") {
+                // we don't want to show inline preview for Explanation column, as value doesn't contain full message
+                // which might be misleading - use preview button to obtain entire explanation 
+                return;
+            } 
+            
             if (column instanceof textColumn) {
                 const value = column.getCellValue(doc);
                 if (!_.isUndefined(value)) {
@@ -432,6 +497,21 @@ class query extends viewModelBase {
         });
         
         this.queryHasFocus(true);
+    }
+    
+    private explanationsColumns(grid: virtualGridController<any>) {
+        return [
+            new actionColumn<explanationItem>(grid, doc => this.showExplanationDetails(doc), "Show", `<i class="icon-preview"></i>`, "72px",
+            {
+                title: () => 'Show detailed explanation'
+            }),
+            new textColumn<explanationItem>(grid, x => x.id, "Id", "30%"),
+            new textColumn<explanationItem>(grid, x => x.explanations.map(x => x.split("\n")[0]).join(", "), "Explanation", "50%")
+        ];
+    }
+    
+    private showExplanationDetails(details: explanationItem) {
+        app.showBootstrapDialog(new showDataDialog("Explanation for: " + details.id, details.explanations.join("\r\n"), "plain"));
     }
 
     private loadSavedQueries() {
@@ -480,12 +560,12 @@ class query extends viewModelBase {
     runQueryOnIndex(indexName: string) {
         this.criteria().setSelectedIndex(indexName);
 
-        if (this.isDynamicIndex() && this.criteria().indexEntries()) {
+        if (this.isCollectionQuery() && this.criteria().indexEntries()) {
             this.criteria().indexEntries(false);
             this.indexEntrieStateWasTrue = true; // save the state..
         }
 
-        if ((!this.isDynamicIndex() && this.indexEntrieStateWasTrue)) {
+        if (!this.isCollectionQuery() && this.indexEntrieStateWasTrue) {
             this.criteria().indexEntries(true);
             this.indexEntrieStateWasTrue = false;
         }
@@ -496,7 +576,7 @@ class query extends viewModelBase {
         this.updateUrl(url);
     }
 
-    runQuery() {
+    runQuery(optionalSavedQueryName?: string) {
         if (!this.isValid(this.criteria().validationGroup)) {
             return;
         }
@@ -505,12 +585,17 @@ class query extends viewModelBase {
         
         this.effectiveFetcher = this.queryFetcher;
         this.currentTab("results");
-        this.includesCache.clear();
+        this.includesCache.removeAll();
+        this.highlightsCache.removeAll();
+        this.explanationsCache.clear();
+        this.timings(null);
         
         this.isEmptyFieldsResult(false);
         
         eventsCollector.default.reportEvent("query", "run");
         const criteria = this.criteria();
+        
+        const criteriaDto = criteria.toStorageDto();
 
         if (criteria.queryText()) {
             this.isLoading(true);
@@ -530,7 +615,7 @@ class query extends viewModelBase {
             const resultsFetcher = (skip: number, take: number) => {
                 const command = new queryCommand(database, skip + totalSkippedResults, take + 1, this.criteria(), !this.cacheEnabled());
                 
-                const resultsTask = $.Deferred<pagedResultWithIncludes<document>>();
+                const resultsTask = $.Deferred<pagedResultExtended<document>>();
                 const queryForAllFields = this.criteria().showFields();
                                 
                 // Note: 
@@ -543,7 +628,7 @@ class query extends viewModelBase {
                     .always(() => {
                         this.isLoading(false);
                     })
-                    .done((queryResults: pagedResultWithIncludes<document>) => {
+                    .done((queryResults: pagedResultExtended<document>) => {
                         this.hasMoreUnboundedResults(false);
                     
                         if (queryResults.totalResultCount === -1) {
@@ -573,7 +658,13 @@ class query extends viewModelBase {
                         }
                     
                         const endQueryTime = new Date().getTime();
-                        queryResults.additionalResultInfo.DurationInMs = Math.min(endQueryTime-startQueryTime, queryResults.additionalResultInfo.DurationInMs);
+                        const localQueryTime = endQueryTime - startQueryTime;
+                        if (localQueryTime < queryResults.additionalResultInfo.DurationInMs) {
+                            queryResults.additionalResultInfo.DurationInMs = localQueryTime;
+                            this.fromCache(true);
+                        } else {
+                            this.fromCache(false);
+                        }
                         
                         const emptyFieldsResult = queryForAllFields 
                             && queryResults.totalResultCount > 0 
@@ -587,13 +678,19 @@ class query extends viewModelBase {
                             });
                             this.isEmptyFieldsResult(true);
                             this.queryStats(queryResults.additionalResultInfo);
+                            this.onHighlightingsLoaded({});
                         } else {
                             resultsTask.resolve(queryResults);
                             this.queryStats(queryResults.additionalResultInfo);
                             this.onIncludesLoaded(queryResults.includes);
+                            this.onHighlightingsLoaded(queryResults.highlightings);
+                            this.onExplanationsLoaded(queryResults.explanations);
+                            this.onTimingsLoaded(queryResults.timings);
                         }
                         this.saveLastQuery("");
-                        this.saveRecentQuery();
+                        this.saveRecentQuery(criteriaDto, optionalSavedQueryName);
+
+                        this.setupDisableReasons(); 
                     })
                     .fail((request: JQueryXHR) => {
                         resultsTask.reject(request);
@@ -605,6 +702,14 @@ class query extends viewModelBase {
             this.queryFetcher(resultsFetcher);
             this.recordQueryRun(this.criteria());
         }
+    }
+    
+    explainIndex() {
+        new explainQueryCommand(this.criteria().queryText(), this.activeDatabase())
+            .execute()
+            .done(explanationResult => {
+                app.showBootstrapDialog(new explainQueryDialog(explanationResult));
+            });
     }
 
     saveQuery() {
@@ -618,12 +723,11 @@ class query extends viewModelBase {
                     this.confirmationMessage(`Query ${this.querySaveName()} already exists`, `Overwrite existing query ?`, ["No", "Overwrite"])
                         .done(result => {
                             if (result.can) {
-                                this.saveQueryToStorage();   
+                                this.saveQueryToStorage(this.criteria().toStorageDto());   
                             }
                         });  
-                }    
-                else {
-                    this.saveQueryToStorage();
+                } else {
+                    this.saveQueryToStorage(this.criteria().toStorageDto());
                 }
             }
         } else {
@@ -633,24 +737,23 @@ class query extends viewModelBase {
         }
     }
     
-    private saveQueryToStorage() {
-        this.criteria().name(this.querySaveName());
-        this.saveQueryInStorage(false);
+    private saveQueryToStorage(criteria: storedQueryDto) {
+        criteria.name = this.querySaveName();
+        this.saveQueryInStorage(criteria, false);
         this.querySaveName(null);
         this.saveQueryValidationGroup.errors.showAllMessages(false);
         messagePublisher.reportSuccess("Query saved successfully");
     }
 
-    private saveRecentQuery() {
-        const name = this.getRecentQueryName();
-        this.criteria().name(name);
-        this.saveQueryInStorage(true);
+    private saveRecentQuery(criteria: storedQueryDto, optionalSavedQueryName?: string) {
+        const name = optionalSavedQueryName || this.getRecentQueryName();
+        criteria.name = name;
+        this.saveQueryInStorage(criteria, !optionalSavedQueryName);
     }
 
-    private saveQueryInStorage(isRecent: boolean) {
-        const dto = this.criteria().toStorageDto();
-        dto.recentQuery = isRecent;
-        this.appendQuery(dto);
+    private saveQueryInStorage(criteria: storedQueryDto, isRecent: boolean) {
+        criteria.recentQuery = isRecent;
+        this.appendQuery(criteria);
         savedQueriesStorage.storeSavedQueries(this.activeDatabase(), this.savedQueries());
 
         this.criteria().name("");
@@ -673,11 +776,12 @@ class query extends viewModelBase {
             }
         } else {
             const existing = this.savedQueries().find(x => x.name === doc.name);
+            
             if (existing) {
-                this.savedQueries.replace(existing, doc);
-            } else {
-                this.savedQueries.unshift(doc);
+                this.savedQueries.remove(existing);                    
             }
+
+            this.savedQueries.unshift(doc);
         }
     }
 
@@ -689,7 +793,6 @@ class query extends viewModelBase {
     }
 
     private getRecentQueryName(): string {
-
         const collectionIndexName = queryUtil.getCollectionOrIndexName(this.criteria().queryText());
 
         return query.recentKeyword + " (" + collectionIndexName + ")";
@@ -706,14 +809,15 @@ class query extends viewModelBase {
 
     useQuery() {
         const queryDoc = this.criteria();
-        queryDoc.copyFrom(this.previewItem());
+        const previewItem  = this.previewItem();
+        queryDoc.copyFrom(previewItem);
         
         // Reset settings
         this.cacheEnabled(true);
         this.criteria().indexEntries(false);
         this.criteria().showFields(false);
         
-        this.runQuery();
+        this.runQuery(previewItem.recentQuery ? null : previewItem.name);
     }
 
     removeQuery(item: storedQueryDto) {
@@ -731,12 +835,65 @@ class query extends viewModelBase {
             });
     }
     
-    private onIncludesLoaded(includes: dictionary<any>) {
-        _.forIn(includes, (doc, id) => {
-            this.includesCache.set(id, doc);
+    private onExplanationsLoaded(explanations: dictionary<Array<string>>) {
+        _.forIn(explanations, (doc, id) => {
+            this.explanationsCache.set(id, {
+               id: id,
+                explanations: doc
+            });
         });
         
-        this.totalIncludes(this.includesCache.size);
+        this.totalExplanations(this.explanationsCache.size);
+    }
+    
+    private onTimingsLoaded(timings: Raven.Client.Documents.Queries.Timings.QueryTimings) {
+        this.timings(timings);
+    }
+    
+    private onIncludesLoaded(includes: dictionary<any>) {
+        _.forIn(includes, (doc, id) => {
+            const metadata = doc['@metadata'];
+            const collection = (metadata ? metadata["@collection"] : null) || "@unknown";
+            
+            let perCollectionCache = this.includesCache().find(x => x.name === collection);
+            if (!perCollectionCache) {
+                perCollectionCache = new perCollectionIncludes(collection);
+                this.includesCache.push(perCollectionCache);
+            }
+            perCollectionCache.items.set(id, doc);
+        });
+        
+        this.includesCache().forEach(cache => {
+            cache.total(cache.items.size);
+        });
+    }
+    
+    private onHighlightingsLoaded(highlightings: dictionary<dictionary<Array<string>>>) {
+        _.forIn(highlightings, (value, fieldName) => {
+            let existingPerFieldCache = this.highlightsCache().find(x => x.fieldName() === fieldName);
+
+            if (!existingPerFieldCache) {
+                existingPerFieldCache = new highlightSection();
+                existingPerFieldCache.fieldName(fieldName);
+                this.highlightsCache.push(existingPerFieldCache);
+            }
+            
+            _.forIn(value, (fragments, key) => {
+               if (!existingPerFieldCache.data.has(key)) {
+                   existingPerFieldCache.data.set(key, [] as Array<highlightItem>);
+               } 
+               const existingFragments = existingPerFieldCache.data.get(key);
+               
+               fragments.forEach(fragment => {
+                   existingFragments.push({
+                       Key: key,
+                       Fragment: fragment
+                   });
+                   
+                   existingPerFieldCache.totalCount(existingPerFieldCache.totalCount() + 1);
+               });
+            });
+        });
     }
 
     refresh() {
@@ -829,16 +986,56 @@ class query extends viewModelBase {
         this.currentTab("results");
         this.effectiveFetcher = this.queryFetcher;
 
+        // since we merge records based on fragments
+        // remove all existing highlights when going back to 
+        // 'results' tab
+        this.highlightsCache.removeAll();
+        
         this.columnsSelector.reset();
         this.refresh();
     }
     
-    goToIncludesTab() {
-        this.currentTab("includes");
-        this.effectiveFetcher = this.includesFetcher;
+    goToIncludesTab(includes: perCollectionIncludes) {
+        this.currentTab(includes);
+        
+        this.effectiveFetcher = ko.observable<fetcherType>(() => {
+            return $.when({
+                items: Array.from(includes.items.values()).map(x => new document(x)),
+                totalResultCount: includes.total()
+            });
+        });
 
         this.columnsSelector.reset();
         this.refresh();
+    }
+    
+    goToExplanationsTab() {
+        this.currentTab("explanations");
+        this.effectiveFetcher = this.explanationsFetcher;
+        
+        this.columnsSelector.reset();
+        this.refresh();
+    }
+
+    goToHighlightsTab(highlight: highlightSection) {
+        this.currentTab(highlight);
+
+        const itemsFlattened = _.flatMap(Array.from(highlight.data.values()), items => items);
+        
+        this.effectiveFetcher = ko.observable<fetcherType>(() => {
+            return $.when({
+                items: itemsFlattened.map(x => new document(x)),
+                totalResultCount: itemsFlattened.length
+            });
+        });
+        this.columnsSelector.reset();
+        this.refresh();
+    }
+
+    goToTimingsTab() {
+        this.currentTab("timings");
+        
+        this.graph.draw(this.timings());
     }
 
     exportCsv() {

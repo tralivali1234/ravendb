@@ -1,30 +1,31 @@
-﻿using System.Collections.Generic;
+﻿using System;
+using System.Collections.Generic;
 using System.Linq;
+using FastTests.Server.Basic.Entities;
+using Microsoft.CodeAnalysis.CSharp.Syntax;
 using Raven.Client;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Exceptions.Documents.Indexes;
-using Raven.Server.Config;
+using Raven.Server.Config.Categories;
 using Xunit;
 
 namespace FastTests.Client.Indexing
 {
     public class JavaScriptIndexTests : RavenTestBase
     {
+
         [Fact]
         public void CreatingJavaScriptIndexWithFeaturesAvailabilitySetToStableWillThrow()
         {
-            using (var store = GetDocumentStore(new Options
+            DoNotReuseServer();
+            using (var store = GetDocumentStore())
             {
-                ModifyDatabaseRecord = record =>
-                {
-                    record.Settings[RavenConfiguration.GetKey(x => x.Core.FeaturesAvailability)] = null; // by default we should have Stable features
-                }
-            }))
-            {
+                Server.Configuration.Core.FeaturesAvailability = FeaturesAvailability.Stable;
                 var e = Assert.Throws<IndexCreationException>(() => store.ExecuteIndex(new UsersByName()));
                 Assert.Contains(
-                    "Database does not support 'JavaScript' indexes. Please enable experimental features by changing 'Features.Availability' configuration value to 'Experimental'.",
+                    "The experimental 'JavaScript' indexes feature is not enabled in your current server configuration. " +
+                    "In order to use, please enable experimental features by changing 'Features.Availability' configuration value to 'Experimental'.",
                     e.Message);
             }
         }
@@ -45,6 +46,145 @@ namespace FastTests.Client.Indexing
                     session.SaveChanges();
                     WaitForIndexing(store);
                     session.Query<User>("UsersByName").Single(x => x.Name == "Brendan Eich");
+                }
+
+            }
+        }
+
+
+        [Fact]
+        public void CanIndexTimeSpan()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new TeemoByDuration());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new Teemo
+                    {
+                        Description = "5 minutes",
+                        Duration = TimeSpan.FromMinutes(5)
+                    });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    session.Query<Teemo>("TeemoByDuration").Single(x => x.Duration == TimeSpan.FromMinutes(5));
+                }
+
+            }
+        }
+
+        public class Teemo
+        {
+            public string Description { get; set; }
+            public TimeSpan Duration { get; set; }
+        }
+
+        [Fact]
+        public void CanUseJavaScriptIndexWithAdditionalSources()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new UsersByNameWithAdditionalSources());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new User
+                    {
+                        Name = "Brendan Eich",
+                        IsActive = true
+                    });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    session.Query<User>("UsersByNameWithAdditionalSources").Single(x => x.Name == "Mr. Brendan Eich");
+                }
+
+            }
+        }
+
+        [Fact]
+        public void CanIndexArrayProperties()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new UsersByPhones());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new User
+                    {
+                        Name = "Jow",
+                        PhoneNumbers = new[] { "555-234-8765", "555-987-3425" }
+                    });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    var result = session.Query<UsersByPhones.UsersByPhonesResult>("UsersByPhones")
+                        .Where(x => x.Phone == "555-234-8765")
+                        .OfType<User>()
+                        .Single();
+                }
+
+            }
+        }
+
+        private class Fanout
+        {
+            public string Foo { get; set; }
+            public int[] Numbers { get; set; }
+        }
+
+        [Fact]
+        public void CanIndexMapWithFanout()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new FanoutByNumbers());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new Fanout
+                    {
+                        Foo = "Foo",
+                        Numbers = new[] { 4, 6, 11, 9 }
+                    });
+                    session.Store(new Fanout
+                    {
+                        Foo = "Bar",
+                        Numbers = new[] { 3, 8, 5, 17 }
+                    });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    var result = session.Query<FanoutByNumbers.Result>("FanoutByNumbers")
+                        .Where(x => x.Sum == 17)
+                        .OfType<Fanout>()
+                        .Single();
+                    Assert.Equal("Bar", result.Foo);
+                }
+
+            }
+        }
+
+        [Fact]
+        public void CanIndexMapReduceWithFanout()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new FanoutByNumbersWithReduce());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new Fanout
+                    {
+                        Foo = "Foo",
+                        Numbers = new[] { 4, 6, 11, 9 }
+                    });
+                    session.Store(new Fanout
+                    {
+                        Foo = "Bar",
+                        Numbers = new[] { 3, 8, 5, 17 }
+                    });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    WaitForUserToContinueTheTest(store);
+                    var result = session.Query<FanoutByNumbersWithReduce.Result>("FanoutByNumbersWithReduce")
+                        .Where(x => x.Sum == 33)
+                        .Single();
+                    Assert.Equal("Bar", result.Foo);
                 }
 
             }
@@ -148,7 +288,7 @@ namespace FastTests.Client.Indexing
 
             }
         }
-        [Fact(Skip = "The code for this is not yet ready")]
+        [Fact]
         public void CanUseJavaScriptMapReduceIndex()
         {
             using (var store = GetDocumentStore())
@@ -170,8 +310,208 @@ namespace FastTests.Client.Indexing
                     WaitForIndexing(store);
                     session.Query<User>("UsersAndProductsByNameAndCount").OfType<ReduceResults>().Single(x => x.Name == "Brendan Eich");
                 }
+            }
+        }
+
+        [Fact]
+        public void CanUseSpatialFields()
+        {
+            var kalab = 10;
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new Spatial());
+                CanUseSpatialFieldsInternal(kalab, store, "Spatial");
+            }
+        }
+
+        [Fact]
+        public void CanUseDynamicSpatialFields()
+        {
+            var kalab = 10;
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new DynamicSpatial());
+                CanUseSpatialFieldsInternal(kalab, store, "DynamicSpatial");
+            }
+        }
+
+        private static void CanUseSpatialFieldsInternal(int kalab, DocumentStore store, string indexName)
+        {
+            using (var session = store.OpenSession())
+            {
+                session.Store(new Location
+                {
+                    Description = "Dor beach",
+                    Latitude = 32.61059534196809,
+                    Longitude = 34.918146686510454
+
+                });
+                session.Store(new Location
+                {
+                    Description = "Kfar Galim",
+                    Latitude = 32.76724701152615,
+                    Longitude = 34.957999421620116
+
+                });
+                session.SaveChanges();
+                WaitForIndexing(store);
+                WaitForUserToContinueTheTest(store);
+                session.Query<Location>(indexName).Spatial("Location", criteria => criteria.WithinRadius(kalab, 32.56829122491778, 34.953954053921734)).Single(x => x.Description == "Dor beach");
+            }
+        }
+
+        [Fact]
+        public void CanReduceNullValues()
+        {
+            using (var store = GetDocumentStore())
+            using (var store2 = GetDocumentStore())
+            {
+                ReduceNullValuesInternal(store);
+            }
+        }
+
+        private static void ReduceNullValuesInternal(DocumentStore store)
+        {
+            store.ExecuteIndex(new UsersReducedByName());
+            using (var session = store.OpenSession())
+            {
+                session.Store(new User { Name = null });
+                session.Store(new User { Name = null });
+                session.Store(new User { Name = null });
+                session.Store(new User { Name = "Tal" });
+                session.Store(new User { Name = "Maxim" });
+                session.SaveChanges();
+                WaitForIndexing(store);
+                var res = session.Query<User>("UsersReducedByName").OfType<ReduceResults>().Single(x => x.Count == 3);
+                Assert.Null(res.Name);
+            }
+        }
+
+        [Fact]
+        public void IdenticalMapReduceIndexWillGenerateDiffrentIndexInstance()
+        {
+            using (var store = GetDocumentStore())
+            using (var store2 = GetDocumentStore())
+            {
+                ReduceNullValuesInternal(store);
+                ReduceNullValuesInternal(store2);
+            }
+        }
+
+        [Fact]
+        public void OutputReduceToCollection()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new Products_ByCategory());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new Category { Name = "Beverages" }, "categories/1-A");
+                    session.Store(new Category { Name = "Seafood" }, "categories/2-A");
+                    session.Store(new product { Name = "Lakkalikööri", Category = "categories/1-A", PricePerUnit = 13 });
+                    session.Store(new product { Name = "Original Frankfurter", Category = "categories/1-A", PricePerUnit = 16 });
+                    session.Store(new product { Name = "Röd Kaviar", Category = "categories/2-A", PricePerUnit = 18 });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    var res = session.Query<Products_ByCategory.Result>("Products/ByCategory")
+                        .ToList();
+                    var res2 = session.Query<CategoryCount>()
+                        .ToList();
+                    Assert.Equal(res.Count, res2.Count);
+                }
 
             }
+        }
+
+        [Fact]
+        public void DateCheckMapReduce()
+        {
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new Product_Sales_ByMonth());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new Order
+                    {
+                        Lines = new List<OrderLine>
+                        {
+                            new OrderLine() {ProductName = "Chang"},
+                            new OrderLine() {ProductName = "Aniseed Syrup"},
+                            new OrderLine() {ProductName = "Chef Anton's Cajun Seasoning"}
+                        },
+                        OrderedAt = new DateTime(1998, 5, 6)
+                    });
+                    session.Store(new Order
+                    {
+                        Lines = new List<OrderLine>
+                        {
+                            new OrderLine() {ProductName = "Grandma's Boysenberry Spread"},
+                            new OrderLine() {ProductName = "Tofu"},
+                            new OrderLine() {ProductName = "Teatime Chocolate Biscuits"}
+                        },
+                        OrderedAt = new DateTime(1998, 5, 10)
+                    });
+                    session.Store(new Order
+                    {
+                        Lines = new List<OrderLine>
+                        {
+                            new OrderLine() {ProductName = "Guaraná Fantástica"},
+                            new OrderLine() {ProductName = "NuNuCa Nuß-Nougat-Creme"},
+                            new OrderLine() {ProductName = "Perth Pasties"},
+                            new OrderLine() {ProductName = "Outback Lager"}
+                        },
+                        OrderedAt = new DateTime(1998, 4, 30)
+                    });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    var res = session.Query<Product_Sales_ByMonth.Result>("Product/Sales/ByMonth")
+                        .Where(x => x.Count == 6)
+                        .ToList();
+                    Assert.Equal(res[0].Month.Month, 5);
+                }
+            }
+        }
+
+        [Fact]
+        public void CanQueryBySubObjectAsString()
+        {
+            var address = new Address
+            {
+                Line1 = "Home",
+                Line2 = "sweet home"
+            };
+
+            using (var store = GetDocumentStore())
+            {
+                store.ExecuteIndex(new Users_ByAddress());
+                using (var session = store.OpenSession())
+                {
+                    session.Store(new User{Name = "Foo", Address = address });
+                    session.SaveChanges();
+                    WaitForIndexing(store);
+                    var user = session.Query<User>("Users/ByAddress").Single(u => u.Address == address);
+                    Assert.Equal("Foo", user.Name);
+                }
+            }
+        }
+
+        private class Category
+        {
+            public string Description { get; set; }
+            public string Name { get; set; }
+        }
+        private class product
+        {
+            public string Category { get; set; }
+            public string Name { get; set; }
+            public int PricePerUnit { get; set; }
+        }
+
+        private class CategoryCount
+        {
+            public string Category { get; set; }
+
+            public int Count { get; set; }
         }
 
         private class User
@@ -179,8 +519,15 @@ namespace FastTests.Client.Indexing
             public string Name { get; set; }
             public bool IsActive { get; set; }
             public string Product { get; set; }
+            public string[] PhoneNumbers { get; set; }
+            public Address Address { get; set; }
         }
 
+        private class Address
+        {
+            public string Line1 { get; set; }
+            public string Line2 { get; set; }
+        }
         private class Product
         {
             public string Name { get; set; }
@@ -193,143 +540,340 @@ namespace FastTests.Client.Indexing
             public int Count { get; set; }
         }
 
-        private class UsersByName : AbstractIndexCreationTask
+        private class UsersByName : AbstractJavaScriptIndexCreationTask
         {
-            public override IndexDefinition CreateIndexDefinition()
+            public UsersByName()
             {
-                return new IndexDefinition
+                Maps = new HashSet<string>
                 {
-                    Name = "UsersByName",
-                    Maps = new HashSet<string>
-                    {
-                        @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
-                    },
-                    Type = IndexType.JavaScriptMap,
-                    LockMode = IndexLockMode.Unlock,
-                    Priority = IndexPriority.Normal,
-                    Configuration = new IndexConfiguration()
+                    @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
                 };
             }
         }
 
-        private class UsersByNameAndAnalyzedName : AbstractIndexCreationTask
+        private class TeemoByDuration : AbstractJavaScriptIndexCreationTask
         {
-            public override IndexDefinition CreateIndexDefinition()
+            public TeemoByDuration()
             {
-                return new IndexDefinition
+                Maps = new HashSet<string>
                 {
-                    Name = "UsersByName",
-                    Maps = new HashSet<string>
-                    {
-                        @"
-map('Users', function (u){ 
-    return { 
-        Name: u.Name, 
-        _: {$value: u.Name, $name:'AnalyzedName', $options:{index: true, store: true}}
-    };
-})",
-                    },
-                    Type = IndexType.JavaScriptMap,
-                    LockMode = IndexLockMode.Unlock,
-                    Priority = IndexPriority.Normal,
-                    Fields = new Dictionary<string, IndexFieldOptions>
-                    {
-                        {
-                            Constants.Documents.Indexing.Fields.AllFields, new IndexFieldOptions()
-                            {
-                                Indexing = FieldIndexing.Search,
-                                Analyzer = "StandardAnalyzer"
-                            }
-                        }
-                    },
-                    Configuration = new IndexConfiguration()
+                    @"map('Teemos', function (t){ return { Duration: t.Duration, Description: t.Description};})",
+                };
+            }
+        }
+
+        private class UsersByNameWithAdditionalSources : AbstractJavaScriptIndexCreationTask
+        {
+            public UsersByNameWithAdditionalSources()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Users', function (u){ return { Name: Mr(u.Name)};})",
+                };
+                AdditionalSources = new Dictionary<string, string>
+                {
+                    ["The Script"] = @"function Mr(x){
+                                        return 'Mr. ' + x;
+                                        }"
                 };
 
             }
 
+        }
+
+        private class FanoutByNumbers : AbstractJavaScriptIndexCreationTask
+        {
+            public FanoutByNumbers()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Fanouts', function (f){
+                                var result = [];
+                                for(var i = 0; i < f.Numbers.length; i++)
+                                {
+                                    result.push({
+                                        Foo: f.Foo,
+                                        Sum: f.Numbers[i]
+                                    });
+                                 }
+                                return result;
+                            })",
+                };
+            }
+
+            internal class Result
+            {
+                public string Foo { get; set; }
+                public int Sum { get; set; }
+            }
+        }
+
+        private class FanoutByNumbersWithReduce : AbstractJavaScriptIndexCreationTask
+        {
+            public FanoutByNumbersWithReduce()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Fanouts', function (f){
+                                var result = [];
+                                for(var i = 0; i < f.Numbers.length; i++)
+                                {
+                                    result.push({
+                                        Foo: f.Foo,
+                                        Sum: f.Numbers[i]
+                                    });
+                                }
+                                return result;
+                                })",
+                };
+                Reduce = @"groupBy( f => f.Foo )
+                             .aggregate( g => ({
+                                 Foo: g.key,
+                                 Sum: g.values.reduce((total, val) => val.Sum + total,0)
+                             }))";
+            }
+            internal class Result
+            {
+                public string Foo { get; set; }
+                public int Sum { get; set; }
+            }
+        }
+
+        private class UsersByPhones : AbstractJavaScriptIndexCreationTask
+        {
+            public class UsersByPhonesResult
+            {
+                public string Name { get; set; }
+                public string Phone { get; set; }
+            }
+
+            public UsersByPhones()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Users', function (u){ return { Name: u.Name, Phone: u.PhoneNumbers};})",
+                };
+            }
+        }
+
+        private class UsersByNameAndAnalyzedName : AbstractJavaScriptIndexCreationTask
+        {
+            public UsersByNameAndAnalyzedName()
+            {
+                Maps = new HashSet<string>
+                        {
+                            @"map('Users', function (u){
+                                    return {
+                                        Name: u.Name,
+                                        _: {$value: u.Name, $name:'AnalyzedName', $options:{indexing: 'Search', storage: true}}
+                                    };
+                                })",
+                        };
+                Fields = new Dictionary<string, IndexFieldOptions>
+                        {
+                            {
+                                Constants.Documents.Indexing.Fields.AllFields, new IndexFieldOptions()
+                                {
+                                    Indexing = FieldIndexing.Search,
+                                    Analyzer = "StandardAnalyzer"
+                                }
+                            }
+                        };
+            }
             public class Result
             {
                 public string AnalyzedName { get; set; }
             }
         }
-        
-        private class UsersAndProductsByName : AbstractIndexCreationTask
+
+        private class UsersAndProductsByName : AbstractJavaScriptIndexCreationTask
         {
-            public override IndexDefinition CreateIndexDefinition()
+            public UsersAndProductsByName()
             {
-                return new IndexDefinition
+                Maps = new HashSet<string>
                 {
-                    Name = "UsersAndProductsByName",
-                    Maps = new HashSet<string>
-                        {
-                            @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
-                            @"map('Products', function (p){ return { Name: p.Name, Count: 1};})"
-                        },
-                    Type = IndexType.JavaScriptMap,
-                    LockMode = IndexLockMode.Unlock,
-                    Priority = IndexPriority.Normal,
-                    Configuration = new IndexConfiguration()
+                    @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
+                    @"map('Products', function (p){ return { Name: p.Name, Count: 1};})"
                 };
             }
         }
 
-        private class UsersByNameAndIsActive : AbstractIndexCreationTask
+        private class UsersByNameAndIsActive : AbstractJavaScriptIndexCreationTask
         {
-            public override IndexDefinition CreateIndexDefinition()
+            public UsersByNameAndIsActive()
             {
-                return new IndexDefinition
+                Maps = new HashSet<string>
                 {
-                    Name = "UsersByNameAndIsActive",
-                    Maps = new HashSet<string>
-                    {
-                        @"map('Users', u => u.Name, function(f){ return f.IsActive;})",
-                    },
-                    Type = IndexType.JavaScriptMap,
-                    LockMode = IndexLockMode.Unlock,
-                    Priority = IndexPriority.Normal,
-                    Configuration = new IndexConfiguration()
+                    @"map('Users', u => u.Name, function(f){ return f.IsActive;})",
                 };
             }
         }
 
-        private class UsersWithProductsByName : AbstractIndexCreationTask
+        private class UsersWithProductsByName : AbstractJavaScriptIndexCreationTask
         {
-            public override IndexDefinition CreateIndexDefinition()
+            public UsersWithProductsByName()
             {
-                return new IndexDefinition
+                Maps = new HashSet<string>
                 {
-                    Name = "UsersWithProductsByName",
-                    Maps = new HashSet<string>
-                        {
-                            @"map('Users', function (u){ return { Name: u.Name, Count: 1, Product: load(u.Product,'Products').Name};})",
-                        },
-                    Type = IndexType.JavaScriptMap,
-                    LockMode = IndexLockMode.Unlock,
-                    Priority = IndexPriority.Normal,
-                    Configuration = new IndexConfiguration()
+                    @"map('Users', function (u){ return { Name: u.Name, Count: 1, Product: load(u.Product,'Products').Name};})",
                 };
             }
         }
 
-        private class UsersAndProductsByNameAndCount : AbstractIndexCreationTask
+        private class Location
         {
-            public override IndexDefinition CreateIndexDefinition()
+            public string Description { get; set; }
+            public double Longitude { get; set; }
+            public double Latitude { get; set; }
+        }
+
+        private class Spatial : AbstractJavaScriptIndexCreationTask
+        {
+            public Spatial()
             {
-                return new IndexDefinition
+                Maps = new HashSet<string>
                 {
-                    Name = "UsersAndProductsByNameAndCount",
-                    Maps = new HashSet<string>
-                        {
-                            @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
-                            @"map('Products', function (p){ return { Name: p.Name, Count: 1};})"
-                        },
-                    Reduce = @"groupBy(x => x.Name).aggregate((key,values) => {return {Name: key,Count: values.reduce((total, val) => val.Count + total,0)};})",
-                    Type = IndexType.JavaScriptMapReduce,
-                    LockMode = IndexLockMode.Unlock,
-                    Priority = IndexPriority.Normal,
-                    Configuration = new IndexConfiguration()
+                    @"map('Locations', function (l){ return { Description: l.Description, Location: createSpatialField(l.Latitude, l.Longitude)}})",
                 };
+            }
+        }
+
+        private class DynamicSpatial : AbstractJavaScriptIndexCreationTask
+        {
+            public DynamicSpatial()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Locations', function (l){ return { Description: l.Description, _:{$value: createSpatialField(l.Latitude, l.Longitude), $name:'Location', $options:{indexing: 'Search', storage: true}} }})",
+                };
+            }
+        }
+
+        private class UsersAndProductsByNameAndCount : AbstractJavaScriptIndexCreationTask
+        {
+            public UsersAndProductsByNameAndCount()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
+                    @"map('Products', function (p){ return { Name: p.Name, Count: 1};})"
+                };
+                Reduce = @"groupBy( x =>  x.Name )
+                                .aggregate(g => {return {
+                                    Name: g.key,
+                                    Count: g.values.reduce((total, val) => val.Count + total,0)
+                               };})";
+            }
+
+        }
+
+        private class UsersReducedByName : AbstractJavaScriptIndexCreationTask
+        {
+            public UsersReducedByName()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('Users', function (u){ return { Name: u.Name, Count: 1};})",
+                };
+                Reduce = @"groupBy( x =>  x.Name )
+                                .aggregate(g => {return {
+                                    Name: g.key,
+                                    Count: g.values.reduce((total, val) => val.Count + total,0)
+                               };})";
+
+            }
+        }
+
+        public class Products_ByCategory : AbstractJavaScriptIndexCreationTask
+        {
+            public class Result
+            {
+                public string Category { get; set; }
+
+                public int Count { get; set; }
+            }
+
+            public Products_ByCategory()
+            {
+                Maps = new HashSet<string>()
+                {
+                    @"map('products', function(p){
+                        return {
+                            Category:
+                            load(p.Category, 'Categories').Name,
+                            Count:
+                            1
+                        }
+                    })"
+                };
+
+                Reduce = @"groupBy( x => x.Category )
+                            .aggregate(g => {
+                                return {
+                                    Category: g.key,
+                                    Count: g.values.reduce((count, val) => val.Count + count, 0)
+                               };})";
+
+                OutputReduceToCollection = "CategoryCounts";
+            }
+        }
+
+        public class Product_Sales_ByMonth : AbstractJavaScriptIndexCreationTask
+        {
+            public class Result
+            {
+                public string Product { get; set; }
+
+                public DateTime Month { get; set; }
+
+                public int Count { get; set; }
+
+            }
+
+            public Product_Sales_ByMonth()
+            {
+                Maps = new HashSet<string>()
+                {
+                    @"map('orders', function(order){
+                            var res = [];
+                            order.Lines.forEach(l => {
+                                res.push({
+                                    Product: l.Product,
+                                    Month: new Date( (new Date(order.OrderedAt)).getFullYear(),(new Date(order.OrderedAt)).getMonth(),1),
+                                    Count: 1,
+                                })
+                            });
+                            return res;
+                        })"
+                };
+
+                Reduce = @"groupBy( x => ({Product: x.Product , Month: x.Month}) )
+                    .aggregate(g => {
+                    return {
+                        Product: g.key.Product,
+                        Month: g.key.Month,
+                        Count: g.values.reduce((sum, x) => x.Count + sum, 0)
+                    }
+                })";
+
+            }
+        }
+
+        public class Users_ByAddress : AbstractJavaScriptIndexCreationTask
+        {
+
+
+            public Users_ByAddress()
+            {
+                Maps = new HashSet<string>
+                {
+                    @"map('users', function(u){
+                            return {Address: u.Address}
+                        })"
+                };
+
             }
         }
     }
+
 }

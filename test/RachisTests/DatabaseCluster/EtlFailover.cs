@@ -6,11 +6,15 @@ using System.Threading.Tasks;
 using FastTests.Server.Replication;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Conventions;
+using Raven.Client.Documents.Operations.Configuration;
 using Raven.Client.Documents.Operations.ConnectionStrings;
 using Raven.Client.Documents.Operations.ETL;
 using Raven.Client.Documents.Operations.OngoingTasks;
+using Raven.Client.Exceptions.Cluster;
+using Raven.Client.Exceptions.Database;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
+using Raven.Server.ServerWide.Commands;
 using Raven.Tests.Core.Utils.Entities;
 using Tests.Infrastructure;
 using Xunit;
@@ -19,7 +23,7 @@ namespace RachisTests.DatabaseCluster
 {
     public class EtlFailover : ReplicationTestBase
     {
-        [NightlyBuildFact]
+        [Fact]
         public async Task ReplicateFromSingleSource()
         {
             var srcDb = "ReplicateFromSingleSourceSrc";
@@ -57,7 +61,7 @@ namespace RachisTests.DatabaseCluster
                             Disabled = false
                         }
                     },
-                    LoadRequestTimeoutInSec = 10,
+                    LoadRequestTimeoutInSec = 30,
                     MentorNode = "B"
                 };
                 var connectionString = new RavenConnectionString
@@ -80,9 +84,10 @@ namespace RachisTests.DatabaseCluster
 
                     session.SaveChanges();
                 }
+                
                 Assert.True(WaitForDocument<User>(dest, "users/1", u => u.Name == "Joe Doe", 30_000));
                 await srcRaft.ServerStore.RemoveFromClusterAsync("B");
-                await originalTaskNode.ServerStore.WaitForState(RachisState.Passive);
+                await originalTaskNode.ServerStore.WaitForState(RachisState.Passive, CancellationToken.None);
 
                 using (var session = src.OpenSession())
                 {
@@ -95,32 +100,33 @@ namespace RachisTests.DatabaseCluster
                 }
 
                 Assert.True(WaitForDocument<User>(dest, "users/2", u => u.Name == "Joe Doe2", 30_000));
-
-                using (var originalSrc = new DocumentStore
+                Assert.Throws<NodeIsPassiveException>(() =>
                 {
-                    Urls = new[] {originalTaskNode.WebUrl},
-                    Database = srcDb,
-                    Conventions = new DocumentConventions
+                    using (var originalSrc = new DocumentStore
                     {
-                        DisableTopologyUpdates = true
-                    }
-                }.Initialize())
-                {
-                    using (var session = originalSrc.OpenSession())
-                    {
-                        session.Store(new User()
+                        Urls = new[] { originalTaskNode.WebUrl },
+                        Database = srcDb,
+                        Conventions = new DocumentConventions
                         {
-                            Name = "Joe Doe3"
-                        }, "users/3");
+                            DisableTopologyUpdates = true
+                        }
+                    }.Initialize())
+                    {
+                        using (var session = originalSrc.OpenSession())
+                        {
+                            session.Store(new User()
+                            {
+                                Name = "Joe Doe3"
+                            }, "users/3");
 
-                        session.SaveChanges();
+                            session.SaveChanges();
+                        }
                     }
-                    Assert.False(WaitForDocument<User>(dest, "users/3", u => u.Name == "Joe Doe3", 30_000));
-                }
+                });
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task EtlDestinationFailoverBetweenNodesWithinSameCluster()
         {
             var srcDb = "EtlDestinationFailoverBetweenNodesWithinSameClusterSrc";
@@ -190,18 +196,24 @@ namespace RachisTests.DatabaseCluster
                     session.Store(new User()
                     {
                         Name = "Joe Doe"
-                    }, "users/1");
+                    }, "users|");
                     session.SaveChanges();
                 }
 
                 Assert.True(etlDone.Wait(TimeSpan.FromMinutes(1)));
-
                 Assert.True(WaitForDocument<User>(dest, "users/1", u => u.Name == "Joe Doe", 30_000));
+
+                // BEFORE THE FIX: this will change the database record and restart the ETL, which would fail the test.
+                // we leave this here to make sure that such issue in future will fail the test immediately 
+                await src.Maintenance.SendAsync(new PutClientConfigurationOperation(new ClientConfiguration()));
+
                 var taskInfo = (OngoingTaskRavenEtlDetails)src.Maintenance.Send(new GetOngoingTaskInfoOperation(etlResult.TaskId, OngoingTaskType.RavenEtl));
+                Assert.NotNull(taskInfo);
+                Assert.NotNull(taskInfo.DestinationUrl);
                 Assert.Equal(myTag, taskInfo.ResponsibleNode.NodeTag);
                 Assert.Null(taskInfo.Error);
                 Assert.Equal(OngoingTaskConnectionStatus.Active, taskInfo.TaskConnectionStatus);
-                Assert.NotNull(taskInfo.DestinationUrl);
+
                 etlDone.Reset();
                 DisposeServerAndWaitForFinishOfDisposal(destNode.Servers.Single(s => s.WebUrl == taskInfo.DestinationUrl));
 

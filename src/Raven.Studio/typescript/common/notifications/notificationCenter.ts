@@ -6,6 +6,7 @@ import viewHelpers = require("common/helpers/view/viewHelpers");
 import alert = require("common/notifications/models/alert");
 import performanceHint = require("common/notifications/models/performanceHint");
 import recentError = require("common/notifications/models/recentError");
+import attachmentUpload = require("common/notifications/models/attachmentUpload");
 import recentLicenseLimitError = require("common/notifications/models/recentLicenseLimitError");
 import operation = require("common/notifications/models/operation");
 
@@ -20,13 +21,16 @@ import killOperationCommand = require("commands/operations/killOperationCommand"
 import collectionsTracker = require("common/helpers/database/collectionsTracker");
 
 import smugglerDatabaseDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/smugglerDatabaseDetails");
+import sqlMigrationDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/sqlMigrationDetails");
 import patchDocumentsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/patchDocumentsDetails");
+import virtualBulkInsertDetails = require("viewmodels/common/notificationCenter/detailViewer/virtualOperations/virtualBulkInsertDetails");
 import bulkInsertDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/bulkInsertDetails");
 import deleteDocumentsDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/deleteDocumentsDetails");
 import generateClientCertificateDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/generateClientCertificateDetails");
 import compactDatabaseDetails = require("viewmodels/common/notificationCenter/detailViewer/operations/compactDatabaseDetails");
 import indexingDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/indexingDetails");
 import slowSqlDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/slowSqlDetails");
+import slowWriteDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/slowWriteDetails");
 import pagingDetails = require("viewmodels/common/notificationCenter/detailViewer/performanceHint/pagingDetails");
 import newVersionAvailableDetails = require("viewmodels/common/notificationCenter/detailViewer/alerts/newVersionAvailableDetails");
 import etlTransformOrLoadErrorDetails = require("viewmodels/common/notificationCenter/detailViewer/alerts/etlTransformOrLoadErrorDetails");
@@ -43,7 +47,12 @@ interface detailsProvider {
 }
 
 interface customOperationMerger {
-    merge(existing: operation, incoming: Raven.Server.NotificationCenter.Notifications.OperationChanged): void;
+    merge(existing: operation, incoming: Raven.Server.NotificationCenter.Notifications.OperationChanged): boolean;
+}
+
+interface customOperationHandler {
+    tryHandle(operationDto: Raven.Server.NotificationCenter.Notifications.OperationChanged, notificationsContainer: KnockoutObservableArray<abstractNotification>,
+              database: database, callbacks: { spinnersCleanup: Function, onChange: Function }): boolean;
 }
 
 class notificationCenter {
@@ -82,6 +91,7 @@ class notificationCenter {
 
     detailsProviders = [] as Array<detailsProvider>;
     customOperationMerger = [] as Array<customOperationMerger>;
+    customOperationHandler = [] as Array<customOperationHandler>;
 
     private hideHandler = (e: Event) => {
         if (this.shouldConsumeHideEvent(e)) {
@@ -95,7 +105,7 @@ class notificationCenter {
         ko.postbox.subscribe(EVENTS.NotificationCenter.RecentError, (error: recentError) => this.onRecentError(error));
         ko.postbox.subscribe(EVENTS.NotificationCenter.OpenNotification, (error: recentError) => this.openDetails(error));
 
-        _.bindAll(this, "dismiss", "postpone", "killOperation", "openDetails");
+        _.bindAll(this, "dismiss", "postpone", "killOperation", "openDetails", "killAttachmentUpload");
     }
 
     private initializeObservables() {
@@ -107,15 +117,20 @@ class notificationCenter {
 
             // operations:
             smugglerDatabaseDetails,
+            sqlMigrationDetails,
             patchDocumentsDetails,
             generateClientCertificateDetails,
             deleteDocumentsDetails,
             bulkInsertDetails,
             compactDatabaseDetails,
+            
+            // virtual operations:
+            virtualBulkInsertDetails,
 
             // performance hints:
             indexingDetails,
             slowSqlDetails,
+            slowWriteDetails,
             pagingDetails,
             requestLatencyDetails,
             
@@ -127,7 +142,10 @@ class notificationCenter {
         );
 
         this.customOperationMerger.push(smugglerDatabaseDetails);
+        this.customOperationMerger.push(sqlMigrationDetails);
         this.customOperationMerger.push(compactDatabaseDetails);
+        
+        this.customOperationHandler.push(bulkInsertDetails);
 
         this.allNotifications = ko.pureComputed(() => {
             const globalNotifications = this.globalNotifications();
@@ -214,6 +232,10 @@ class notificationCenter {
         this.databaseNotifications.removeAll();
     }
 
+    monitorAttachmentUpload(notification: attachmentUpload) {
+        this.databaseNotifications.push(notification);
+    }
+    
     private onRecentError(error: recentError) {
         if (error instanceof recentLicenseLimitError) {
             this.openDetails(error);
@@ -250,6 +272,26 @@ class notificationCenter {
 
     private onOperationChangeReceived(operationDto: Raven.Server.NotificationCenter.Notifications.OperationChanged, notificationsContainer: KnockoutObservableArray<abstractNotification>,
         database: database) {
+        const spinnersCleanup = () => {
+            if (operationDto.State.Status !== "InProgress") {
+                // since kill request doesn't wait for actual kill, let's remove completed items
+                this.spinners.kill.remove(operationDto.Id);
+            }
+        };
+        
+        const invokeOnChange = () => this.getOperationsWatch(database).onOperationChange(operationDto);
+        
+        for (let i = 0; i < this.customOperationHandler.length; i++) {
+            const handler = this.customOperationHandler[i];
+            if (handler.tryHandle(operationDto, notificationsContainer, database, {
+                onChange: invokeOnChange,
+                spinnersCleanup: spinnersCleanup
+            })) {
+                // low-level handler processed this notification  - we assume we are done
+                return;
+            }
+        }
+        
         const existingOperation = notificationsContainer().find(x => x.id === operationDto.Id) as operation;
         if (existingOperation) {
             let foundCustomMerger = false;
@@ -257,12 +299,14 @@ class notificationCenter {
                 const merger = this.customOperationMerger[i];
                 if (merger.merge(existingOperation, operationDto)) {
                     foundCustomMerger = true;
+                    existingOperation.invokeOnUpdateHandlers();
                     break;
                 }
             }
 
             if (!foundCustomMerger) {
                 existingOperation.updateWith(operationDto);
+                existingOperation.invokeOnUpdateHandlers();
             }
         } else {
             const operationChangedObject = new operation(database, operationDto);
@@ -271,16 +315,14 @@ class notificationCenter {
             this.customOperationMerger.forEach(merger => {
                 merger.merge(operationChangedObject, undefined);
             });
+            
+            operationChangedObject.invokeOnUpdateHandlers();
 
             notificationsContainer.push(operationChangedObject);
         }
 
-        if (operationDto.State.Status !== "InProgress") {
-            // since kill request doesn't wait for actual kill, let's remove completed items
-            this.spinners.kill.remove(operationDto.Id);
-        }
-
-        this.getOperationsWatch(database).onOperationChange(operationDto);
+        spinnersCleanup();
+        invokeOnChange();
     }
 
     private onNotificationUpdated(notificationUpdatedDto: Raven.Server.NotificationCenter.Notifications.NotificationUpdated, notificationsContainer: KnockoutObservableArray<abstractNotification>,
@@ -320,10 +362,16 @@ class notificationCenter {
     }
 
     dismiss(notification: abstractNotification) {
+        if (!notification.canBeDismissed()) {
+            return;
+        }
+        
         if (notification instanceof recentError) {
             // local dismiss
             this.globalNotifications.remove(notification);
-
+        } else if (notification instanceof attachmentUpload) {
+            // local dismiss
+            this.databaseNotifications.remove(notification);
         } else { // remote dismiss
             const notificationId = notification.id;
 
@@ -343,6 +391,18 @@ class notificationCenter {
         this.databaseNotifications.remove(notification);
     }
 
+    killAttachmentUpload(upload: attachmentUpload) {
+        return viewHelpers.confirmationMessage("Are you sure?", "Do you want to abort attachment upload?", ["No", "Yes"], true)
+            .done((result: confirmDialogResult) => {
+                if (result.can) {
+                    // no need for spinners here - it is sync call
+                    upload.abortUpload();
+                    
+                    this.databaseNotifications.remove(upload);
+                }
+            });
+    }
+    
     killOperation(operationToKill: operation) {
         return viewHelpers.confirmationMessage("Are you sure?", "Do you want to abort current operation?", ["No", "Yes"], true)
             .done((result: confirmDialogResult) => {

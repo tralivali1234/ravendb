@@ -1,7 +1,6 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Session;
 using Sparrow.Json;
@@ -10,6 +9,8 @@ namespace Raven.Server.Documents.Indexes.Auto
 {
     public abstract class AutoIndexDefinitionBase : IndexDefinitionBase<AutoIndexField>
     {
+        public IndexState State { get; set; }
+
         protected AutoIndexDefinitionBase(string indexName, string collection, AutoIndexField[] fields)
             : base(indexName, new HashSet<string> { collection }, IndexLockMode.Unlock, IndexPriority.Normal, fields)
         {
@@ -47,7 +48,7 @@ namespace Raven.Server.Documents.Indexes.Auto
                 if (field.Spatial == null)
                     writer.WriteNull();
                 else
-                    writer.WriteObject(EntityToBlittable.ConvertEntityToBlittable(field.Spatial, DocumentConventions.Default, context));
+                    writer.WriteObject(EntityToBlittable.ConvertCommandToBlittable(field.Spatial, context));
 
                 writer.WriteEndObject();
 

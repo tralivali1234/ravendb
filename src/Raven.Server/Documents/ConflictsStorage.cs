@@ -5,7 +5,9 @@ using System.Runtime.CompilerServices;
 using System.Threading;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Commands;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Documents;
+using Raven.Server.Documents.Replication;
 using Raven.Server.Documents.Revisions;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
@@ -19,7 +21,6 @@ using Sparrow.Logging;
 using Sparrow.Utils;
 using Voron.Util;
 using static Raven.Server.Documents.DocumentsStorage;
-using ConcurrencyException = Voron.Exceptions.ConcurrencyException;
 
 namespace Raven.Server.Documents
 {
@@ -58,23 +59,25 @@ namespace Raven.Server.Documents
 
         static ConflictsStorage()
         {
-            Slice.From(StorageEnvironment.LabelsContext, "ChangeVector", ByteStringType.Immutable, out ChangeVectorSlice);
-            Slice.From(StorageEnvironment.LabelsContext, "ConflictsId", ByteStringType.Immutable, out ConflictsIdSlice);
-            Slice.From(StorageEnvironment.LabelsContext, "IdAndChangeVector", ByteStringType.Immutable, out IdAndChangeVectorSlice);
-            Slice.From(StorageEnvironment.LabelsContext, "AllConflictedDocsEtags", ByteStringType.Immutable, out AllConflictedDocsEtagsSlice);
-            Slice.From(StorageEnvironment.LabelsContext, "ConflictedCollection", ByteStringType.Immutable, out ConflictedCollectionSlice);
-            Slice.From(StorageEnvironment.LabelsContext, "Conflicts", ByteStringType.Immutable, out ConflictsSlice);
-
+            using (StorageEnvironment.GetStaticContext(out var ctx))
+            {
+                Slice.From(ctx, "ChangeVector", ByteStringType.Immutable, out ChangeVectorSlice);
+                Slice.From(ctx, "ConflictsId", ByteStringType.Immutable, out ConflictsIdSlice);
+                Slice.From(ctx, "IdAndChangeVector", ByteStringType.Immutable, out IdAndChangeVectorSlice);
+                Slice.From(ctx, "AllConflictedDocsEtags", ByteStringType.Immutable, out AllConflictedDocsEtagsSlice);
+                Slice.From(ctx, "ConflictedCollection", ByteStringType.Immutable, out ConflictedCollectionSlice);
+                Slice.From(ctx, "Conflicts", ByteStringType.Immutable, out ConflictsSlice);
+            }
             /*
              The structure of conflicts table starts with the following fields:
              [ Conflicted Doc Id | Separator | Change Vector | ... the rest of fields ... ]
              PK of the conflicts table will be 'Change Vector' field, because when dealing with conflicts,
               the change vectors will always be different, hence the uniqueness of the ID. (inserts/updates will not overwrite)
 
-            Additional indice is set to have composite ID of 'Conflicted Doc Id' and 'Change Vector' so we will be able to iterate
+            Additional index is set to have composite ID of 'Conflicted Doc Id' and 'Change Vector' so we will be able to iterate
             on conflicts by conflicted doc id (using 'starts with')
 
-            We need a separator in order to delete all conflicts all "users/1" without deleting "users/11" conflics.
+            We need a separator in order to delete all conflicts all "users/1" without deleting "users/11" conflicts.
              */
 
             ConflictsSchema.DefineKey(new TableSchema.SchemaIndexDef
@@ -336,7 +339,7 @@ namespace Raven.Server.Documents
                     }
                     else if(conflicted.Flags.Contain(DocumentFlags.FromReplication) == false)
                     {
-                        using (Slice.External(context.Allocator, conflicted.LowerId, out Slice key))
+                        using (Slice.External(context.Allocator, conflicted.LowerId, out var key))
                         {
                             var lastModifiedTicks = _documentDatabase.Time.GetUtcNow().Ticks;
                             _documentsStorage.RevisionsStorage.DeleteRevision(context, key, conflicted.Collection, conflicted.ChangeVector, lastModifiedTicks);
@@ -760,7 +763,7 @@ namespace Raven.Server.Documents
 
             if (HasHigherChangeVector(context, lowerId, expectedChangeVector))
             {
-                throw new ConcurrencyException($"Failed to resolve document conflict with change vector = {expectedChangeVector}, beacuse we have a newer change vector.");
+                throw new ConcurrencyException($"Failed to resolve document conflict with change vector = {expectedChangeVector}, because we have a newer change vector.");
             }
         }
 
@@ -815,37 +818,46 @@ namespace Raven.Server.Documents
             return indexOfLargestEtag;
         }
 
-        public static ConflictStatus GetConflictStatusForDocument(DocumentsOperationContext context, string id, LazyStringValue remote, out string conflictingVector)
+        public static ConflictStatus GetConflictStatusForDocument(DocumentsOperationContext context, IncomingReplicationHandler.ReplicationItem remote, out string conflictingVector, out bool hasLocalClusterTx)
         {
-            //tombstones also can be a conflict entry
+            hasLocalClusterTx = false;
             conflictingVector = null;
-            var conflicts = context.DocumentDatabase.DocumentsStorage.ConflictsStorage.GetConflictsFor(context, id);
+
+            //tombstones also can be a conflict entry
+            var conflicts = context.DocumentDatabase.DocumentsStorage.ConflictsStorage.GetConflictsFor(context, remote.Id);
+            ConflictStatus status;
             if (conflicts.Count > 0)
             {
                 foreach (var existingConflict in conflicts)
                 {
-                    if (ChangeVectorUtils.GetConflictStatus(remote, existingConflict.ChangeVector) == ConflictStatus.Conflict)
+                    status = ChangeVectorUtils.GetConflictStatus(remote.ChangeVector, existingConflict.ChangeVector);
+                    if (status == ConflictStatus.Conflict)
                     {
                         conflictingVector = existingConflict.ChangeVector;
-                        return ConflictStatus.Conflict;
+                        return status;
                     }
                 }
                 // this document will resolve the conflicts when putted
                 return ConflictStatus.Update;
             }
 
-            var result = context.DocumentDatabase.DocumentsStorage.GetDocumentOrTombstone(context, id);
+            var result = context.DocumentDatabase.DocumentsStorage.GetDocumentOrTombstone(context, remote.Id);
             string local;
 
             if (result.Document != null)
+            {
                 local = result.Document.ChangeVector;
+                hasLocalClusterTx = result.Document.Flags.Contain(DocumentFlags.FromClusterTransaction);
+            }
             else if (result.Tombstone != null)
+            {
                 local = result.Tombstone.ChangeVector;
+                hasLocalClusterTx = result.Tombstone.Flags.Contain(DocumentFlags.FromClusterTransaction);
+            }
             else
                 return ConflictStatus.Update; //document with 'id' doesn't exist locally, so just do PUT
-
-
-            var status = ChangeVectorUtils.GetConflictStatus(remote, local);
+           
+            status = ChangeVectorUtils.GetConflictStatus(remote.ChangeVector, local);
             if (status == ConflictStatus.Conflict)
             {
                 conflictingVector = local;

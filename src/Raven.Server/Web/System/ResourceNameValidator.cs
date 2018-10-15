@@ -3,6 +3,7 @@ using System.IO;
 using System.Linq;
 using System.Runtime.InteropServices;
 using Raven.Client;
+using Raven.Server.Utils;
 
 namespace Raven.Server.Web.System
 {
@@ -48,6 +49,11 @@ namespace Raven.Server.Web.System
                 errorMessage = "An empty name is forbidden for use!";
                 return false;
             }
+            if (NameUtils.IsValidResourceName(name) == false)
+            {
+                errorMessage = $"The name '{name}' is not permitted. Only letters, digits and characters ('_', '.', '-') are allowed.";
+                return false;
+            }
             if (name.Length > Constants.Documents.MaxDatabaseNameLength)
             {
                 errorMessage = $"The name '{name}' exceeds '{Constants.Documents.MaxDatabaseNameLength}' characters!";
@@ -60,9 +66,11 @@ namespace Raven.Server.Web.System
             }
             if (WindowsReservedFileNames.Any(x => string.Equals(x, name, StringComparison.OrdinalIgnoreCase)))
             {
-                errorMessage = string.Format($"The name '{name}' is forbidden for use!");
+                errorMessage = $"The name '{name}' is forbidden for use!";
                 return false;
             }
+
+            dataDirectory = dataDirectory ?? string.Empty;
             if (Path.Combine(dataDirectory, name).Length > WindowsMaxPath)
             {
                 int maxfileNameLength = WindowsMaxPath - dataDirectory.Length;

@@ -9,6 +9,7 @@ using Raven.Server.Documents.Indexes.MapReduce;
 using Raven.Server.Documents.Indexes.MapReduce.Auto;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
 using Raven.Server.Documents.Indexes.Static;
+using Raven.Server.Documents.Indexes.Static.Roslyn.Rewriters;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.Results;
 using Raven.Server.ServerWide;
@@ -324,18 +325,30 @@ namespace Raven.Server.Documents.Indexes.Debugging
 
         private static string GetTreeName(BlittableJsonReaderObject reduceEntry, IndexDefinitionBase indexDefinition, JsonOperationContext context)
         {
-            HashSet<string> groupByFields;
+            HashSet<CompiledIndexField> groupByFields;
 
             if (indexDefinition is MapReduceIndexDefinition)
                 groupByFields = ((MapReduceIndexDefinition)indexDefinition).GroupByFields;
             else if (indexDefinition is AutoMapReduceIndexDefinition)
-                groupByFields = ((AutoMapReduceIndexDefinition)indexDefinition).GroupByFields.Keys.ToHashSet();
+                groupByFields = ((AutoMapReduceIndexDefinition)indexDefinition).GroupByFields.Keys
+                    .Select(x => (CompiledIndexField)new SimpleField(x))
+                    .ToHashSet();
             else
                 throw new InvalidOperationException("Invalid map reduce index definition: " + indexDefinition.GetType());
 
             foreach (var prop in reduceEntry.GetPropertyNames())
             {
-                if (groupByFields.Contains(prop))
+                var skip = false;
+                foreach (var groupByField in groupByFields)
+                {
+                    if (groupByField.IsMatch(prop))
+                    {
+                        skip = true;
+                        break;
+                    }
+                }
+
+                if (skip)
                     continue;
 
                 if (reduceEntry.Modifications == null)
@@ -411,15 +424,15 @@ namespace Raven.Server.Documents.Indexes.Debugging
 
                 var fieldsToFetch = new FieldsToFetch(query, index.Definition);
 
-                var retriever = new MapReduceQueryResultRetriever(null, null, null, context, fieldsToFetch, null);
+                var retriever = new MapReduceQueryResultRetriever(null, null, null, null, context, fieldsToFetch, null);
                 var result = reader
-                     .Query(query, fieldsToFetch, new Reference<int>(), new Reference<int>(), retriever, ctx, null, CancellationToken.None)
+                     .Query(query, null, fieldsToFetch, new Reference<int>(), new Reference<int>(), retriever, ctx, null, CancellationToken.None)
                     .ToList();
 
                 if (result.Count != 1)
                     throw new InvalidOperationException("Cannot have multiple reduce results for a single reduce key");
 
-                return result[0].Data;
+                return result[0].Result.Data;
             }
         }
 
@@ -437,6 +450,8 @@ namespace Raven.Server.Documents.Indexes.Debugging
                     return ((AutoMapIndex)self).Definition.IndexFields.Keys.ToArray();
                 case IndexType.AutoMapReduce:
                     return ((AutoMapReduceIndex)self).Definition.IndexFields.Keys.ToArray();
+                case IndexType.Faulty:
+                    throw new InvalidOperationException($"Index '{self.Name}' is Faulty. Can't return index entries for a faulty index.");
                 default:
                     throw new ArgumentException("Unknown index type: " + self.Type);
             }

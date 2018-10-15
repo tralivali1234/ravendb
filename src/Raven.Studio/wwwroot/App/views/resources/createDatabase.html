@@ -1,5 +1,5 @@
 <div class="modal-dialog modal-lg" role="document" id="newDatabase">
-    <form data-bind="submit: createDatabase" autocomplete="off">
+    <form data-bind="submit: createDatabase" autocomplete="off" novalidate>
         <div class="modal-content">
             <div class="modal-header">
                 <button type="button" data-bind="click: close" class="close" data-dismiss="modal" aria-label="Close"><i aria-hidden="true" class="icon-cancel"></i></button>
@@ -15,7 +15,7 @@
                 <div class="modal-settings-panel">
                     <div class="modal-settings-panel-main">
                         <div class="form-group" data-bind="validationElement: databaseModel.name">
-                            <h3>NAME</h3>
+                            <h3>NAME<i class="required"></i></h3>
                             <input type="text" id="resourceName" data-bind="textInput: databaseModel.name" autofocus class="form-control" placeholder="Enter database name">
                         </div>
                         <div class="settings-group" data-bind="foreach: getAvailableSections()">
@@ -28,11 +28,11 @@
                                 </button>
                             </div>
                             <div class="toggle settings-item" data-bind="css: { 'active': $root.currentAdvancedSection() === id }, visible: !alwaysEnabled">
-                                <input class="styled" type="checkbox" data-bind="checked: enabled, attr: { id: 'section_' + $index() }">
+                                <input class="styled" type="checkbox" data-bind="checked: enabled, attr: { id: 'section_' + $index() }, disable: disableToggle">
                                 <label data-bind="text: name, attr: { 'for': 'section_' + $index() }">
                                 </label>
                                 <button type="button" class="btn pull-right btn-toggle"
-                                        data-bind="click: _.partial($root.showAdvancedConfigurationFor, id), css: { 'btn-danger': enabled() && validationGroup && !validationGroup.isValid() }">
+                                        data-bind="click: _.partial($root.showAdvancedConfigurationFor, id), css: { 'btn-danger': enabled() && validationGroup && !validationGroup.isValid() }, disable: disableToggle() && !enabled()">
                                     <i data-bind="attr: { 'class' : enabled() && validationGroup && !validationGroup.isValid() ? 'icon-danger' : 'icon-settings' }"></i>
                                 </button>
                             </div>
@@ -74,7 +74,7 @@
 
 <script type="text/html" id="create-db-legacy-migration">
     <div data-bind="with: databaseModel.legacyMigration">
-        <h3>Data source configuration</h3>
+        <h3>Data Source Configuration</h3>
 
         <div class="bg-info margin-bottom">
             <div class="padding">
@@ -227,7 +227,7 @@
 
 <script type="text/html" id="create-db-restore">
     <div data-bind="with: databaseModel.restore">
-        <h3>Backup source configuration</h3>
+        <h3>Backup Source Configuration</h3>
         <div class="form-group row" data-bind="validationElement: backupDirectory">
             <div class="col-md-4">
                 <label class="control-label">Backup directory</label>
@@ -238,52 +238,116 @@
                        class="form-control" placeholder="Enter backup directory path" />
             </div>
         </div>
-        
+
+        <div class="toggle">
+            <input class="styled" type="checkbox" id="disable-ongoing-tasks" data-bind="checked: disableOngoingTasks">
+            <label for="disable-ongoing-tasks">Disable ongoing tasks after restore</label>
+        </div>
+
+        <div class="toggle">
+            <input class="styled" type="checkbox" id="skip-indexes-import" data-bind="checked: skipIndexes">
+            <label for="skip-indexes-import">Skip indexes</label>
+        </div>
+
         <div class="form-group row" data-bind="validationOptions: { insertMessages: false }, validationElement: selectedRestorePoint">
             <div class="col-md-4">
                 <label class="control-label">Restore point</label>
             </div>
-            <div class="col-md-8">
+            <div class="col-md-12">
                 <div>
                     <div class="dropdown btn-block">
                         <button class="btn btn-block dropdown-toggle text-left" type="button" data-toggle="dropdown"
                                 data-bind="disable: restorePoints().length === 0 || $parent.databaseModel.spinners.fetchingRestorePoints(), attr: { title: restorePoints().length == 0 ? 'No restore points in selected directory' : '' }">
-                            <span data-bind="text: restorePoints().length === 0 ? 'Select backup directory' : ( selectedRestorePoint() || 'Select restore point...' ), textInput: selectedRestorePoint"></span>
+                            <span data-bind="text: restorePoints().length === 0 ? 'Select backup directory' : ( selectedRestorePointText() || 'Select restore point... (' + restorePointsCount().toLocaleString() + ' options)' ), textInput: selectedRestorePoint"></span>
                             <span class="caret"></span>
                         </button>
-                        <ul class="dropdown-menu max-height" data-bind="foreach: restorePoints">
-                            <li><a href="#" data-bind="text: $data.Key, click: _.partial($root.databaseModel.useRestorePoint, $data), attr: { 'title': 'File name: ' + $data.Details.FileName }"></a></li>
-                        </ul>
+                        <div class="dropdown-menu has-info">
+                            <ul class="menu max-height" role="menu" data-bind="foreach: restorePoints">
+                                <!-- ko if: $index() !== 0 -->
+                                <li class="divider"></li>
+                                <!-- /ko -->
+                                <li class="dropdown-header" data-bind="attr: { title: $data.databaseNameTitle }">
+                                    <span class="text-success" data-bind="text: $data.databaseName"></span>
+                                </li>
+
+                                <!-- ko foreach: $data.restorePoints -->
+                                <li>
+                                    <a href="#" data-bind="click: _.partial($root.databaseModel.useRestorePoint, $data)" title="">
+                                        <div class="row">
+                                            <strong class="col-xs-5" data-bind="text: dateTime"></strong>
+                                            <small class="col-xs-3" data-bind="text: backupType"></small>
+                                            <small class="col-xs-2 text-center" data-bind="text: nodeTag"></small>
+                                            <small class="col-xs-2 text-center" data-bind="text: filesToRestore.toLocaleString()"></small>
+                                        </div>
+                                    </a>
+                                </li>
+                                <!-- /ko -->
+                            </ul>
+
+                            <div class="divider"></div>
+                            <div class="dropdown-header header bg-info" title="">
+                                <div class="row">
+                                    <span class="col-xs-5">Date</span>
+                                    <span class="col-xs-3">Backup Type</span>
+                                    <span class="col-xs-2">Node Tag</span>
+                                    <span class="col-xs-2">Files to Restore</span>
+                                </div>
+                            </div>
+                        </div>
+
                     </div>
                     <span class="help-block" data-bind="validationMessage: selectedRestorePoint"></span>
                 </div>
             </div>
         </div>
+
+        <div data-bind="with: selectedRestorePoint">
+            <div class="panel panel-info padding flex-horizontal" data-bind="visible: isSnapshotRestore && isEncrypted">
+                <i class="icon-info"></i>
+                <div class="margin-left">Selected restore point is encrypted. Please provide encryption key in 'Encryption' tab.</div>
+            </div>
+
+            <div class="panel panel-info padding flex-horizontal" data-bind="visible: isSnapshotRestore && !isEncrypted">
+                <i class="icon-info"></i>
+                <div class="margin-left">Selected restore point is not encrypted. 'Encyption' tab was disabled.</div>
+            </div>
+        </div>
+
     </div>
 </script>
 
 <script type="text/html" id="create-db-path">
     <div data-bind="with: databaseModel.path">
-        <h3>Path configuration</h3>
+        <h3>Path Configuration</h3>
         <div class="form-group row" data-bind="validationElement: dataPath">
             <div class="col-md-4">
                 <label class="control-label">Path</label>
             </div>
             <div class="col-md-8">
-                <input type="text" class="form-control" data-bind="textInput: dataPath, attr: { placeholder: $root.databaseModel.name() }" />
+                <input type="text" class="form-control"
+                       data-bind="textInput: dataPath, attr: { placeholder: $root.databaseModel.name() || 'Enter database path (optional)' }"
+                       title="Enter location for the database files."/>
+            </div>
+        </div>
+        <div class="form-group row">
+            <div class="col-sm-12">
+                <p class="text-info bg-info padding padding-sm">
+                    The data files will be created in:<br/>
+                    <strong><small data-bind="text: $root.databaseLocationShowing"></small></strong>
+                </p>
             </div>
         </div>
     </div>
 </script>
 
 <script type="text/html" id="create-db-replication">
-    <h3>Replication configuration</h3>
+    <h3>Replication Configuration</h3>
     <div data-bind="with: databaseModel.replication">
         <div class="form-group" style="min-height: 62px">
             <div class="input-group" title="Set the number of nodes that will contain the database" 
                  data-bind="css: { 'has-warning': (!$root.databaseModel.isFromBackupOrFromOfflineMigration && $root.showReplicationFactorWarning()) }, validationElement: replicationFactor">
                 <span class="input-group-addon">Replication factor</span>
-                <input class="form-control" type="number" min="0" title="Set the number of nodes that will contain the database" 
+                <input class="form-control" type="number" min="1" title="Set the number of nodes that will contain the database" 
                        data-bind="numericInput: replicationFactor, disable: $root.databaseModel.isFromBackupOrFromOfflineMigration || $root.disableReplicationFactorInput">
                 <div class="help-block" data-bind="visible: !$root.databaseModel.isFromBackupOrFromOfflineMigration && $root.showReplicationFactorWarning">
                     With the replication factor set to 1, the data won't be replicated!
@@ -302,7 +366,7 @@
             </div>
             <small class="toggle-caption">Maintain replication factor upon node failure.</small>
             <div class="help-block" data-bind="visible: $root.showDynamicDatabaseDistributionWarning">
-                Your current license doesn't include the dynamic nodes distribution feature.
+                Your current license doesn't include the dynamic database distribution feature.
             </div>
         </div>
 
@@ -335,7 +399,7 @@
 </script>
 
 <script type="text/html" id="create-db-encryption">
-    <h3>Encryption configuration</h3>
+    <h3>Encryption Configuration</h3>
         <div data-bind="with: encryptionSection">
             <div data-bind="compose: 'resources/setupEncryptionKey.html'"></div>
         </div>

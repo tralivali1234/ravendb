@@ -11,6 +11,7 @@ using System.Linq.Expressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Conventions;
+using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Operations.Indexes;
 using Raven.Client.Util;
 
@@ -58,6 +59,17 @@ namespace Raven.Client.Documents.Indexes
         public IndexPriority? Priority { get; set; }
 
         public IndexLockMode? LockMode { get; set; }
+
+        /// <summary>
+        /// Provide a way to dynamically index values with runtime known values
+        /// </summary>
+        protected object CreateField(
+            string name,
+            object value,
+            CreateFieldOptions options)
+        {
+            throw new NotSupportedException("This can only be run on the server side");
+        }
 
         /// <summary>
         /// Provide a way to dynamically index values with runtime known values
@@ -288,6 +300,22 @@ namespace Raven.Client.Documents.Indexes
         }
 
         /// <summary>
+        /// Allow to get attachments of the document (without binary data)
+        /// </summary>
+        protected IEnumerable<AttachmentName> AttachmentsFor(object doc)
+        {
+            throw new NotSupportedException("This is here as a marker only");
+        }
+
+        /// <summary>
+        /// Allow to get counter names of the document
+        /// </summary>
+        protected IEnumerable<string> CounterNamesFor(object doc)
+        {
+            throw new NotSupportedException("This is here as a marker only");
+        }
+
+        /// <summary>
         /// Allow to access an entity as a document
         /// </summary>
         protected JsonObject AsJson(object doc)
@@ -296,7 +324,7 @@ namespace Raven.Client.Documents.Indexes
         }
 
         /// <summary>
-        /// Add additional sources to be copiled with the index on the server.
+        /// Add additional sources to be compiled with the index on the server.
         /// </summary>
         public Dictionary<string, string> AdditionalSources { get; set; }
     }

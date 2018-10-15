@@ -1,7 +1,6 @@
 ﻿
 @resource-usage-primary-color: @brand-primary-light;
 @resource-usage-secondary-color: @brand-primary-dark;
-@resource-usage-tertiary-color: @dashboard-requests-color;
 @dashboard-requests-color: #27c5da;
 @dashboard-writes-color: #7051ad;
 @dashboard-written-color: #d08f27;
@@ -11,6 +10,18 @@
 @dashboard-reduce-color: #d83731;
 
 #dashboard-container {
+
+    .disabled {
+        a {
+            cursor: not-allowed;
+            opacity: 0.5;
+        }
+    }
+
+    .tooltip-inner {
+        max-width: 255px;
+        white-space: nowrap;
+    }
 
     .tooltip {
         padding: 10px;
@@ -38,6 +49,7 @@
         background-position: bottom right;
         background-size: auto 100%;
         position: relative;
+        overflow: hidden;
 
         svg {
             position: absolute;
@@ -89,16 +101,6 @@
         .fill {
             fill-opacity: 0.3;
             stroke: none;
-        }
-
-        .physical {
-            .line {
-                stroke: @resource-usage-tertiary-color;
-            }
-
-            .fill {
-                fill: @resource-usage-tertiary-color;
-            }
         }
 
         .machine {
@@ -243,10 +245,21 @@
     }
 
     #storageChart {
-        circle.border {
-            stroke: solid 1px #39434f;
-            fill: none;
+        .arc {
+            path {
+                transition: fill .2s cubic-bezier(0.5, 0, 1, 0.5), stroke .1s ease;
+
+                &:hover, &.active {
+                    fill: @gray-lighter;
+                    stroke-width: .5px;
+                    stroke: #FFF;
+                }
+            }
         }
+    }
+
+    .virtual-grid {
+        padding: 0;
     }
 
     .panel-title {
@@ -309,6 +322,10 @@
             flex-direction: column;
             padding: @grid-gutter-width/4;
 
+            &.dashboard-node {
+                flex-grow: 0;
+            }
+
             .panel {
                 flex-grow: 1;
                 display: flex;
@@ -361,6 +378,7 @@
         line-height: 20px;
         text-align: center;
         min-width: 160px;
+        position: relative;
     }
 
     .infogrid-graph {
@@ -372,10 +390,6 @@
 
     .machine-usage {
         color: @resource-usage-secondary-color;
-    }
-
-    .physical-memory {
-        color: @resource-usage-tertiary-color;
     }
 }
 

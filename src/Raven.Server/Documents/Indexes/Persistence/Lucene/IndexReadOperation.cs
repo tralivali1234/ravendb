@@ -6,20 +6,25 @@ using System.Text;
 using System.Threading;
 using Lucene.Net.Index;
 using Lucene.Net.Search;
+using Lucene.Net.Search.Vectorhighlight;
 using Lucene.Net.Store;
 using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Indexes.Spatial;
+using Raven.Client.Documents.Queries.Explanation;
 using Raven.Client.Documents.Queries.MoreLikeThis;
 using Raven.Client.Exceptions;
 using Raven.Server.Documents.Indexes.Persistence.Lucene.Analyzers;
 using Raven.Server.Documents.Indexes.Persistence.Lucene.Collectors;
+using Raven.Server.Documents.Indexes.Persistence.Lucene.Highlightings;
 using Raven.Server.Documents.Indexes.Static.Spatial;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.AST;
+using Raven.Server.Documents.Queries.Explanation;
 using Raven.Server.Documents.Queries.MoreLikeThis;
 using Raven.Server.Documents.Queries.Results;
 using Raven.Server.Documents.Queries.Sorting.AlphaNumeric;
+using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.Exceptions;
 using Raven.Server.Indexing;
 using Raven.Server.Json;
@@ -47,6 +52,9 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
 
         private readonly IState _state;
 
+        private FastVectorHighlighter _highlighter;
+        private FieldQuery _highlighterQuery;
+
         public IndexReadOperation(Index index, LuceneVoronDirectory directory, IndexSearcherHolder searcherHolder, QueryBuilderFactories queryBuilderFactories, Transaction readTransaction)
             : base(index, LoggingSource.Instance.GetLogger<IndexReadOperation>(index._indexStorage.DocumentDatabase.Name))
         {
@@ -73,8 +81,10 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
         }
 
 
-        public IEnumerable<Document> Query(IndexQueryServerSide query, FieldsToFetch fieldsToFetch, Reference<int> totalResults, Reference<int> skippedResults, IQueryResultRetriever retriever, DocumentsOperationContext documentsContext, Func<string, SpatialField> getSpatialField, CancellationToken token)
+        public IEnumerable<(Document Result, Dictionary<string, Dictionary<string, string[]>> Highlightings, ExplanationResult Explanation)> Query(IndexQueryServerSide query, QueryTimingsScope queryTimings, FieldsToFetch fieldsToFetch, Reference<int> totalResults, Reference<int> skippedResults, IQueryResultRetriever retriever, DocumentsOperationContext documentsContext, Func<string, SpatialField> getSpatialField, CancellationToken token)
         {
+            ExplanationOptions explanationOptions = null;
+
             var pageSize = query.PageSize;
             var isDistinctCount = pageSize == 0 && query.Metadata.IsDistinct;
             if (isDistinctCount)
@@ -85,17 +95,49 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             var docsToGet = pageSize;
             var position = query.Start;
 
-            var luceneQuery = GetLuceneQuery(documentsContext, query.Metadata, query.QueryParameters, _analyzer, _queryBuilderFactories);
-            var sort = GetSort(query, getSpatialField);
+            if (query.Metadata.IsOptimizedSortOnly && _index.Definition.HasDynamicFields == false)
+            {
+                foreach (var result in QuerySortOnly(query, retriever, position, pageSize, totalResults, token))
+                    yield return result;
+
+                yield break;
+            }
+
+            QueryTimingsScope luceneScope = null;
+            QueryTimingsScope highlightingScope = null;
+            QueryTimingsScope explanationsScope = null;
+
+            if (queryTimings != null)
+            {
+                luceneScope = queryTimings.For(nameof(QueryTimingsScope.Names.Lucene), start: false);
+                highlightingScope = query.Metadata.HasHighlightings
+                    ? queryTimings.For(nameof(QueryTimingsScope.Names.Highlightings), start: false)
+                    : null;
+                explanationsScope = query.Metadata.HasExplanations
+                    ? queryTimings.For(nameof(QueryTimingsScope.Names.Explanations), start: false)
+                    : null;
+            }
+
             var returnedResults = 0;
+
+            var luceneQuery = GetLuceneQuery(documentsContext, query.Metadata, query.QueryParameters, _analyzer, _queryBuilderFactories);
+            var sort = GetSort(query, _index, getSpatialField, documentsContext);
 
             using (var scope = new IndexQueryingScope(_indexType, query, fieldsToFetch, _searcher, retriever, _state))
             {
+                if (query.Metadata.HasHighlightings)
+                {
+                    using (highlightingScope?.For(nameof(QueryTimingsScope.Names.Setup)))
+                        SetupHighlighter(query, luceneQuery, documentsContext);
+                }
+
                 while (true)
                 {
                     token.ThrowIfCancellationRequested();
 
-                    var search = ExecuteQuery(luceneQuery, query.Start, docsToGet, sort);
+                    TopDocs search;
+                    using (luceneScope?.Start())
+                        search = ExecuteQuery(luceneQuery, query.Start, docsToGet, sort);
 
                     totalResults.Value = search.TotalHits;
 
@@ -106,7 +148,10 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                         token.ThrowIfCancellationRequested();
 
                         var scoreDoc = search.ScoreDocs[position];
-                        var document = _searcher.Doc(scoreDoc.Doc, _state);
+
+                        global::Lucene.Net.Documents.Document document;
+                        using (luceneScope?.Start())
+                            document = _searcher.Doc(scoreDoc.Doc, _state);
 
                         if (retriever.TryGetKey(document, _state, out string key) && scope.WillProbablyIncludeInResults(key) == false)
                         {
@@ -124,7 +169,28 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                         returnedResults++;
 
                         if (isDistinctCount == false)
-                            yield return result;
+                        {
+                            Dictionary<string, Dictionary<string, string[]>> highlightings = null;
+                            if (query.Metadata.HasHighlightings)
+                            {
+                                using (highlightingScope?.Start())
+                                    highlightings = GetHighlighterResults(query, _searcher, scoreDoc, result, document, documentsContext);
+                            }
+
+                            ExplanationResult explanation = null;
+                            if (query.Metadata.HasExplanations)
+                            {
+                                using (explanationsScope?.Start())
+                                {
+                                    if (explanationOptions == null)
+                                        explanationOptions = query.Metadata.Explanation.GetOptions(documentsContext, query.QueryParameters);
+
+                                    explanation = GetQueryExplanations(explanationOptions, luceneQuery, _searcher, scoreDoc, result, document);
+                                }
+                            }
+
+                            yield return (result, highlightings, explanation);
+                        }
 
                         if (returnedResults == pageSize)
                             yield break;
@@ -146,7 +212,193 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             }
         }
 
-        public IEnumerable<Document> IntersectQuery(IndexQueryServerSide query, FieldsToFetch fieldsToFetch, Reference<int> totalResults, Reference<int> skippedResults, IQueryResultRetriever retriever, DocumentsOperationContext documentsContext, Func<string, SpatialField> getSpatialField, CancellationToken token)
+        private IEnumerable<(Document Result, Dictionary<string, Dictionary<string, string[]>> Highlightings, ExplanationResult Explanation)> QuerySortOnly(
+            IndexQueryServerSide query, IQueryResultRetriever retriever, int start, int pageSize, Reference<int> totalResults, CancellationToken token)
+        {
+        
+            totalResults.Value = _searcher.IndexReader.NumDocs();
+            var subReaders = _searcher.IndexReader.GetSequentialSubReaders();
+
+            var returnedResults = 0;
+
+            var order = query.Metadata.OrderBy[0];
+            var isAscending = order.Ascending;
+            var fieldName = order.Name;
+
+            var indexes = new(Reference<int> Index, HashSet<int> Seen, StringIndex Item, IndexReader IndexReader)[subReaders.Length];
+            for (var i = 0; i < subReaders.Length; i++)
+            {
+                var subReader = subReaders[i];
+                var index = FieldCache_Fields.DEFAULT.GetStringIndex(subReader, fieldName, _state);
+                indexes[i] = (new Reference<int>(), new HashSet<int>(), index, subReader);
+            }
+
+            while (true)
+            {
+                token.ThrowIfCancellationRequested();
+
+                var idx = -1;
+                var doc = -1;
+                string docTerm = null;
+
+                for (var i = 0; i < indexes.Length; i++)
+                {
+                    var tpl = indexes[i];
+
+                    var innerDoc = FindDocument(isAscending, i);
+
+                    if (innerDoc == -1)
+                        continue;
+
+                    var termIndex = tpl.Item.order[innerDoc];
+                    var term = tpl.Item.lookup[termIndex];
+
+                    if (idx == -1)
+                    {
+                        idx = i;
+                        docTerm = term;
+                        doc = innerDoc;
+                        continue;
+                    }
+
+                    var compare = string.Compare(docTerm, term, StringComparison.Ordinal);
+                    if (isAscending && compare > 0 || isAscending == false && compare < 0)
+                    {
+                        indexes[idx].Seen.Remove(doc);
+                        idx = i;
+                        docTerm = term;
+                        doc = innerDoc;
+                    }
+                    else
+                    {
+                        indexes[i].Seen.Remove(innerDoc);
+                    }
+                }
+
+                if (idx == -1)
+                    yield break;
+
+                indexes[idx].Index.Value++;
+
+                if (start-- > 0)
+                    continue;
+
+                var document = indexes[idx].IndexReader.Document(doc, _state);
+                var result = retriever.Get(document, 1.0f, _state);
+
+                returnedResults++;
+
+                yield return (result, null, null);
+
+                if (returnedResults == pageSize)
+                    yield break;
+            }
+
+            int FindDocument(bool isAsc, int i)
+            {
+                var innerDoc = -1;
+                var tpl = indexes[i];
+                var index = tpl.Index.Value;
+                while (index < tpl.Item.reverseOrder.Length)
+                {
+                    if (isAsc == false)
+                        index = tpl.Item.reverseOrder.Length - index - 1;
+
+                    innerDoc = tpl.Item.reverseOrder[index];
+
+                    if (innerDoc == -1 || 
+                        (tpl.IndexReader.HasDeletions && tpl.IndexReader.IsDeleted(innerDoc))
+                        || tpl.Seen.Add(innerDoc) == false)
+                    {
+                        innerDoc = -1;
+                        index = ++tpl.Index.Value;
+                        continue;
+                    }
+
+                    break;
+                }
+
+                return innerDoc;
+            }
+
+        }
+
+        private ExplanationResult GetQueryExplanations(ExplanationOptions options, Query luceneQuery, IndexSearcher searcher, ScoreDoc scoreDoc, Document document, global::Lucene.Net.Documents.Document luceneDocument)
+        {
+            string key;
+            if (options != null && string.IsNullOrWhiteSpace(options.GroupKey) == false)
+                key = luceneDocument.Get(options.GroupKey, _state);
+            else
+                key = document.Id;
+
+            return new ExplanationResult
+            {
+                Key = key,
+                Explanation = searcher.Explain(luceneQuery, scoreDoc.Doc, _state)
+            };
+        }
+
+        private Dictionary<string, Dictionary<string, string[]>> GetHighlighterResults(IndexQueryServerSide query, IndexSearcher searcher, ScoreDoc scoreDoc, Document document, global::Lucene.Net.Documents.Document luceneDocument, JsonOperationContext context)
+        {
+            Debug.Assert(_highlighter != null);
+            Debug.Assert(_highlighterQuery != null);
+
+            var results = new Dictionary<string, Dictionary<string, string[]>>();
+            foreach (var highlighting in query.Metadata.Highlightings)
+            {
+                var fieldName = highlighting.Field.Value;
+                var indexFieldName = query.Metadata.IsDynamic
+                    ? AutoIndexField.GetSearchAutoIndexFieldName(fieldName)
+                    : fieldName;
+
+                var fragments = _highlighter.GetBestFragments(
+                    _highlighterQuery,
+                    searcher.IndexReader,
+                    scoreDoc.Doc,
+                    indexFieldName,
+                    highlighting.FragmentLength,
+                    highlighting.FragmentCount,
+                    _state);
+
+                if (fragments == null || fragments.Length == 0)
+                    continue;
+
+                var options = highlighting.GetOptions(context, query.QueryParameters);
+
+                string key;
+                if (options != null && string.IsNullOrWhiteSpace(options.GroupKey) == false)
+                    key = luceneDocument.Get(options.GroupKey, _state);
+                else
+                    key = document.Id;
+
+                if (results.TryGetValue(fieldName, out var result) == false)
+                    results[fieldName] = result = new Dictionary<string, string[]>();
+
+                if (result.TryGetValue(key, out var innerResult))
+                {
+                    Array.Resize(ref innerResult, innerResult.Length + fragments.Length);
+                    Array.Copy(fragments, 0, innerResult, innerResult.Length, fragments.Length);
+                }
+                else
+                    result[key] = fragments;
+            }
+
+            return results;
+        }
+
+        private void SetupHighlighter(IndexQueryServerSide query, Query luceneQuery, JsonOperationContext context)
+        {
+            var fragmentsBuilder = new PerFieldFragmentsBuilder(query, context);
+            _highlighter = new FastVectorHighlighter(
+                FastVectorHighlighter.DEFAULT_PHRASE_HIGHLIGHT,
+                FastVectorHighlighter.DEFAULT_FIELD_MATCH,
+                new SimpleFragListBuilder(),
+                fragmentsBuilder);
+
+            _highlighterQuery = _highlighter.GetFieldQuery(luceneQuery);
+        }
+
+        public IEnumerable<(Document Result, Dictionary<string, Dictionary<string, string[]>> Highlightings, ExplanationResult Explanation)> IntersectQuery(IndexQueryServerSide query, FieldsToFetch fieldsToFetch, Reference<int> totalResults, Reference<int> skippedResults, IQueryResultRetriever retriever, DocumentsOperationContext documentsContext, Func<string, SpatialField> getSpatialField, CancellationToken token)
         {
             var method = query.Metadata.Query.Where as MethodExpression;
 
@@ -181,7 +433,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             int previousBaseQueryMatches = 0;
 
             var firstSubDocumentQuery = subQueries[0];
-            var sort = GetSort(query, getSpatialField);
+            var sort = GetSort(query, _index, getSpatialField, documentsContext);
 
             using (var scope = new IndexQueryingScope(_indexType, query, fieldsToFetch, _searcher, retriever, _state))
             {
@@ -247,7 +499,9 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                     }
 
                     returnedResults++;
-                    yield return result;
+
+                    yield return (result, null, null);
+
                     if (returnedResults == pageSize)
                         yield break;
                 }
@@ -312,7 +566,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             return false;
         }
 
-        private static Sort GetSort(IndexQueryServerSide query, Func<string, SpatialField> getSpatialField)
+        private static Sort GetSort(IndexQueryServerSide query, Index index, Func<string, SpatialField> getSpatialField, DocumentsOperationContext documentsContext)
         {
             if (query.PageSize == 0) // no need to sort when counting only
                 return null;
@@ -320,7 +574,12 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             var orderByFields = query.Metadata.OrderBy;
 
             if (orderByFields == null)
-                return null;
+            {
+                if (query.Metadata.HasBoost == false && index.HasBoostedFields == false)
+                    return null;
+
+                return new Sort(SortField.FIELD_SCORE);
+            }
 
             var sort = new List<SortField>();
 
@@ -387,7 +646,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                 switch (field.OrderingType)
                 {
                     case OrderByFieldType.AlphaNumeric:
-                        var anSort = new AlphaNumericComparatorSource();
+                        var anSort = new AlphaNumericComparatorSource(documentsContext);
                         sort.Add(new SortField(fieldName, anSort, field.Ascending == false));
                         continue;
                     case OrderByFieldType.Long:
@@ -440,7 +699,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             return results;
         }
 
-        public IEnumerable<Document> MoreLikeThis(
+        public IEnumerable<(Document Result, Dictionary<string, Dictionary<string, string[]>> Highlightings, ExplanationResult Explanation)> MoreLikeThis(
             IndexQueryServerSide query,
             IQueryResultRetriever retriever,
             DocumentsOperationContext context,
@@ -556,7 +815,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                 if (ids.Add(id) == false)
                     continue;
 
-                yield return retriever.Get(doc, hit.Score, _state);
+                yield return (retriever.Get(doc, hit.Score, _state), null, null);
             }
         }
 
@@ -566,7 +825,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             var position = query.Start;
 
             var luceneQuery = GetLuceneQuery(context, query.Metadata, query.QueryParameters, _analyzer, _queryBuilderFactories);
-            var sort = GetSort(query, getSpatialField);
+            var sort = GetSort(query, _index, getSpatialField, documentsContext);
 
             var search = ExecuteQuery(luceneQuery, query.Start, docsToGet, sort);
             var termsDocs = IndexedTerms.ReadAllEntriesFromIndex(_searcher.IndexReader, documentsContext, _state);

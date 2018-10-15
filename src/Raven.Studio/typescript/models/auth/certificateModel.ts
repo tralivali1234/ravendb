@@ -6,7 +6,7 @@ class certificateModel {
 
     static securityClearanceTypes: valueAndLabelItem<Raven.Client.ServerWide.Operations.Certificates.SecurityClearance, string>[] = [
         {
-            label: "Cluster Administator",
+            label: "Cluster Administrator",
             value: "ClusterAdmin"
         }, {
             label: "Operator", 
@@ -86,7 +86,7 @@ class certificateModel {
     private initValidation() {
         this.name.extend({
             required: {
-                onlyIf: () => this.mode() !== "editExisting"
+                onlyIf: () => this.mode() !== "replace"
             }
         });
         
@@ -114,7 +114,6 @@ class certificateModel {
     
     toReplaceCertificateDto() {
         return {
-            Name: this.name(),
             Certificate: this.certificateAsBase64(),
             Password: this.certificatePassphrase(),
         }

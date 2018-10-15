@@ -5,21 +5,23 @@ namespace Raven.Server.Documents.ETL.Providers.Raven.Enumerators
 {
     public class TombstonesToRavenEtlItems : IEnumerator<RavenEtlItem>
     {
-        private readonly IEnumerator<DocumentTombstone> _tombstones;
+        private readonly IEnumerator<Tombstone> _tombstones;
         private readonly string _collection;
+        private readonly EtlItemType _tombstoneType;
 
-        public TombstonesToRavenEtlItems(IEnumerator<DocumentTombstone> tombstones, string collection)
+        public TombstonesToRavenEtlItems(IEnumerator<Tombstone> tombstones, string collection, EtlItemType tombstoneType)
         {
             _tombstones = tombstones;
             _collection = collection;
+            _tombstoneType = tombstoneType;
         }
 
         public bool MoveNext()
         {
             if (_tombstones.MoveNext() == false)
                 return false;
-
-            Current = new RavenEtlItem(_tombstones.Current, _collection);
+            
+            Current = new RavenEtlItem(_tombstones.Current, _collection, _tombstoneType);
 
             return true;
         }

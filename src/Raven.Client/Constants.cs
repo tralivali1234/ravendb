@@ -40,9 +40,15 @@ namespace Raven.Client
 
             public const string ClientConfigurationEtag = "Client-Configuration-Etag";
 
+            public const string LastKnownClusterTransactionIndex = "Known-Raft-Index";
+
             public const string RefreshClientConfiguration = "Refresh-Client-Configuration";
 
             public const string Etag = "ETag";
+
+            public const string ClientVersion = "Raven-Client-Version";
+
+            public const string ServerVersion = "Raven-Server-Version";
 
             public const string IfNoneMatch = "If-None-Match";
             public const string TransferEncoding = "Transfer-Encoding";
@@ -95,6 +101,13 @@ namespace Raven.Client
             }
 
             public const string ClientId = "Configuration/Client";
+
+            public const string StudioId = "Configuration/Studio";
+        }
+
+        public static class Counters
+        {
+            public const string All = "@all_counters";
         }
 
         public class Documents
@@ -137,6 +150,10 @@ namespace Raven.Client
                 public const string Flags = "@flags";
 
                 public const string Attachments = "@attachments";
+
+                public const string Counters = "@counters";
+
+                public const string RevisionCounters = "@counters-snapshot";
 
                 public const string LegacyAttachmentsMetadata = "@legacy-attachment-metadata";
 

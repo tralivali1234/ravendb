@@ -4,6 +4,7 @@ using System.Text.RegularExpressions;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Formatting;
 using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Static.Roslyn;
 using static Microsoft.CodeAnalysis.CSharp.SyntaxFactory;
@@ -86,7 +87,13 @@ namespace Raven.Server.Documents.Indexes
                 .NormalizeWhitespace()
                 .AddMembers(c);
 
-            return cu.ToFullString();
+            SyntaxNode formattedCompilationUnit;
+            using (var workspace = new AdhocWorkspace())
+            {
+                formattedCompilationUnit = Formatter.Format(cu, workspace);
+            }
+
+            return formattedCompilationUnit.ToFullString();
         }
 
         private static IEnumerable<SyntaxNodeOrToken> ParsingIndexDefinitionFields(IndexDefinition indexDefinition)

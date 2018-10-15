@@ -10,7 +10,7 @@ namespace Raven.Server.Documents.Patch
     public class AdminJsConsole
     {
         private readonly DocumentDatabase _database;
-        public readonly Logger Log = LoggingSource.Instance.GetLogger<AdminJsConsole>("AdminJsConsole");
+        public readonly Logger Log = LoggingSource.Instance.GetLogger<AdminJsConsole>("Server");
         private readonly RavenServer _server;
 
         public AdminJsConsole(RavenServer server, DocumentDatabase database)
@@ -20,9 +20,9 @@ namespace Raven.Server.Documents.Patch
             if (Log.IsOperationsEnabled)
             {
                 if (database != null)
-                    Log.Operations($"AdminJSConsole : Prepering to execute database script for \"{database.Name}\"");
+                    Log.Operations($"AdminJSConsole : Preparing to execute database script for \"{database.Name}\"");
                 else
-                    Log.Operations("AdminJSConsole : Prepering to execute server script");
+                    Log.Operations("AdminJSConsole : Preparing to execute server script");
 
             }
         }

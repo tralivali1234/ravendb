@@ -1,7 +1,6 @@
 import viewModelBase = require("viewmodels/viewModelBase");
 import database = require("models/resources/database");
 import messagePublisher = require("common/messagePublisher");
-import importDatabaseModel = require("models/database/tasks/importDatabaseModel");
 import notificationCenter = require("common/notifications/notificationCenter");
 import eventsCollector = require("common/eventsCollector");
 import getNextOperationId = require("commands/database/studio/getNextOperationId");
@@ -49,22 +48,6 @@ class importCollectionFromCsv extends viewModelBase {
 
     createPostboxSubscriptions(): Array<KnockoutSubscription> {
         return [
-            ko.postbox.subscribe("UploadProgress", (percentComplete: number) => {
-                const db = this.activeDatabase();
-                if (!db) {
-                    return;
-                }
-
-                if (!this.isUploading()) {
-                    return;
-                }
-
-                if (percentComplete === 100) {
-                    setTimeout(() => this.isUploading(false), 700);
-                }
-
-                this.uploadStatus(percentComplete);
-            }),
             ko.postbox.subscribe(EVENTS.ChangesApi.Reconnected, (db: database) => {
                 this.isUploading(false);
             })
@@ -92,7 +75,7 @@ class importCollectionFromCsv extends viewModelBase {
             .done((operationId: number) => {
                 notificationCenter.instance.openDetailsForOperationById(db, operationId);
 
-                new importFromCsvCommand(db, operationId, fileInput.files[0], this.customCollectionName())
+                new importFromCsvCommand(db, operationId, fileInput.files[0], this.customCollectionName(), this.isUploading, this.uploadStatus)
                     .execute()
                     .always(() => this.isUploading(false));
             });

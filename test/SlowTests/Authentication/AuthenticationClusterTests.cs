@@ -77,7 +77,8 @@ namespace SlowTests.Authentication
                     await session.SaveChangesAsync();
                 }
 
-                var newServerCert = CertificateUtils.CreateSelfSignedCertificate(Environment.MachineName, "RavenTestsServerReplacementCert");
+                var certBytes = CertificateUtils.CreateSelfSignedCertificate(Environment.MachineName, "RavenTestsServerReplacementCert");
+                var newServerCert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
 
                 var mre = new ManualResetEventSlim();
 
@@ -86,7 +87,7 @@ namespace SlowTests.Authentication
                 var requestExecutor = store.GetRequestExecutor();
                 using (requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context))
                 {
-                    var command = new ReplaceClusterCertificateOperation("Replacement Server Cert", newServerCert, false)
+                    var command = new ReplaceClusterCertificateOperation(certBytes, false)
                         .GetCommand(store.Conventions, context);
 
                     requestExecutor.Execute(command, context);

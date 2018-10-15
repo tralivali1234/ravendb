@@ -71,12 +71,28 @@ interface documentMetadataDto {
     '@flags'?: string;
     '@attachments'?: Array<documentAttachmentDto>;
     '@change-vector'?: string;
-
+    '@counters'?: Array<string>;
+    '@counters-snapshot'?: dictionary<number>;
 }
 
 interface updateDatabaseConfigurationsResult {
     RaftCommandIndex: number;
 }
+
+interface nodeCounterValue {
+    nodeTag: string;
+    nodeFullId: string;
+    nodeShortId: string;
+    nodeCounterValue: number;
+}
+
+interface counterItem {
+    documentId: string;
+    counterName: string;
+    totalCounterValue: number;
+    counterValuesPerNode: Array<nodeCounterValue>;
+}
+
 interface documentAttachmentDto {
     ContentType: string;
     Hash: string;
@@ -154,6 +170,7 @@ interface availableConfigurationSection {
     name: string;
     id: availableConfigurationSectionId;
     alwaysEnabled: boolean;
+    disableToggle: KnockoutObservable<boolean>;
     enabled: KnockoutObservable<boolean>;
     validationGroup?: KnockoutValidationGroup;
 }
@@ -221,7 +238,7 @@ interface replicationConflictListItemDto {
     LastModified: string;
 }
 
-type databaseDisconnectionCause = "Error" | "DatabaseDeleted" | "DatabaseDisabled" | "ChangingDatabase";
+type databaseDisconnectionCause = "Error" | "DatabaseDeleted" | "DatabaseDisabled" | "ChangingDatabase" | "DatabaseIsNotRelevant";
 
 type querySortType = "Ascending" | "Descending" | "Range Ascending" | "Range Descending";
 
@@ -232,9 +249,8 @@ interface recentErrorDto extends Raven.Server.NotificationCenter.Notifications.N
 
 declare module studio.settings {
     type numberFormatting = "raw" | "formatted";
-    type dontShowAgain = "EditSystemDocument";
+    type dontShowAgain = "UnsupportedBrowser";
     type saveLocation = "local" | "remote";
-    type usageEnvironment = "Default" | "Dev" | "Test" | "Prod";
 }
 
 interface IndexingPerformanceStatsWithCache extends Raven.Client.Documents.Indexes.IndexingPerformanceStats {
@@ -270,8 +286,15 @@ interface pagedResult<T> {
     additionalResultInfo?: any; 
 }
 
-interface pagedResultWithIncludes<T> extends pagedResult<T> {
+interface testSubscriptionPagedResult<T> extends pagedResult<T> {
     includes: dictionary<any>;
+}
+
+interface pagedResultExtended<T> extends pagedResult<T> {
+    includes: dictionary<any>;
+    highlightings?: dictionary<dictionary<Array<string>>>;
+    explanations?: dictionary<Array<string>>;
+    timings?: Raven.Client.Documents.Queries.Timings.QueryTimings;
 }
 
 interface pagedResultWithAvailableColumns<T> extends pagedResult<T> {
@@ -339,7 +362,7 @@ interface rqlQueryInfo {
 }
 
 interface queryCompleterProviders {
-    terms: (indexName: string, field: string, pageSize: number, callback: (terms: string[]) => void) => void;
+    terms: (indexName: string, collection: string, field: string, pageSize: number, callback: (terms: string[]) => void) => void;
     indexFields: (indexName: string, callback: (fields: string[]) => void) => void;
     collectionFields: (collectionName: string, prefix: string, callback: (fields: dictionary<string>) => void) => void;
     collections: (callback: (collectionNames: string[]) => void) => void;
@@ -359,6 +382,7 @@ type legacyEncryptionAlgorithms = "DES" | "RC2" | "Rijndael" | "Triple DES";
 
 interface unifiedCertificateDefinition extends Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition {
     Thumbprints: Array<string>;
+    Visible: KnockoutObservable<boolean>;
 }
 
 type dashboardChartTooltipProviderArgs = {
@@ -399,5 +423,59 @@ interface resourceStyleMap {
     styleMap: any;
 }
 
-
 type checkbox = "unchecked" | "some_checked" | "checked";
+
+type sqlMigrationAction = "skip" | "embed" | "link";
+
+
+interface sqlMigrationAdvancedSettingsDto {
+    UsePascalCase: boolean,
+    TrimSuffix: boolean,
+    SuffixToTrim: string,
+    DetectManyToMany: boolean 
+}
+
+type virtualNotificationType = "CumulativeBulkInsert" | "AttachmentUpload";
+
+declare module Raven.Server.NotificationCenter.Notifications {
+    interface Notification  {
+        // extend server side type to contain local virtual notifications 
+        Type: Raven.Server.NotificationCenter.Notifications.NotificationType | virtualNotificationType;
+    }
+}
+
+interface explainQueryResponse extends resultsDto<Raven.Server.Documents.Queries.Dynamic.DynamicQueryToIndexMatcher.Explanation> {
+    IndexName: string;
+}
+
+
+interface virtualBulkInsertItem {
+    id: string;
+    date: string;
+    duration: number;
+    items: number;
+}
+
+type adminLogsHeaderType = "Source" | "Logger";
+
+declare module Raven.Server.Documents.ETL.Providers.SQL.Test {
+    interface SqlEtlTestScriptResult {
+        DebugOutput: Array<string>;
+        TransformationErrors: Array<Raven.Server.NotificationCenter.Notifications.Details.EtlErrorInfo>;
+    }
+}
+
+declare module Raven.Server.Documents.ETL.Providers.Raven.Test {
+    interface RavenEtlTestScriptResult extends Raven.Server.Documents.ETL.Test.TestEtlScriptResult {
+        DebugOutput: Array<string>;
+        TransformationErrors: Array<Raven.Server.NotificationCenter.Notifications.Details.EtlErrorInfo>;
+    }
+}
+
+type backupOptions = "None" | "Local" | "Azure" | "AmazonGlacier" | "AmazonS3" | "FTP";
+
+interface periodicBackupServerLimitsResponse {
+    LocalRootPath: string;
+    AllowedAwsRegions: Array<string>;
+    AllowedDestinations: Array<backupOptions>;
+}

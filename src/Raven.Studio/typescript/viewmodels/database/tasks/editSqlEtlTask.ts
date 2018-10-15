@@ -2,6 +2,7 @@ import app = require("durandal/app");
 import appUrl = require("common/appUrl");
 import viewModelBase = require("viewmodels/viewModelBase");
 import router = require("plugins/router");
+import database = require("models/resources/database");
 import ongoingTaskSqlEtlEditModel = require("models/database/tasks/ongoingTaskSqlEtlEditModel");
 import getOngoingTaskInfoCommand = require("commands/database/tasks/getOngoingTaskInfoCommand");
 import eventsCollector = require("common/eventsCollector");
@@ -15,12 +16,167 @@ import transformationScriptSyntax = require("viewmodels/database/tasks/transform
 import ongoingTaskSqlEtlTableModel = require("models/database/tasks/ongoingTaskSqlEtlTableModel");
 import connectionStringSqlEtlModel = require("models/database/settings/connectionStringSqlEtlModel");
 import aceEditorBindingHandler = require("common/bindingHelpers/aceEditorBindingHandler");
+import docsIdsBasedOnQueryFetcher = require("viewmodels/database/patch/docsIdsBasedOnQueryFetcher");
 import getPossibleMentorsCommand = require("commands/database/tasks/getPossibleMentorsCommand");
 import jsonUtil = require("common/jsonUtil");
+import document = require("models/database/documents/document");
+import viewHelpers = require("common/helpers/view/viewHelpers");
+import documentMetadata = require("models/database/documents/documentMetadata");
+import getDocumentsMetadataByIDPrefixCommand = require("commands/database/documents/getDocumentsMetadataByIDPrefixCommand");
+import testSqlReplicationCommand = require("commands/database/tasks/testSqlReplicationCommand");
+import getDocumentWithMetadataCommand = require("commands/database/documents/getDocumentWithMetadataCommand");
+
+class sqlTaskTestMode {
+    
+    performRolledBackTransaction = ko.observable<boolean>(false);
+    documentId = ko.observable<string>();
+    docsIdsAutocompleteResults = ko.observableArray<string>([]);
+    docsIdsAutocompleteSource: docsIdsBasedOnQueryFetcher;
+    db: KnockoutObservable<database>;
+    configurationProvider: () => Raven.Client.Documents.Operations.ETL.SQL.SqlEtlConfiguration;
+    connectionProvider: () => Raven.Client.Documents.Operations.ETL.SQL.SqlConnectionString;
+    
+    validationGroup: KnockoutValidationGroup;
+    validateParent: () => boolean;
+
+    testAlreadyExecuted = ko.observable<boolean>(false);
+    
+    spinners = {
+        preview: ko.observable<boolean>(false),
+        test: ko.observable<boolean>(false)
+    };
+
+    loadedDocument = ko.observable<string>();
+    loadedDocumentId = ko.observable<string>();
+    
+    testResults = ko.observableArray<Raven.Server.Documents.ETL.Providers.SQL.Test.TableQuerySummary.CommandData>([]);
+    debugOutput = ko.observableArray<string>([]);
+    
+    // all kinds of alerts:
+    transformationErrors = ko.observableArray<Raven.Server.NotificationCenter.Notifications.Details.EtlErrorInfo>([]);
+    loadErrors = ko.observableArray<Raven.Server.NotificationCenter.Notifications.Details.EtlErrorInfo>([]);
+    slowSqlWarnings = ko.observableArray<Raven.Server.NotificationCenter.Notifications.Details.SlowSqlStatementInfo>([]);
+    
+    warningsCount = ko.pureComputed(() => {
+        const transformationCount = this.transformationErrors().length;
+        const loadErrorCount = this.loadErrors().length;
+        const slowSqlCount = this.slowSqlWarnings().length;
+        return transformationCount + loadErrorCount + slowSqlCount;
+    });
+    
+    constructor(db: KnockoutObservable<database>, validateParent: () => boolean, 
+                configurationProvider: () => Raven.Client.Documents.Operations.ETL.SQL.SqlEtlConfiguration,
+                connectionProvider: () => Raven.Client.Documents.Operations.ETL.SQL.SqlConnectionString) {
+        this.db = db;
+        this.validateParent = validateParent;
+        this.configurationProvider = configurationProvider;
+        this.connectionProvider = connectionProvider;
+        this.docsIdsAutocompleteSource = new docsIdsBasedOnQueryFetcher(db);
+        
+        _.bindAll(this, "onAutocompleteOptionSelected");
+    }
+    
+    initObservables() {
+        this.documentId.extend({
+            required: true
+        });
+        
+        this.documentId.throttle(250).subscribe(item => {
+            if (!item) {
+                return;
+            }
+
+            new getDocumentsMetadataByIDPrefixCommand(item, 10, this.db())
+                .execute()
+                .done(results => {
+                    this.docsIdsAutocompleteResults(results.map(x => x["@metadata"]["@id"]));
+                });
+        });
+        
+        this.validationGroup = ko.validatedObservable({
+            documentId : this.documentId
+        });
+    }
+    
+    onAutocompleteOptionSelected(option: string) {
+        this.documentId(option);
+        this.previewDocument();
+    }
+
+    previewDocument() {
+        const spinner = this.spinners.preview;
+        const documentId: KnockoutObservable<string> = this.documentId;
+        const documentIdValidationGroup = this.validationGroup;
+        const db = this.db;
+        
+        spinner(true);
+        
+        viewHelpers.asyncValidationCompleted(this.validationGroup)
+            .then(() => {
+                if (viewHelpers.isValid(this.validationGroup)) {
+                    new getDocumentWithMetadataCommand(documentId(), this.db())
+                        .execute()
+                        .done((doc: document) => {
+                            const docDto = doc.toDto(true);
+                            const metaDto = docDto["@metadata"];
+                            documentMetadata.filterMetadata(metaDto);
+                            const text = JSON.stringify(docDto, null, 4);
+                            this.loadedDocument(Prism.highlight(text, (Prism.languages as any).javascript));
+                            this.loadedDocumentId(doc.getId());
+
+                            $('.test-container a[href="#documentPreview"]').tab('show');
+                        }).always(() => spinner(false));
+                } else {
+                    spinner(false);
+                }
+            });
+    }
+    
+    runTest() {
+        const testValid = viewHelpers.isValid(this.validationGroup, true);
+        const parentValid = this.validateParent();
+     
+        if (testValid && parentValid) {
+            this.spinners.test(true);
+            
+            const dto = {
+                DocumentId: this.documentId(),
+                PerformRolledBackTransaction: this.performRolledBackTransaction(),
+                Configuration: this.configurationProvider(),
+                Connection: this.connectionProvider()
+            } as Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters.TestSqlEtlScript;
+
+            eventsCollector.default.reportEvent("sql-etl", "test-replication");
+            
+            new testSqlReplicationCommand(this.db(), dto)
+                .execute()
+                .done((testResult: Raven.Server.Documents.ETL.Providers.SQL.Test.SqlEtlTestScriptResult) => {
+                    this.testResults(_.flatMap(testResult.Summary, x => x.Commands));
+                    this.debugOutput(testResult.DebugOutput);
+                    this.loadErrors(testResult.LoadErrors);
+                    this.slowSqlWarnings(testResult.SlowSqlWarnings); 
+                    this.transformationErrors(testResult.TransformationErrors);
+                    
+                    if (this.warningsCount()) {
+                        $('.test-container a[href="#warnings"]').tab('show');
+                    } else {
+                        $('.test-container a[href="#testResults"]').tab('show');
+                    }
+
+                    this.testAlreadyExecuted(true);
+                })
+                .always(() => this.spinners.test(false));
+        }
+    }
+}
 
 class editSqlEtlTask extends viewModelBase {
 
     static readonly scriptNamePrefix = "Script #";
+
+    enableTestArea = ko.observable<boolean>(false);
+    
+    test: sqlTaskTestMode;
     
     editedSqlEtl = ko.observable<ongoingTaskSqlEtlEditModel>();
     isAddingNewSqlEtlTask = ko.observable<boolean>(true);
@@ -33,7 +189,8 @@ class editSqlEtlTask extends viewModelBase {
 
     possibleMentors = ko.observableArray<string>([]);
     sqlEtlConnectionStringsNames = ko.observableArray<string>([]); 
-
+    
+    connectionStingDefined: KnockoutComputed<boolean>;
     testConnectionResult = ko.observable<Raven.Server.Web.System.NodeConnectionTestResult>();
     
     spinners = {
@@ -65,6 +222,7 @@ class editSqlEtlTask extends viewModelBase {
                                    "saveEditedSqlTable",
                                    "syntaxHelp",
                                    "toggleAdvancedArea",
+                                   "toggleTestArea",
                                    "deleteSqlTable",
                                    "editSqlTable");
 
@@ -154,6 +312,67 @@ class editSqlEtlTask extends viewModelBase {
         this.initDirtyFlag();
 
         this.newConnectionString(connectionStringSqlEtlModel.empty());
+
+        // Open the 'Create new conn. str.' area if no connection strings are yet defined 
+        this.sqlEtlConnectionStringsNames.subscribe((value) => { this.createNewConnectionString(!value.length) });
+
+        this.connectionStingDefined = ko.pureComputed(() => {
+            const editedEtl = this.editedSqlEtl();
+            if (this.createNewConnectionString()) {
+                return !!this.newConnectionString().connectionString();
+            } else {
+                return !!editedEtl.connectionStringName();
+            }
+        });
+        
+        this.enableTestArea.subscribe(testMode => {
+            $("body").toggleClass('show-test', testMode);
+        });
+
+        const dtoProvider = () => {
+            const dto = this.editedSqlEtl().toDto();
+
+            // override transforms - use only current transformation
+            const transformationScriptDto = this.editedTransformationScriptSandbox().toDto();
+            transformationScriptDto.Name = "Script #1"; // assign fake name
+            dto.Transforms = [transformationScriptDto];
+
+            if (!dto.Name) {
+                dto.Name = "Test SQL Task"; // assign fake name
+            }
+            return dto;
+        };
+        
+        const connectionStringProvider = () => {
+            if (this.createNewConnectionString()) {
+                return this.newConnectionString().toDto();
+            } else {
+                return null;
+            }
+        };
+        
+        this.test = new sqlTaskTestMode(this.activeDatabase, () => {
+            const transformationValidationGroup = this.isValid(this.editedTransformationScriptSandbox().validationGroup);
+            const connectionStringValid = this.connectionStingDefined();
+            
+            if (this.test.performRolledBackTransaction()) {
+                if (transformationValidationGroup && !connectionStringValid) {
+                    // close test mode, as connection string is invalid, 
+                    // but user requested rolled back transation
+                    
+                    // by closing we let user know that connection string is required
+                    this.enableTestArea(false);
+                    // run global validation - to show connection string errors
+                    this.isValid(this.editedSqlEtl().validationGroup);
+                    
+                    return false;
+                }
+            }
+            
+            return transformationValidationGroup && connectionStringValid;
+        }, dtoProvider, connectionStringProvider);
+        
+        this.test.initObservables();
     }
     
     private initDirtyFlag() {
@@ -216,8 +435,7 @@ class editSqlEtlTask extends viewModelBase {
                 .always(()=> {
                     this.spinners.test(false);
                 });
-        }
-        else {
+        } else {
             // Existing connection string
             getConnectionStringInfoCommand.forSqlEtl(this.activeDatabase(), this.editedSqlEtl().connectionStringName())
                 .execute()
@@ -240,8 +458,7 @@ class editSqlEtlTask extends viewModelBase {
         if (this.showEditSqlTableArea()) {
             if (!this.isValid(this.editedSqlTableSandbox().validationGroup)) {                
                 hasAnyErrors = true;
-            } 
-            else {
+            } else {
                 this.saveEditedSqlTable();
             }
         }
@@ -250,8 +467,7 @@ class editSqlEtlTask extends viewModelBase {
         if (this.showEditTransformationArea()) {
             if (!this.isValid(this.editedTransformationScriptSandbox().validationGroup)) {
                 hasAnyErrors = true;  
-            } 
-            else {
+            } else {
                 this.saveEditedTransformation();
             }
         }
@@ -260,8 +476,7 @@ class editSqlEtlTask extends viewModelBase {
         if (this.createNewConnectionString()) {
             if (!this.isValid(this.newConnectionString().validationGroup)) {
                 hasAnyErrors = true;  
-            } 
-            else {
+            }  else {
                 // Use the new connection string
                 this.editedSqlEtl().connectionStringName(this.newConnectionString().connectionStringName());
             } 
@@ -288,13 +503,14 @@ class editSqlEtlTask extends viewModelBase {
                 .fail(() => {
                     this.spinners.save(false);
                 });
-        }
-        else {
+        } else {
             savingNewStringAction.resolve();
         }
         
         // 6. All is well, Save Sql Etl task
-        savingNewStringAction.done(()=> {
+        savingNewStringAction.done(() => {
+            eventsCollector.default.reportEvent("sql-etl", "save");
+            
             const scriptsToReset = this.editedSqlEtl()
                 .transformationScripts()
                 .filter(x => x.resetScript())
@@ -328,6 +544,41 @@ class editSqlEtlTask extends viewModelBase {
         this.showAdvancedOptions.toggle();
     }
 
+    toggleTestArea() {
+        if (!this.enableTestArea()) {
+            let hasErrors = false;
+            
+            // validate sql tables
+            if (this.showEditSqlTableArea()) {
+                if (this.isValid(this.editedSqlTableSandbox().validationGroup)) {
+                    this.saveEditedSqlTable();
+                } else {
+                    hasErrors = true;
+                }
+            }
+
+            // validate connection string
+            if (this.createNewConnectionString()) {
+                if (!this.isValid(this.newConnectionString().validationGroup)) {
+                    hasErrors = true;
+                }  else {
+                    this.editedSqlEtl().connectionStringName(this.newConnectionString().connectionStringName());
+                }
+            }
+
+            // validate global form - but only 'enterTestModeValidationGroup'
+            if (!this.isValid(this.editedSqlEtl().enterTestModeValidationGroup)) {
+                hasErrors = true;
+            }
+            
+            if (!hasErrors) {
+                this.enableTestArea(true);    
+            }
+        } else {
+            this.enableTestArea(false);
+        }
+    }
+
     /********************************************/
     /*** Transformation Script Actions Region ***/
     /********************************************/
@@ -344,9 +595,11 @@ class editSqlEtlTask extends viewModelBase {
     cancelEditedTransformation() {
         this.editedTransformationScriptSandbox(null);
         this.transformationScriptSelectedForEdit(null);
+        this.enableTestArea(false);
     }    
     
     saveEditedTransformation() {
+        this.enableTestArea(false);
         const transformation = this.editedTransformationScriptSandbox();
         
         if (!this.isValid(transformation.validationGroup)) {
@@ -395,8 +648,18 @@ class editSqlEtlTask extends viewModelBase {
     }
 
     editTransformationScript(model: ongoingTaskSqlEtlTransformationModel) {
+        this.makeSureSandboxIsVisible();
         this.transformationScriptSelectedForEdit(model);
         this.editedTransformationScriptSandbox(new ongoingTaskSqlEtlTransformationModel(model.toDto(), false, model.resetScript()));
+
+        $('.edit-raven-sql-task .js-test-area [data-toggle="tooltip"]').tooltip();
+    }
+    
+    private makeSureSandboxIsVisible() {
+        const $editArea = $(".edit-raven-sql-task");
+        if ($editArea.scrollTop() > 300) {
+            $editArea.scrollTop(0);
+        }
     }
 
     createCollectionNameAutocompleter(collectionText: KnockoutObservable<string>) {
@@ -448,13 +711,11 @@ class editSqlEtlTask extends viewModelBase {
                     if (result.can) {
                         this.overwriteExistingSqlTable(existingSqlTable, newSqlTable);
                         overwriteAction.resolve(true);
-                    }
-                    else {
+                    } else {
                         overwriteAction.resolve(false);
                     }
                 });
-        }
-        else {
+        } else {
             // New sql table
             if (sqlTableToSave.isNew()) {
                 this.editedSqlEtl().sqlTables.push(newSqlTable);
@@ -492,7 +753,7 @@ class editSqlEtlTask extends viewModelBase {
         }
     }    
     
-    editSqlTable(sqlTableModel: ongoingTaskSqlEtlTableModel) {          
+    editSqlTable(sqlTableModel: ongoingTaskSqlEtlTableModel) {
         this.sqlTableSelectedForEdit(sqlTableModel);
         this.editedSqlTableSandbox(new ongoingTaskSqlEtlTableModel(sqlTableModel.toDto(), false));
     }

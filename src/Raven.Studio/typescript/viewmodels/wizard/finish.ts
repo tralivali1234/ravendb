@@ -95,7 +95,6 @@ class finish extends setupStep {
                 break;
             case "Unsecured":
                 this.saveUnsecuredConfiguration();
-                this.configurationTask.resolve();
                 break;
             case "LetsEncrypt":
                 this.saveSecuredConfiguration(endpoints.global.setup.setupLetsencrypt, this.model.toSecuredDto());
@@ -137,7 +136,7 @@ class finish extends setupStep {
     }
     
     private saveUnsecuredConfiguration() {
-        new saveUnsecuredSetupCommand(this.model.unsecureSetup().toDto())
+        new saveUnsecuredSetupCommand(this.model.toUnsecuredDto())
             .execute()
             .done(() => {
                 this.configurationTask.resolve();

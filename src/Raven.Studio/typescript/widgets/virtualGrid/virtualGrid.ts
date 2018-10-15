@@ -77,6 +77,7 @@ class virtualGrid<T> {
 
     private initController() {
         this.controller = {
+            findRowForCell: cell => this.findRowForCell(cell),
             headerVisible: v => this.settings.showHeader(v),
             init: (fetcher, columnsProvider) => this.init(fetcher, columnsProvider),
             reset: (hard: boolean = true) => this.resetItems(hard),
@@ -336,7 +337,9 @@ class virtualGrid<T> {
     
     private scrollDown() {
         const element = this.$viewportElement[0];
-        element.scrollTop = element.scrollHeight;
+        if (element) {
+            element.scrollTop = element.scrollHeight;
+        }
     }
 
     private checkGridVisibility(): boolean {
@@ -847,7 +850,7 @@ class virtualGrid<T> {
         <div class="viewport-scroller" data-bind="style: { height: virtualHeight() + 'px', width: virtualWidth() + 'px' }, template: { afterRender: afterRender.bind($data) }">
         </div>
     </div>
-    <div class="absolute-center" data-bind="visible: emptyTemplate && emptyResult(), if: emptyTemplate">
+    <div class="absolute-center" data-bind="visible: !isLoading() && emptyTemplate && emptyResult(), if: emptyTemplate">
         <div data-bind="template: emptyTemplate"></div>
     </div>
 </div>

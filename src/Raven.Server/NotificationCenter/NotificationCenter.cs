@@ -15,7 +15,7 @@ namespace Raven.Server.NotificationCenter
 {
     public class NotificationCenter : NotificationsBase, IDisposable
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<NotificationCenter>("NotificationCenter");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<NotificationCenter>("Server");
         private readonly NotificationsStorage _notificationsStorage;
         private readonly string _database;
         private readonly CancellationToken _shutdown;
@@ -30,6 +30,7 @@ namespace Raven.Server.NotificationCenter
             Paging = new Paging(this, _notificationsStorage, database);
             RequestLatency = new RequestLatency(this, _notificationsStorage, database);
             EtlNotifications = new EtlNotifications(this, _notificationsStorage, _database);
+            SlowWrites = new SlowWriteNotifications(this, _notificationsStorage, _database);
         }
 
         public bool IsInitialized { get; set; }
@@ -48,10 +49,11 @@ namespace Raven.Server.NotificationCenter
         public readonly Paging Paging;
         public readonly RequestLatency RequestLatency;
         public readonly EtlNotifications EtlNotifications;
+        public readonly SlowWriteNotifications SlowWrites;
 
         public readonly NotificationCenterOptions Options;
 
-        public void Add(Notification notification)
+        public void Add(Notification notification, DateTime? postponeUntil = null, bool updateExisting = true)
         {
             try
             {
@@ -59,7 +61,7 @@ namespace Raven.Server.NotificationCenter
                 {
                     try
                     {
-                        if (_notificationsStorage.Store(notification) == false)
+                        if (_notificationsStorage.Store(notification, postponeUntil, updateExisting) == false)
                             return;
                     }
                     catch (Exception e)
@@ -82,7 +84,7 @@ namespace Raven.Server.NotificationCenter
                     if (existing?.PostponedUntil > SystemTime.UtcNow)
                         return;
                 }
-                
+
                 foreach (var watcher in Watchers)
                 {
                     // serialize to avoid race conditions
@@ -99,19 +101,6 @@ namespace Raven.Server.NotificationCenter
                 if (Logger.IsInfoEnabled)
                     Logger.Info($"Failed to add notification '{notification.Id}' to the notification center. Title: {notification.Title}, message: {notification.Message}", e);
             }
-        }
-
-        public void AddAfterTransactionCommit(Notification notification, RavenTransaction tx)
-        {
-            var llt = tx.InnerTransaction.LowLevelTransaction;
-
-            llt.OnDispose += _ =>
-            {
-                if (llt.Committed == false)
-                    return;
-
-                Add(notification);
-            };
         }
 
         public IDisposable GetStored(out IEnumerable<NotificationTableValue> actions, bool postponed = true)
@@ -133,11 +122,16 @@ namespace Raven.Server.NotificationCenter
             return _notificationsStorage.GetAlertCount();
         }
 
+        public long GetPerformanceHintCount()
+        {
+            return _notificationsStorage.GetPerformanceHintCount();
+        }
+
         public void Dismiss(string id)
         {
             _notificationsStorage.Delete(id);
 
-            // send this notificaton even when notification doesn't exist 
+            // send this notification even when notification doesn't exist 
             // we don't persist all notifications
             Add(NotificationUpdated.Create(id, NotificationUpdateType.Dismissed));
         }
@@ -156,6 +150,7 @@ namespace Raven.Server.NotificationCenter
         public new void Dispose()
         {
             Paging?.Dispose();
+            SlowWrites?.Dispose();
 
             base.Dispose();
         }

@@ -30,7 +30,7 @@ namespace Voron.Data.Tables
 
         public readonly Slice Name;
         private readonly byte _tableType;
-        
+
         public long NumberOfEntries { get; private set; }
 
         private long _overflowPageCount;
@@ -191,6 +191,24 @@ namespace Voron.Data.Tables
             return RawDataSection.DirectRead(_tx.LowLevelTransaction, id, out size);
         }
 
+        public int GetAllocatedSize(long id)
+        {
+            var posInPage = id % Constants.Storage.PageSize;
+            if (posInPage == 0) // large
+            {
+                var page = _tx.LowLevelTransaction.GetPage(id / Constants.Storage.PageSize);
+
+                var allocated = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(page.OverflowSize);
+
+                return allocated * Constants.Storage.PageSize;
+            }
+
+            // here we rely on the fact that RawDataSmallSection can
+            // read any RawDataSmallSection piece of data, not just something that
+            // it exists in its own section, but anything from other sections as well
+            return RawDataSection.GetRawDataEntrySizeFor(_tx.LowLevelTransaction, id)->AllocatedSize;
+        }
+
         public long Update(long id, TableValueBuilder builder, bool forceUpdate = false)
         {
             AssertWritableTable();
@@ -215,7 +233,7 @@ namespace Voron.Data.Tables
                     var tvr = new TableValueReader(oldData, oldDataSize);
                     UpdateValuesFromIndex(id,
                         ref tvr,
-                        builder, 
+                        builder,
                         forceUpdate);
 
                     builder.CopyTo(pos);
@@ -290,7 +308,7 @@ namespace Voron.Data.Tables
                         slice.Content.Ptr < oldData + oldDataSize)
                     {
                         throw new InvalidOperationException(
-                            "Invalid attempt to update data with the source equals to the range we are modifying. This is not permitted since it can cause data corruption when table defrag happens");
+                            "Invalid attempt to update data with the source equals to the range we are modifying. This is not permitted since it can cause data corruption when table defrag happens. You probably should clone your data.");
                     }
                 }
             }
@@ -447,7 +465,7 @@ namespace Voron.Data.Tables
 
             if (size + sizeof(RawDataSection.RawDataEntrySizes) < RawDataSection.MaxItemSize)
             {
-                id = AllocateFromSmallActiveSection(builder,size);
+                id = AllocateFromSmallActiveSection(builder, size);
 
                 if (ActiveDataSmallSection.TryWriteDirect(id, size, out pos) == false)
                     throw new VoronErrorException(
@@ -652,7 +670,7 @@ namespace Voron.Data.Tables
 
         public FixedSizeTree GetFixedSizeTree(TableSchema.FixedSizeSchemaIndexDef indexDef)
         {
-            
+
             if (indexDef.IsGlobal)
                 return _tx.GetGlobalFixedSizeTree(indexDef.Name, sizeof(long), isIndexTree: true, newPageAllocator: _globalPageAllocator);
 
@@ -808,7 +826,7 @@ namespace Voron.Data.Tables
                     {
                         it.Seek(long.MaxValue);
                     }
-                    
+
                     var result = new TableValueHolder();
                     while (it.MovePrev())
                     {
@@ -845,7 +863,7 @@ namespace Voron.Data.Tables
         public IEnumerable<SeekResult> SeekForwardFrom(TableSchema.SchemaIndexDef index, Slice value, int skip, bool startsWith = false)
         {
             var tree = GetTree(index);
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 if (startsWith)
                     it.SetRequiredPrefix(value);
@@ -873,10 +891,10 @@ namespace Voron.Data.Tables
             }
         }
 
-        public TableValueHolder SeekOneForwardFrom(TableSchema.SchemaIndexDef index, Slice value)
+        public TableValueHolder SeekOneForwardFromPrefix(TableSchema.SchemaIndexDef index, Slice value)
         {
             var tree = GetTree(index);
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 it.SetRequiredPrefix(value);
 
@@ -901,7 +919,7 @@ namespace Voron.Data.Tables
             if (tree == null || tree.State.NumberOfEntries == 0)
                 yield break;
 
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 if (it.Seek(last) == false && it.Seek(Slices.AfterAllKeys) == false)
                     yield break;
@@ -940,7 +958,7 @@ namespace Voron.Data.Tables
                 tree.State.NumberOfEntries == 0)
                 yield break;
 
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 if (it.Seek(last) == false && it.Seek(Slices.AfterAllKeys) == false)
                     yield break;
@@ -973,7 +991,7 @@ namespace Voron.Data.Tables
                 tree.State.NumberOfEntries == 0)
                 yield break;
 
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 if (it.Seek(last) == false && it.Seek(Slices.AfterAllKeys) == false)
                     yield break;
@@ -991,14 +1009,14 @@ namespace Voron.Data.Tables
                 } while (it.MovePrev());
             }
         }
-        
+
         public TableValueHolder SeekOneBackwardFrom(TableSchema.SchemaIndexDef index, Slice prefix, Slice last)
         {
             var tree = GetTree(index);
             if (tree.State.NumberOfEntries == 0)
                 return null;
 
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 if (it.Seek(last) == false && it.Seek(Slices.AfterAllKeys) == false)
                     return null;
@@ -1007,7 +1025,7 @@ namespace Voron.Data.Tables
                 if (SliceComparer.StartWith(it.CurrentKey, it.RequiredPrefix) == false)
                 {
                     if (it.MovePrev() == false)
-                    return null;
+                        return null;
                 }
 
                 do
@@ -1037,7 +1055,7 @@ namespace Voron.Data.Tables
 
             var pk = _schema.Key;
             var tree = GetTree(pk);
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 it.SetRequiredPrefix(requiredPrefix);
 
@@ -1065,7 +1083,7 @@ namespace Voron.Data.Tables
         {
             var pk = _schema.Key;
             var tree = GetTree(pk);
-            using (var it = tree.Iterate(false))
+            using (var it = tree.Iterate(true))
             {
                 if (it.Seek(value) == false)
                     yield break;
@@ -1095,7 +1113,7 @@ namespace Voron.Data.Tables
             {
                 while (true)
                 {
-                    using (var it = tree.Iterate(false))
+                    using (var it = tree.Iterate(true))
                     {
                         if (it.Seek(value) == false)
                             return;
@@ -1124,7 +1142,7 @@ namespace Voron.Data.Tables
                     }
                 }
             }
-            finally 
+            finally
             {
                 value.Release(_tx.Allocator);
             }
@@ -1214,8 +1232,8 @@ namespace Voron.Data.Tables
             {
                 if (it.SeekToLast() == false)
                     yield break;
-                
-                if(it.Skip(-skip) == false)
+
+                if (it.Skip(-skip) == false)
                     yield break;
 
                 var result = new TableValueHolder();
@@ -1246,7 +1264,7 @@ namespace Voron.Data.Tables
             }
         }
 
-        public bool HasEntriesBetween(TableSchema.FixedSizeSchemaIndexDef index, long start, long end)
+        public bool HasEntriesGreaterThanStartAndLowerThanOrEqualToEnd(TableSchema.FixedSizeSchemaIndexDef index, long start, long end)
         {
             var fst = GetFixedSizeTree(index);
 
@@ -1255,8 +1273,10 @@ namespace Voron.Data.Tables
                 if (it.Seek(start) == false)
                     return false;
 
+                if (it.CurrentKey <= start && it.MoveNext() == false)
+                    return false;
 
-                return it.CurrentKey < end;
+                return it.CurrentKey <= end;
             }
         }
 
@@ -1330,40 +1350,46 @@ namespace Voron.Data.Tables
             return deleted;
         }
 
-        public void DeleteByPrimaryKeyPrefix(Slice startSlice, Action<TableValueHolder> beforeDelete = null)
+        public bool DeleteByPrimaryKeyPrefix(Slice startSlice, Action<TableValueHolder> beforeDelete = null, Func<TableValueHolder, bool> shouldAbort = null)
         {
             AssertWritableTable();
 
+            bool deleted = false;
             var pk = _schema.Key;
             var tree = GetTree(pk);
             TableValueHolder tableValueHolder = null;
             while (true)
             {
-                using (var it = tree.Iterate(false))
+                using (var it = tree.Iterate(true))
                 {
                     it.SetRequiredPrefix(startSlice);
                     if (it.Seek(it.RequiredPrefix) == false)
-                        return;
+                        return deleted;
 
                     long id = it.CreateReaderForCurrent().ReadLittleEndianInt64();
 
-                    if (beforeDelete != null)
+                    if (beforeDelete != null || shouldAbort != null)
                     {
                         int size;
                         var ptr = DirectRead(id, out size);
                         if (tableValueHolder == null)
                             tableValueHolder = new TableValueHolder();
                         tableValueHolder.Reader = new TableValueReader(id, ptr, size);
-                        beforeDelete(tableValueHolder);
+                        if (shouldAbort?.Invoke(tableValueHolder) == true)
+                        {
+                            return deleted;
+                        }
+                        beforeDelete?.Invoke(tableValueHolder);
                     }
 
                     Delete(id);
+                    deleted = true;
                 }
             }
         }
 
         public long DeleteForwardFrom(TableSchema.SchemaIndexDef index, Slice value, bool startsWith, long numberOfEntriesToDelete,
-            Action<TableValueHolder> beforeDelete = null)
+            Action<TableValueHolder> beforeDelete = null, Func<TableValueHolder,bool> shouldAbort = null)
         {
             AssertWritableTable();
 
@@ -1377,7 +1403,7 @@ namespace Voron.Data.Tables
             {
                 // deleting from a table can shift things around, so we delete 
                 // them one at a time
-                using (var it = tree.Iterate(false))
+                using (var it = tree.Iterate(true))
                 {
                     if (startsWith)
                         it.SetRequiredPrefix(value);
@@ -1390,13 +1416,17 @@ namespace Voron.Data.Tables
                         if (fstIt.Seek(long.MinValue) == false)
                             break;
 
-                        if (beforeDelete != null)
+                        if (beforeDelete != null || shouldAbort != null)
                         {
                             var ptr = DirectRead(fstIt.CurrentKey, out int size);
                             if (tableValueHolder == null)
                                 tableValueHolder = new TableValueHolder();
                             tableValueHolder.Reader = new TableValueReader(fstIt.CurrentKey, ptr, size);
-                            beforeDelete(tableValueHolder);
+                            if (shouldAbort?.Invoke(tableValueHolder) == true)
+                            {
+                                return deleted;
+                            }
+                            beforeDelete?.Invoke(tableValueHolder);
                         }
 
                         Delete(fstIt.CurrentKey);
@@ -1422,7 +1452,7 @@ namespace Voron.Data.Tables
             {
                 // deleting from a table can shift things around, so we delete 
                 // them one at a time
-                using (var it = tree.Iterate(false))
+                using (var it = tree.Iterate(true))
                 {
                     if (startsWith)
                         it.SetRequiredPrefix(value);
@@ -1524,7 +1554,7 @@ namespace Voron.Data.Tables
                 {
                     if (NumberOfEntries != indexNumberOfEntries)
                         ThrowInconsistentItemsCountInIndexes(fsi.Key.ToString(), NumberOfEntries, indexNumberOfEntries);
-                        
+
                 }
                 else
                 {
@@ -1534,7 +1564,7 @@ namespace Voron.Data.Tables
                         ThrowInconsistentItemsCountInIndexes(fsi.Key.ToString(), NumberOfEntries, indexNumberOfEntries);
                 }
             }
-           
+
             if (_schema.Key == null)
                 return;
 

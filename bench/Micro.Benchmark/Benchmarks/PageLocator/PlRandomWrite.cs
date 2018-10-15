@@ -22,7 +22,7 @@ namespace Micro.Benchmark.Benchmarks.PageLocator
             {
                 Add(new Job
                 {
-                    Env =
+                    Environment =
                     {
                         Runtime = Runtime.Core,
                         Platform = Platform.X64,
@@ -106,14 +106,14 @@ namespace Micro.Benchmark.Benchmarks.PageLocator
         //    }
         //}
 
-        //[Benchmark(OperationsPerInvoke = NumberOfOperations)]
-        //public void BasicV2()
-        //{
-        //    foreach (var pageNumber in _pageNumbers)
-        //    {
-        //        _cacheV2.GetWritablePage(pageNumber);
-        //    }
-        //}
+        [Benchmark(OperationsPerInvoke = NumberOfOperations)]
+        public void BasicV2()
+        {
+            foreach (var pageNumber in _pageNumbers)
+            {
+                _cacheV2.GetWritablePage(pageNumber);
+            }
+        }
 
         //[Benchmark(OperationsPerInvoke = NumberOfOperations)]
         //public void BasicV3()
@@ -124,14 +124,14 @@ namespace Micro.Benchmark.Benchmarks.PageLocator
         //    }
         //}
 
-        //[Benchmark(OperationsPerInvoke = NumberOfOperations)]
-        //public void BasicV4()
-        //{
-        //    foreach (var pageNumber in _pageNumbers)
-        //    {
-        //        _cacheV4.GetWritablePage(pageNumber);
-        //    }
-        //}
+        [Benchmark(OperationsPerInvoke = NumberOfOperations)]
+        public void BasicV4()
+        {
+            foreach (var pageNumber in _pageNumbers)
+            {
+                _cacheV4.GetWritablePage(pageNumber);
+            }
+        }
 
         //[Benchmark(OperationsPerInvoke = NumberOfOperations)]
         //public void BasicV5()

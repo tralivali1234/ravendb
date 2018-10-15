@@ -5,8 +5,11 @@ using System.Linq.Expressions;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Indexes.Spatial;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Queries.Explanation;
+using Raven.Client.Documents.Queries.Highlighting;
 using Raven.Client.Documents.Queries.MoreLikeThis;
 using Raven.Client.Documents.Queries.Spatial;
+using Raven.Client.Documents.Queries.Timings;
 using Sparrow.Json;
 
 namespace Raven.Client.Documents.Session
@@ -56,13 +59,11 @@ namespace Raven.Client.Documents.Session
         /// </summary>
         TSelf NoTracking();
 
-#if FEATURE_SHOW_TIMINGS
         /// <summary>
         ///     Enables calculation of timings for various parts of a query (Lucene search, loading documents, transforming
         ///     results). Default: false
         /// </summary>
-        TSelf ShowTimings();
-#endif
+        TSelf Timings(out QueryTimings timings);
 
         /// <summary>
         ///     Skips the specified count.
@@ -194,7 +195,14 @@ namespace Raven.Client.Documents.Session
         TSelf WhereLucene(string fieldName, string whereClause);
 
         /// <summary>
-        ///     Matches fields where the value is between the specified start and end, exclusive
+        ///     Filter the results from the index using the specified where clause.
+        /// </summary>
+        /// <param name="fieldName">Name of the field.</param>
+        /// <param name="whereClause">Lucene-syntax based query predicate.</param>
+        TSelf WhereLucene(string fieldName, string whereClause, bool exact);
+
+        /// <summary>
+        ///     Matches fields where the value is between the specified start and end, inclusive 
         /// </summary>
         /// <param name="fieldName">Name of the field.</param>
         /// <param name="start">The start.</param>
@@ -202,7 +210,7 @@ namespace Raven.Client.Documents.Session
         TSelf WhereBetween(string fieldName, object start, object end, bool exact = false);
 
         /// <summary>
-        ///     Matches fields where the value is between the specified start and end, exclusive
+        ///     Matches fields where the value is between the specified start and end, inclusive
         /// </summary>
         /// <param name="propertySelector">Property selector for the field.</param>
         /// <param name="start">The start.</param>
@@ -409,11 +417,33 @@ namespace Raven.Client.Documents.Session
         ///     Filter matches based on a given shape - only documents with the shape defined in fieldName that
         ///     have a relation rel with the given shapeWkt will be returned
         /// </summary>
+        /// <param name="propertySelector">Property selector for the field.</param>
+        /// <param name="shapeWkt">WKT formatted shape</param>
+        /// <param name="relation">Spatial relation to check (Within, Contains, Disjoint, Intersects, Nearby)</param>
+        /// <param name="units">Units to be used</param>
+        /// <param name="distanceErrorPct">The allowed error percentage. By default: 0.025</param>
+        TSelf RelatesToShape<TValue>(Expression<Func<T, TValue>> propertySelector, string shapeWkt, SpatialRelation relation, SpatialUnits units, double distanceErrorPct = Constants.Documents.Indexing.Spatial.DefaultDistanceErrorPct);
+
+        /// <summary>
+        ///     Filter matches based on a given shape - only documents with the shape defined in fieldName that
+        ///     have a relation rel with the given shapeWkt will be returned
+        /// </summary>
         /// <param name="fieldName">Spatial field name.</param>
         /// <param name="shapeWkt">WKT formatted shape</param>
         /// <param name="relation">Spatial relation to check (Within, Contains, Disjoint, Intersects, Nearby)</param>
         /// <param name="distanceErrorPct">The allowed error percentage. By default: 0.025</param>
         TSelf RelatesToShape(string fieldName, string shapeWkt, SpatialRelation relation, double distanceErrorPct = Constants.Documents.Indexing.Spatial.DefaultDistanceErrorPct);
+
+        /// <summary>
+        ///     Filter matches based on a given shape - only documents with the shape defined in fieldName that
+        ///     have a relation rel with the given shapeWkt will be returned
+        /// </summary>
+        /// <param name="fieldName">Spatial field name.</param>
+        /// <param name="shapeWkt">WKT formatted shape</param>
+        /// <param name="relation">Spatial relation to check (Within, Contains, Disjoint, Intersects, Nearby)</param>
+        /// <param name="units">Units to be used</param>
+        /// <param name="distanceErrorPct">The allowed error percentage. By default: 0.025</param>
+        TSelf RelatesToShape(string fieldName, string shapeWkt, SpatialRelation relation, SpatialUnits units, double distanceErrorPct = Constants.Documents.Indexing.Spatial.DefaultDistanceErrorPct);
 
         /// <summary>
         ///     Ability to use one factory to determine spatial shape that will be used in query.
@@ -519,12 +549,15 @@ If you really want to do in memory filtering on the data returned from the query
         /// </summary>
         TSelf Distinct();
 
-#if FEATURE_EXPLAIN_SCORES
         /// <summary>
         ///     Adds explanations of scores calculated for queried documents to the query result
         /// </summary>
-        TSelf ExplainScores();
-#endif
+        TSelf IncludeExplanations(out Explanations explanations);
+
+        /// <summary>
+        ///     Adds explanations of scores calculated for queried documents to the query result
+        /// </summary>
+        TSelf IncludeExplanations(ExplanationOptions options, out Explanations explanations);
 
         /// <summary>
         ///     Specifies a fuzziness factor to the single word term in the last where clause
@@ -536,89 +569,13 @@ If you really want to do in memory filtering on the data returned from the query
         /// </remarks>
         TSelf Fuzzy(decimal fuzzy);
 
-#if FEATURE_HIGHLIGHTING
-        /// <summary>
-        ///     Adds matches highlighting for the specified field.
-        /// </summary>
-        /// <remarks>
-        ///     The specified field should be analyzed and stored for highlighter to work.
-        ///     For each match it creates a fragment that contains matched text surrounded by highlighter tags.
-        /// </remarks>
-        /// <param name="fieldName">The field name to highlight.</param>
-        /// <param name="fragmentLength">The fragment length.</param>
-        /// <param name="fragmentCount">The maximum number of fragments for the field.</param>
-        /// <param name="fragmentsField">The field in query results item to put highlights into.</param>
-        TSelf Highlight(string fieldName, int fragmentLength, int fragmentCount, string fragmentsField);
+        TSelf Highlight(string fieldName, int fragmentLength, int fragmentCount, out Highlightings highlightings);
 
-        /// <summary>
-        ///     Adds matches highlighting for the specified field.
-        /// </summary>
-        /// <remarks>
-        ///     The specified field should be analyzed and stored for highlighter to work.
-        ///     For each match it creates a fragment that contains matched text surrounded by highlighter tags.
-        /// </remarks>
-        /// <param name="fieldName">The field name to highlight.</param>
-        /// <param name="fragmentLength">The fragment length.</param>
-        /// <param name="fragmentCount">The maximum number of fragments for the field.</param>
-        /// <param name="highlightings">Field highlights for all results.</param>
-        TSelf Highlight(string fieldName, int fragmentLength, int fragmentCount, out FieldHighlightings highlightings);
+        TSelf Highlight(string fieldName, int fragmentLength, int fragmentCount, HighlightingOptions options, out Highlightings highlightings);
 
-        /// <summary>
-        ///     Adds matches highlighting for the specified field on a Map/Reduce Index.
-        /// </summary>
-        /// <remarks>
-        ///     This is only valid for Map/Reduce Index queries.
-        ///     The specified field and key should be analyzed and stored for highlighter to work.
-        ///     For each match it creates a fragment that contains matched text surrounded by highlighter tags.
-        /// </remarks>
-        /// <param name="fieldName">The field name to highlight.</param>
-        /// <param name="fieldKeyName">The field key name to associate highlights with.</param>
-        /// <param name="fragmentLength">The fragment length.</param>
-        /// <param name="fragmentCount">The maximum number of fragments for the field.</param>
-        /// <param name="highlightings">Field highlights for all results.</param>
-        TSelf Highlight(string fieldName, string fieldKeyName, int fragmentLength, int fragmentCount, out FieldHighlightings highlightings);
+        TSelf Highlight(Expression<Func<T, object>> path, int fragmentLength, int fragmentCount, out Highlightings highlightings);
 
-        /// <summary>
-        ///     Adds matches highlighting for the specified field.
-        /// </summary>
-        /// <remarks>
-        ///     The specified field should be analyzed and stored for highlighter to work.
-        ///     For each match it creates a fragment that contains matched text surrounded by highlighter tags.
-        /// </remarks>
-        /// <param name="propertySelector">The property to highlight.</param>
-        /// <param name="fragmentLength">The fragment length.</param>
-        /// <param name="fragmentCount">The maximum number of fragments for the field.</param>
-        /// <param name="fragmentsPropertySelector">The property to put highlights into.</param>
-        TSelf Highlight<TValue>(Expression<Func<T, TValue>> propertySelector, int fragmentLength, int fragmentCount, Expression<Func<T, IEnumerable>> fragmentsPropertySelector);
-
-        /// <summary>
-        ///     Adds matches highlighting for the specified field.
-        /// </summary>
-        /// <remarks>
-        ///     The specified field should be analyzed and stored for highlighter to work.
-        ///     For each match it creates a fragment that contains matched text surrounded by highlighter tags.
-        /// </remarks>
-        /// <param name="propertySelector">The property to highlight.</param>
-        /// <param name="fragmentLength">The fragment length.</param>
-        /// <param name="fragmentCount">The maximum number of fragments for the field.</param>
-        /// <param name="highlightings">Field highlights for all results.</param>
-        TSelf Highlight<TValue>(Expression<Func<T, TValue>> propertySelector, int fragmentLength, int fragmentCount, out FieldHighlightings highlightings);
-
-        /// <summary>
-        ///     Adds matches highlighting for the specified field on a Map/Reduce Index.
-        /// </summary>
-        /// <remarks>
-        ///     This is only valid for Map/Reduce Index queries.
-        ///     The specified fields should be analyzed and stored for highlighter to work.
-        ///     For each match it creates a fragment that contains matched text surrounded by highlighter tags.
-        /// </remarks>
-        /// <param name="propertySelector">The property to highlight.</param>
-        /// <param name="keyPropertySelector">The key property to associate highlights with.</param>
-        /// <param name="fragmentLength">The fragment length.</param>
-        /// <param name="fragmentCount">The maximum number of fragments for the field.</param>
-        /// <param name="highlightings">Field highlights for all results.</param>
-        TSelf Highlight<TValue>(Expression<Func<T, TValue>> propertySelector, Expression<Func<T, TValue>> keyPropertySelector, int fragmentLength, int fragmentCount, out FieldHighlightings highlightings);
-#endif
+        TSelf Highlight(Expression<Func<T, object>> path, int fragmentLength, int fragmentCount, HighlightingOptions options, out Highlightings highlightings);
 
         /// <summary>
         ///     Includes the specified path in the query, loading the document specified in that path
@@ -723,22 +680,6 @@ If you really want to do in memory filtering on the data returned from the query
         /// Order the search results randomly
         /// </summary>
         TSelf CustomSortUsing(string typeName, bool descending);
-#endif
-
-#if FEATURE_HIGHLIGHTING
-        /// <summary>
-        ///     Sets the tags to highlight matches with.
-        /// </summary>
-        /// <param name="preTag">Prefix tag.</param>
-        /// <param name="postTag">Postfix tag.</param>
-        TSelf SetHighlighterTags(string preTag, string postTag);
-
-        /// <summary>
-        ///     Sets the tags to highlight matches with.
-        /// </summary>
-        /// <param name="preTags">Prefix tags.</param>
-        /// <param name="postTags">Postfix tags.</param>
-        TSelf SetHighlighterTags(string[] preTags, string[] postTags);
 #endif
 
         /// <summary>

@@ -12,18 +12,21 @@ using System.Text;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
-using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Session;
 using Raven.Client.Exceptions;
+using Raven.Client.Exceptions.Security;
+using Raven.Client.ServerWide.Operations.Configuration;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Json;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide;
+using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using StudioConfiguration = Raven.Client.Documents.Operations.Configuration.StudioConfiguration;
 
 namespace Raven.Server.Web.System
 {
@@ -60,6 +63,7 @@ namespace Raven.Server.Web.System
                     string error = null;
                     object result = null;
                     string responseString = null;
+                    string errorMessage = null;
                     
                     try
                     {
@@ -71,10 +75,16 @@ namespace Raven.Server.Web.System
                         if (response.StatusCode == HttpStatusCode.InternalServerError)
                         {
                             error = responseString;
+                            errorMessage = GeneralDomainRegistrationError;
                         }
                         else
                         {
                             result = JsonConvert.DeserializeObject<JObject>(responseString);
+                            if (result != null)
+                            {
+                                if (((JObject)result).TryGetValue("Error", out var err))
+                                    error = err.ToString();
+                            }
                         }
                     }
                     catch (Exception e)
@@ -82,6 +92,7 @@ namespace Raven.Server.Web.System
                         result = responseString;
                         HttpContext.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
                         error = e.ToString();
+                        errorMessage = DomainRegistrationServiceUnreachableError;
                     }
                     
                     using (var streamWriter = new StreamWriter(ResponseBodyStream()))
@@ -90,9 +101,10 @@ namespace Raven.Server.Web.System
                         {
                             new JsonSerializer().Serialize(streamWriter, new
                             {
-                                Message = GeneralDomainRegistrationServiceError,
+                                Message = errorMessage,
                                 Response = result,
-                                Error = error
+                                Error = error,
+                                Type = typeof(RavenException).FullName
                             });
                             
                             streamWriter.Flush();
@@ -107,7 +119,7 @@ namespace Raven.Server.Web.System
                 }
                 catch (Exception e)
                 {
-                    throw new InvalidOperationException(GeneralDomainRegistrationServiceError, e);
+                    throw new InvalidOperationException(GeneralDomainRegistrationError, e);
                 }
             }
         }
@@ -128,6 +140,7 @@ namespace Raven.Server.Web.System
                     string error = null;
                     object result = null;
                     string responseString = null;
+                    string errorMessage = null;
 
                     try
                     {
@@ -139,6 +152,7 @@ namespace Raven.Server.Web.System
                         if (response.IsSuccessStatusCode == false)
                         {
                             error = responseString;
+                            errorMessage = GeneralDomainRegistrationError;
                         }
                         else
                         {
@@ -150,21 +164,26 @@ namespace Raven.Server.Web.System
                         result = responseString;
                         HttpContext.Response.StatusCode = (int)HttpStatusCode.InternalServerError;
                         error = e.ToString();
+                        errorMessage = DomainRegistrationServiceUnreachableError;
                     }
 
                     if (error != null)
-                    {
-                        JsonConvert.DeserializeObject<JObject>(responseString).TryGetValue("Error", out var errorJToken);
-
+                    {   
+                        JToken errorJToken = null;
+                        if (responseString != null)
+                        {
+                            JsonConvert.DeserializeObject<JObject>(responseString).TryGetValue("Error", out errorJToken); 
+                        }
+                        
                         using (var streamWriter = new StreamWriter(ResponseBodyStream()))
                         {
                             new JsonSerializer().Serialize(streamWriter, new
                             {
-                                Message = GeneralDomainRegistrationServiceError,
+                                Message = errorMessage,
                                 Response = result,
                                 Error = errorJToken ?? error
                             });
-                            
+
                             streamWriter.Flush();
                         }
 
@@ -205,19 +224,25 @@ namespace Raven.Server.Web.System
                         fullResult.UserDomainsWithIps.Domains.Add(domain.Key, list);
                     }
 
-                    var licenseStatus = ServerStore.LicenseManager.GetLicenseStatus(licenseInfo.License);
+                    var licenseStatus = await SetupManager
+                        .GetUpdatedLicenseStatus(ServerStore, licenseInfo.License)
+                        .ConfigureAwait(false);
                     fullResult.MaxClusterSize = licenseStatus.MaxClusterSize;
                     fullResult.LicenseType = licenseStatus.Type;
 
                     using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                     {
-                        var blittable = EntityToBlittable.ConvertEntityToBlittable(fullResult, DocumentConventions.Default, context);
+                        var blittable = EntityToBlittable.ConvertCommandToBlittable(fullResult, context);
                         context.Write(writer, blittable);
                     }
                 }
+                catch (LicenseExpiredException)
+                {
+                    throw;
+                }
                 catch (Exception e)
                 {
-                    throw new InvalidOperationException(GeneralDomainRegistrationServiceError, e);
+                    throw new InvalidOperationException(GeneralDomainRegistrationError, e);
                 }
             }
         }
@@ -250,7 +275,7 @@ namespace Raven.Server.Web.System
 
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
-                    var blittable = EntityToBlittable.ConvertEntityToBlittable(userDomainsWithIps, DocumentConventions.Default, context);
+                    var blittable = EntityToBlittable.ConvertCommandToBlittable(userDomainsWithIps, context);
                     context.Write(writer, blittable);
                 }
             }
@@ -294,6 +319,18 @@ namespace Raven.Server.Web.System
         {
             AssertOnlyInSetupMode();
 
+            NetworkInterface[] netInterfaces = null;
+            try
+            {
+                netInterfaces = NetworkInterface.GetAllNetworkInterfaces();
+            }
+            catch (Exception)
+            {
+                // https://github.com/dotnet/corefx/issues/26476
+                // If GetAllNetworkInterfaces is not supported, we'll just return the default: 127.0.0.1
+            }
+
+
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
             {
@@ -304,43 +341,67 @@ namespace Raven.Server.Web.System
                 writer.WritePropertyName("NetworkInterfaces");
                 writer.WriteStartArray();
                 var first = true;
-                foreach (var netInterface in NetworkInterface.GetAllNetworkInterfaces())
+
+                List<string> ips;
+                if (netInterfaces != null)
                 {
-                    var ips = netInterface.GetIPProperties().UnicastAddresses
-                        .Where(x =>
-                        {
-                            // filter 169.254.xxx.xxx out, they are not meaningful for binding
-                            if (x.Address.AddressFamily != AddressFamily.InterNetwork)
-                                return false;
-                            var addressBytes = x.Address.GetAddressBytes();
+                    foreach (var netInterface in netInterfaces)
+                    {
+                        ips = netInterface.GetIPProperties().UnicastAddresses
+                            .Where(x =>
+                            {
+                                // filter 169.254.xxx.xxx out, they are not meaningful for binding
+                                if (x.Address.AddressFamily != AddressFamily.InterNetwork)
+                                    return false;
+                                var addressBytes = x.Address.GetAddressBytes();
 
-                            // filter 127.xxx.xxx.xxx out, in docker only
-                            if (SetupParameters.Get(ServerStore).IsDocker && addressBytes[0] == 127)
-                                return false;
+                                // filter 127.xxx.xxx.xxx out, in docker only
+                                if (SetupParameters.Get(ServerStore).IsDocker && addressBytes[0] == 127)
+                                    return false;
 
-                            return addressBytes[0] != 169 || addressBytes[1] != 254;
-                        })
-                        .Select(addr => addr.Address.ToString())
-                        .ToList();
+                                return addressBytes[0] != 169 || addressBytes[1] != 254;
+                            })
+                            .Select(addr => addr.Address.ToString())
+                            .ToList();
 
-                    // If there's a hostname in the server url, add it to the list
-                    if (SetupParameters.Get(ServerStore).DockerHostname != null && ips.Contains(SetupParameters.Get(ServerStore).DockerHostname) == false)
-                        ips.Add(SetupParameters.Get(ServerStore).DockerHostname);
+                        // If there's a hostname in the server url, add it to the list
+                        if (SetupParameters.Get(ServerStore).DockerHostname != null && ips.Contains(SetupParameters.Get(ServerStore).DockerHostname) == false)
+                            ips.Add(SetupParameters.Get(ServerStore).DockerHostname);
 
-                    if (first == false)
+                        if (first == false)
+                            writer.WriteComma();
+                        first = false;
+
+                        writer.WriteStartObject();
+                        writer.WritePropertyName("Name");
+                        writer.WriteString(netInterface.Name);
                         writer.WriteComma();
-                    first = false;
-
+                        writer.WritePropertyName("Description");
+                        writer.WriteString(netInterface.Description);
+                        writer.WriteComma();
+                        writer.WriteArray("Addresses", ips);
+                        writer.WriteEndObject();
+                    }
+                }
+                else
+                {
+                    // https://github.com/dotnet/corefx/issues/26476
+                    // If GetAllNetworkInterfaces is not supported, we'll just return the default: 127.0.0.1
+                    ips = new List<string>
+                    {
+                        "127.0.0.1"
+                    };
                     writer.WriteStartObject();
                     writer.WritePropertyName("Name");
-                    writer.WriteString(netInterface.Name);
+                    writer.WriteString("Loopback Interface");
                     writer.WriteComma();
                     writer.WritePropertyName("Description");
-                    writer.WriteString(netInterface.Description);
+                    writer.WriteString("Loopback Interface");
                     writer.WriteComma();
                     writer.WriteArray("Addresses", ips);
                     writer.WriteEndObject();
                 }
+                
 
                 writer.WriteEndArray();
                 writer.WriteEndObject();
@@ -365,8 +426,8 @@ namespace Raven.Server.Web.System
                 try
                 {
                     certificate = certDef.Password == null
-                        ? new X509Certificate2(Convert.FromBase64String(certDef.Certificate))
-                        : new X509Certificate2(Convert.FromBase64String(certDef.Certificate), certDef.Password);
+                        ? new X509Certificate2(Convert.FromBase64String(certDef.Certificate), (string)null, X509KeyStorageFlags.MachineKeySet)
+                        : new X509Certificate2(Convert.FromBase64String(certDef.Certificate), certDef.Password, X509KeyStorageFlags.MachineKeySet);
 
                     cn = certificate.GetNameInfo(X509NameType.SimpleName, false);
                 }
@@ -391,7 +452,7 @@ namespace Raven.Server.Web.System
                 }
                 catch (Exception e)
                 {
-                    throw new InvalidOperationException($"Failed to load the uploaded certificate. Did you accidently upload a client certificate?", e);
+                    throw new InvalidOperationException($"Failed to load the uploaded certificate. Did you accidentally upload a client certificate?", e);
                 }
 
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
@@ -423,7 +484,7 @@ namespace Raven.Server.Web.System
         }
 
         [RavenAction("/setup/unsecured", "POST", AuthorizationStatus.UnauthenticatedClients)]
-        public Task SetupUnsecured()
+        public async Task SetupUnsecured()
         {
             AssertOnlyInSetupMode();
 
@@ -469,13 +530,30 @@ namespace Raven.Server.Web.System
 
                 settingsJson.Modifications[RavenConfiguration.GetKey(x => x.Core.TcpServerUrls)] = string.Join(";", setupInfo.Addresses.Select(ip => IpAddressToUrl(ip, setupInfo.TcpPort, "tcp")));
 
+                if (setupInfo.EnableExperimentalFeatures)
+                {
+                    settingsJson.Modifications[RavenConfiguration.GetKey(x => x.Core.FeaturesAvailability)] = FeaturesAvailability.Experimental;
+                }
+                
+                ServerStore.EnsureNotPassive(nodeTag: setupInfo.LocalNodeTag);
+                
+                if (setupInfo.Environment != StudioConfiguration.StudioEnvironment.None)
+                {
+                    var res = await ServerStore.PutValueInClusterAsync(new PutServerWideStudioConfigurationCommand(new ServerWideStudioConfiguration
+                    {
+                        Disabled = false,
+                        Environment = setupInfo.Environment
+                    }));
+                    await ServerStore.Cluster.WaitForIndexNotification(res.Index);
+                }
+                
                 var modifiedJsonObj = context.ReadObject(settingsJson, "modified-settings-json");
 
                 var indentedJson = SetupManager.IndentJsonString(modifiedJsonObj.ToString());
                 SetupManager.WriteSettingsJsonLocally(ServerStore.Configuration.ConfigPath, indentedJson);
             }
 
-            return NoContent();
+            NoContentStatus();
         }
 
         [RavenAction("/setup/secured", "POST", AuthorizationStatus.UnauthenticatedClients)]
@@ -500,13 +578,13 @@ namespace Raven.Server.Web.System
                     "Setting up RavenDB in secured mode.",
                     Documents.Operations.Operations.OperationType.Setup,
                     progress => SetupManager.SetupSecuredTask(progress, setupInfo, ServerStore, operationCancelToken.Token),
-                    operationId.Value, operationCancelToken);
+                    operationId.Value, token: operationCancelToken);
 
                 var zip = ((SetupProgressAndResult)operationResult).SettingsZipFile;
 
                 var nodeCert = setupInfo.Password == null
-                    ? new X509Certificate2(Convert.FromBase64String(setupInfo.Certificate))
-                    : new X509Certificate2(Convert.FromBase64String(setupInfo.Certificate), setupInfo.Password);
+                    ? new X509Certificate2(Convert.FromBase64String(setupInfo.Certificate), (string)null, X509KeyStorageFlags.MachineKeySet)
+                    : new X509Certificate2(Convert.FromBase64String(setupInfo.Certificate), setupInfo.Password, X509KeyStorageFlags.MachineKeySet);
 
                 var cn = nodeCert.GetNameInfo(X509NameType.SimpleName, false);
 
@@ -562,7 +640,7 @@ namespace Raven.Server.Web.System
                     null, "Setting up RavenDB with a Let's Encrypt certificate",
                     Documents.Operations.Operations.OperationType.Setup,
                     progress => SetupManager.SetupLetsEncryptTask(progress, setupInfo, ServerStore, operationCancelToken.Token),
-                    operationId.Value, operationCancelToken);
+                    operationId.Value, token: operationCancelToken);
 
                 var zip = ((SetupProgressAndResult)operationResult).SettingsZipFile;
 
@@ -605,7 +683,7 @@ namespace Raven.Server.Web.System
                             if (entry.Name.Equals("settings.json") == false)
                                 continue;
 
-                            var tag = entry.FullName[0].ToString();
+                            var tag = entry.FullName.Substring(0, entry.FullName.Length - "/settings.json".Length);
 
                             using (var settingsJson = context.ReadForMemory(entry.Open(), "settings-json"))
                                 if (settingsJson.TryGet(nameof(ConfigurationNodeInfo.PublicServerUrl), out string publicServerUrl))
@@ -668,7 +746,7 @@ namespace Raven.Server.Web.System
                     null, "Continue Cluster Setup.",
                     Documents.Operations.Operations.OperationType.Setup,
                     progress => SetupManager.ContinueClusterSetupTask(progress, continueSetupInfo, ServerStore, operationCancelToken.Token),
-                    operationId.Value, operationCancelToken);
+                    operationId.Value, token: operationCancelToken);
             }
             
             NoContentStatus();
@@ -696,7 +774,7 @@ namespace Raven.Server.Web.System
             if (ServerStore.Configuration.Core.SetupMode == SetupMode.Initial)
                 return;
 
-            throw new UnauthorizedAccessException("RavenDB has already been setup. Cannot use the /setup endpoints any longer.");
+            throw new AuthorizationException("RavenDB has already been setup. Cannot use the /setup endpoints any longer.");
         }
 
         private static string IpAddressToUrl(string address, int port, string scheme = "http")
@@ -707,7 +785,8 @@ namespace Raven.Server.Web.System
             return url;
         }
 
-        private static string GeneralDomainRegistrationServiceError = "The domain registration service (" + ApiHttpClient.ApiRavenDbNet + ") is currently not available. Please try again later.";
+        private static string GeneralDomainRegistrationError = "Registration error.";
+        private static string DomainRegistrationServiceUnreachableError = $"Failed to contact {ApiHttpClient.ApiRavenDbNet}. Please try again later."; 
     }
 
     public class LicenseInfo

@@ -6,6 +6,7 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using Raven.Client.Documents.Operations.ETL.SQL;
+using Raven.Server.Documents.ETL.Providers.SQL.Test;
 
 namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
 {
@@ -16,10 +17,10 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
         private readonly DbCommandBuilder _commandBuilder;
 
         public RelationalDatabaseWriterSimulator(SqlEtlConfiguration configuration) 
-            : base(configuration.FactoryName)
+            : base(configuration.GetFactoryName())
         {
             _configuration = configuration;
-            _providerFactory = DbProviderFactories.GetFactory(configuration.FactoryName);
+            _providerFactory = DbProviderFactories.GetFactory(configuration.GetFactoryName());
             _commandBuilder = _providerFactory.InitializeCommandBuilder();
         }
 
@@ -35,13 +36,13 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                 }
             }
 
-            foreach (var insertQuery in GenerteInsertItemCommandText(records.TableName, records.DocumentIdColumn, records.Inserts, token))
+            foreach (var insertQuery in GenerateInsertItemCommandText(records.TableName, records.DocumentIdColumn, records.Inserts, token))
             {
                 yield return insertQuery;
             }
         }
 
-        private IEnumerable<string> GenerteInsertItemCommandText(string tableName, string pkName, List<ToSqlItem> dataForTable, CancellationToken token)
+        private IEnumerable<string> GenerateInsertItemCommandText(string tableName, string pkName, List<ToSqlItem> dataForTable, CancellationToken token)
         {
             foreach (var itemToReplicate in dataForTable)
             {
@@ -61,7 +62,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                 sb.Length = sb.Length - 2;
 
 
-                sb.Append(") VALUES (")
+                sb.Append(") \r\nVALUES (")
                     .Append("'")
                     .Append(itemToReplicate.DocumentId)
                     .Append("'")
@@ -73,8 +74,10 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                         continue;
                      DbParameter param = new SqlParameter();
                      RelationalDatabaseWriter.SetParamValue(param, column, null);
-                     sb.Append("'").Append(param.Value).Append("'").Append(", ");
+
+                    sb.Append(TableQuerySummary.GetParameterValue(param)).Append(", ");
                 }
+
                 sb.Length = sb.Length - 2;
                 sb.Append(")");
                 if (IsSqlServerFactoryType && _configuration.ForceQueryRecompile)
@@ -96,7 +99,6 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
 
             for (int i = 0; i < toSqlItems.Count; i += maxParams)
             {
-
                 var sb = new StringBuilder("DELETE FROM ")
                     .Append(GetTableNameString(tableName))
                     .Append(" WHERE ")
@@ -107,16 +109,10 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                 {
                     if (i != j)
                         sb.Append(", ");
-                    if (parameterize)
-                    {
-                        sb.Append(toSqlItems[j].DocumentId);
-                    }
-                    else
-                    {
-                        sb.Append("'").Append(RelationalDatabaseWriter.SanitizeSqlValue(toSqlItems[j].DocumentId)).Append("'");
-                    }
-
+                    
+                    sb.Append("'").Append(RelationalDatabaseWriter.SanitizeSqlValue(toSqlItems[j].DocumentId)).Append("'");
                 }
+
                 sb.Append(")");
 
                 if (IsSqlServerFactoryType && _configuration.ForceQueryRecompile)

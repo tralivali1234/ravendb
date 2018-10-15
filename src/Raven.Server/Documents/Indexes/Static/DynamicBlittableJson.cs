@@ -94,7 +94,10 @@ namespace Raven.Server.Documents.Indexes.Static
                 FastCompare(name, MetadataIdPropertyIndex))
             {
                 if (BlittableJson.TryGetMember(name, out result))
+                {
+                    result = TypeConverter.ToDynamicType(result);
                     return true;
+                }
 
                 if (_doc == null)
                 {
@@ -180,6 +183,11 @@ namespace Raven.Server.Documents.Indexes.Static
             {
                 yield return new KeyValuePair<object, object>(TypeConverter.ToDynamicType(propertyName), TypeConverter.ToDynamicType(BlittableJson[propertyName]));
             }
+        }
+
+        public IEnumerable<object> SelectMany(Func<object, IEnumerable<object>> func)
+        {
+            return new DynamicArray(Enumerable.SelectMany(this, func));
         }
 
         public IEnumerable<object> Select(Func<object, object> func)

@@ -23,7 +23,6 @@ using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Database;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
-using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations;
 using Raven.Server.Documents;
 using Raven.Server.Json;
@@ -33,20 +32,19 @@ using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Raven.Server.Documents.Patch;
-using Raven.Server.Documents.PeriodicBackup;
 using Raven.Server.Rachis;
 using Raven.Server.Smuggler.Migration;
 using Raven.Server.ServerWide.Commands;
 using Raven.Server.Smuggler.Documents;
 using Raven.Client.Extensions;
+using Raven.Client.ServerWide.Operations.Migration;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Auto;
+using Raven.Server.Documents.PeriodicBackup.Restore;
 using Raven.Server.ServerWide.Commands.Indexes;
 using Raven.Server.Utils;
 using Sparrow.Logging;
 using Sparrow;
-using Sparrow.Utils;
-using Voron.Impl;
 using Constants = Raven.Client.Constants;
 using DatabaseSmuggler = Raven.Server.Smuggler.Documents.DatabaseSmuggler;
 
@@ -54,7 +52,7 @@ namespace Raven.Server.Web.System
 {
     public class AdminDatabasesHandler : RequestHandler
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<AdminDatabasesHandler>("AdminDatabasesTasks");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<AdminDatabasesHandler>("Server");
 
         [RavenAction("/admin/databases", "GET", AuthorizationStatus.Operator)]
         public Task Get()
@@ -86,7 +84,7 @@ namespace Raven.Server.Web.System
                     using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                     {
                         writer.WriteStartObject();
-                        writer.WriteDocumentPropertiesWithoutMetdata(context, new Document
+                        writer.WriteDocumentPropertiesWithoutMetadata(context, new Document
                         {
                             Data = dbDoc
                         });
@@ -171,7 +169,7 @@ namespace Raven.Server.Web.System
                     if (databaseRecord.Topology.RelevantFor(mentor) == false)
                         throw new ArgumentException($"The node {mentor} is not part of the database group");
                     if (databaseRecord.Topology.Members.Contains(mentor) == false)
-                        throw new ArgumentException($"The node {mentor} is not vaild for the operation because it is not a member");
+                        throw new ArgumentException($"The node {mentor} is not valid for the operation because it is not a member");
                     databaseRecord.Topology.PredefinedMentors.Add(node, mentor);
                 }
 
@@ -195,7 +193,7 @@ namespace Raven.Server.Web.System
             }
         }
 
-        public bool NotUsingHttps(string url)
+        public static bool NotUsingHttps(string url)
         {
             return url.StartsWith("https:", StringComparison.OrdinalIgnoreCase) == false;
         }
@@ -207,15 +205,26 @@ namespace Raven.Server.Web.System
             if (ResourceNameValidator.IsValidResourceName(name, ServerStore.Configuration.Core.DataDirectory.FullPath, out string errorMessage) == false)
                 throw new BadRequestException(errorMessage);
 
+            if (LoggingSource.AuditLog.IsInfoEnabled)
+            {
+                var clientCert = GetCurrentCertificate();
+
+                var auditLog = LoggingSource.AuditLog.GetLogger("DbMgmt", "Audit");
+                auditLog.Info($"Database {name} PUT by {clientCert?.Subject} ({clientCert?.Thumbprint})");
+            }
+
+
             ServerStore.EnsureNotPassive();
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
                 context.OpenReadTransaction();
 
                 var index = GetLongFromHeaders("ETag");
-                var replicationFactor = GetIntValueQueryString("replicationFactor", required: false) ?? 0;
+                var replicationFactor = GetIntValueQueryString("replicationFactor", required: false) ?? 1;
                 var json = context.ReadForDisk(RequestBodyStream(), name);
                 var databaseRecord = JsonDeserializationCluster.DatabaseRecord(json);
+                if (string.IsNullOrWhiteSpace(databaseRecord.DatabaseName))
+                    throw new ArgumentException("DatabaseName property has invalid value (null, empty or whitespace only)");
                 databaseRecord.DatabaseName = databaseRecord.DatabaseName.Trim();
 
                 if ((databaseRecord.Topology?.DynamicNodesDistribution ?? false) &&
@@ -293,6 +302,8 @@ namespace Raven.Server.Web.System
 
                             case IndexType.Map:
                             case IndexType.MapReduce:
+                            case IndexType.JavaScriptMap:
+                            case IndexType.JavaScriptMapReduce:
                                 var indexDefinition = index.GetIndexDefinition();
                                 databaseRecord.Indexes.Add(indexDefinition.Name, indexDefinition);
                                 break;
@@ -325,10 +336,12 @@ namespace Raven.Server.Web.System
             if (existingDatabaseRecord != null && index.HasValue == false)
                 throw new ConcurrencyException($"Database '{name}' already exists!");
 
-            var nodeUrlsAddedTo = new List<string>();
+            if (replicationFactor <= 0)
+                throw new ArgumentException("Replication factor must be greater than 0.");
+
             try
             {
-                DatabaseHelper.Validate(name, databaseRecord);
+                DatabaseHelper.Validate(name, databaseRecord, Server.Configuration);
             }
             catch (Exception e)
             {
@@ -337,28 +350,42 @@ namespace Raven.Server.Web.System
             var clusterTopology = ServerStore.GetClusterTopology(context);
             ValidateClusterMembers(clusterTopology, databaseRecord);
 
-            DatabaseTopology topology;
             if (databaseRecord.Topology?.Members?.Count > 0)
             {
-                topology = databaseRecord.Topology;
+                var topology = databaseRecord.Topology;
                 foreach (var member in topology.Members)
                 {
-                    var nodeUrl = clusterTopology.GetUrlFromTag(member);
-                    if (nodeUrl == null)
-                        throw new ArgumentException($"Failed to add node {member}, becasue we don't have it in the cluster.");
-                    nodeUrlsAddedTo.Add(nodeUrl);
+                    if (clusterTopology.Contains(member) == false)
+                        throw new ArgumentException($"Failed to add node {member}, because we don't have it in the cluster.");
                 }
+                topology.ReplicationFactor = topology.Members.Count;
             }
             else
             {
-                var factor = Math.Max(1, replicationFactor);
-                databaseRecord.Topology = topology = AssignNodesToDatabase(context, factor, name, databaseRecord.Encrypted, out nodeUrlsAddedTo);
-            }
-            topology.ReplicationFactor = topology.Members.Count;
-            var (newIndex, _) = await ServerStore.WriteDatabaseRecordAsync(name, databaseRecord, index);
+                if (databaseRecord.Topology == null)
+                    databaseRecord.Topology = new DatabaseTopology();
 
-            await WaitForExecutionOnRelevantNodes(context, name, clusterTopology, databaseRecord.Topology?.Members, newIndex);
-            return (newIndex, topology, nodeUrlsAddedTo);
+                databaseRecord.Topology.ReplicationFactor = Math.Min(replicationFactor, clusterTopology.AllNodes.Count);
+            }
+
+            var (newIndex, result) = await ServerStore.WriteDatabaseRecordAsync(name, databaseRecord, index);
+            await ServerStore.WaitForCommitIndexChange(RachisConsensus.CommitIndexModification.GreaterOrEqual, newIndex);
+
+            var members = (List<string>)result;
+            await WaitForExecutionOnRelevantNodes(context, name, clusterTopology, members, newIndex);
+
+            var nodeUrlsAddedTo = new List<string>();
+            foreach (var member in members)
+            {
+                nodeUrlsAddedTo.Add(clusterTopology.GetUrlFromTag(member));
+            }
+
+            using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
+            using (ctx.OpenReadTransaction())
+            {
+                var record = ServerStore.Cluster.ReadDatabase(ctx, name);
+                return (newIndex, record.Topology, nodeUrlsAddedTo);
+            }
         }
 
         [RavenAction("/admin/databases/reorder", "POST", AuthorizationStatus.Operator)]
@@ -375,12 +402,11 @@ namespace Raven.Server.Web.System
                 var json = await context.ReadForMemoryAsync(RequestBodyStream(), "nodes");
                 var parameters = JsonDeserializationServer.Parameters.MembersOrder(json);
 
-                if (record.Topology.Members.Count != parameters.MembersOrder.Count
-                    || record.Topology.Members.All(parameters.MembersOrder.Contains) == false)
-                {
-                    throw new ArgumentException("The reordered list doesn't correspond to the existing members of the database group.");
-                }
-                record.Topology.Members = parameters.MembersOrder;
+                var reorderedTopology = DatabaseTopology.Reorder(record.Topology, parameters.MembersOrder);
+
+                record.Topology.Members = reorderedTopology.Members;
+                record.Topology.Promotables = reorderedTopology.Promotables;
+                record.Topology.Rehabs = reorderedTopology.Rehabs;
 
                 var reorder = new UpdateTopologyCommand
                 {
@@ -393,98 +419,6 @@ namespace Raven.Server.Web.System
 
                 NoContentStatus();
             }
-        }
-
-        private async Task WaitForExecutionOnRelevantNodes(JsonOperationContext context, string database, ClusterTopology clusterTopology, List<string> members, long index)
-        {
-            await ServerStore.Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
-            var executors = new List<ClusterRequestExecutor>();
-            var timeoutTask = TimeoutManager.WaitFor(TimeSpan.FromMilliseconds(10000));
-            var waitingTasks = new List<Task>
-            {
-                timeoutTask
-            };
-            var cts = CancellationTokenSource.CreateLinkedTokenSource(ServerStore.ServerShutdown);
-            try
-            {
-                foreach (var member in members)
-                {
-                    var url = clusterTopology.GetUrlFromTag(member);
-                    var requester = ClusterRequestExecutor.CreateForSingleNode(url, ServerStore.Server.Certificate.Certificate);
-                    executors.Add(requester);
-                    waitingTasks.Add(requester.ExecuteAsync(new WaitForRaftIndexCommand(index), context, token: cts.Token));
-                }
-
-                while (true)
-                {
-                    var task = await Task.WhenAny(waitingTasks);
-                    if (task == timeoutTask)
-                        throw new TimeoutException($"Waited too long for the raft command (number {index}) to be executed on any of the relevant nodes to this command.");
-                    if (task.IsCompletedSuccessfully)
-                    {
-                        break;
-                    }
-                    waitingTasks.Remove(task);
-                    if (waitingTasks.Count == 1) // only the timeout task is left
-                        throw new InvalidDataException($"The database '{database}' was create but is not accessible, because all of the nodes on which this database was supose to be created, had thrown an exception.", task.Exception);
-                }
-            }
-            finally
-            {
-                cts.Cancel();
-                foreach (var clusterRequestExecutor in executors)
-                {
-                    clusterRequestExecutor.Dispose();
-                }
-                cts.Dispose();
-            }
-        }
-
-        private async Task WaitForExecutionOnSpecificNode(TransactionOperationContext context, ClusterTopology clusterTopology, string node, long index)
-        {
-            await ServerStore.Cluster.WaitForIndexNotification(index); // first let see if we commit this in the leader
-
-            using (var requester = ClusterRequestExecutor.CreateForSingleNode(clusterTopology.GetUrlFromTag(node), ServerStore.Server.Certificate.Certificate))
-            {
-                await requester.ExecuteAsync(new WaitForRaftIndexCommand(index), context);
-            }
-        }
-
-        private DatabaseTopology AssignNodesToDatabase(
-            TransactionOperationContext context,
-            int factor,
-            string name,
-            bool isEncrypted,
-            out List<string> nodeUrlsAddedTo)
-        {
-            var topology = new DatabaseTopology();
-
-            var clusterTopology = ServerStore.GetClusterTopology(context);
-
-            var allNodes = clusterTopology.Members.Keys
-                .Concat(clusterTopology.Promotables.Keys)
-                .Concat(clusterTopology.Watchers.Keys)
-                .ToList();
-
-            if (isEncrypted)
-            {
-                allNodes.RemoveAll(n => NotUsingHttps(clusterTopology.GetUrlFromTag(n)));
-                if (allNodes.Count == 0)
-                    throw new InvalidOperationException($"Database {name} is encrypted and requires a node which supports SSL. There is no such node available in the cluster.");
-            }
-
-            var offset = new Random().Next();
-            nodeUrlsAddedTo = new List<string>();
-
-            for (int i = 0; i < Math.Min(allNodes.Count, factor); i++)
-            {
-                var selectedNode = allNodes[(i + offset) % allNodes.Count];
-                var url = clusterTopology.GetUrlFromTag(selectedNode);
-                topology.Members.Add(selectedNode);
-                nodeUrlsAddedTo.Add(url);
-            }
-
-            return topology;
         }
 
         private void ValidateClusterMembers(ClusterTopology clusterTopology, DatabaseRecord databaseRecord)
@@ -530,27 +464,29 @@ namespace Raven.Server.Web.System
                 if (Directory.Exists(restorePathJson.Path) == false)
                     throw new InvalidOperationException($"Path '{restorePathJson.Path}' doesn't exist");
 
+                var sortedList = new SortedList<DateTime, RestorePoint>(new RestoreUtils.DescendedDateComparer());
                 var directories = Directory.GetDirectories(restorePathJson.Path).OrderBy(x => x).ToList();
                 if (directories.Count == 0)
                 {
                     // no folders in directory
                     // will scan the directory for backup files
-                    Restore.FetchRestorePoints(restorePathJson.Path, restorePoints.List, assertLegacyBackups: true);
+                    RestoreUtils.FetchRestorePoints(restorePathJson.Path, sortedList, context, assertLegacyBackups: true);
                 }
                 else
                 {
                     foreach (var directory in directories)
                     {
-                        Restore.FetchRestorePoints(directory, restorePoints.List);
+                        RestoreUtils.FetchRestorePoints(directory, sortedList, context);
                     }
                 }
 
+                restorePoints.List = sortedList.Values.ToList();
                 if (restorePoints.List.Count == 0)
                     throw new InvalidOperationException("Couldn't locate any backup files!");
 
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
-                    var blittable = EntityToBlittable.ConvertEntityToBlittable(restorePoints, DocumentConventions.Default, context);
+                    var blittable = EntityToBlittable.ConvertCommandToBlittable(restorePoints, context);
                     context.Write(writer, blittable);
                     writer.Flush();
                 }
@@ -599,9 +535,7 @@ namespace Raven.Server.Web.System
                     ServerStore.NodeTag,
                     cancelToken);
 
-#pragma warning disable 4014
-                ServerStore.Operations.AddOperation(
-#pragma warning restore 4014
+                var t = ServerStore.Operations.AddOperation(
                     null,
                     $"Database restore: {databaseName}",
                     Documents.Operations.Operations.OperationType.DatabaseRestore,
@@ -626,6 +560,14 @@ namespace Raven.Server.Web.System
             {
                 var json = await context.ReadForMemoryAsync(RequestBodyStream(), "docs");
                 var parameters = JsonDeserializationServer.Parameters.DeleteDatabasesParameters(json);
+
+                if (LoggingSource.AuditLog.IsInfoEnabled)
+                {
+                    var clientCert = GetCurrentCertificate();
+
+                    var auditLog = LoggingSource.AuditLog.GetLogger("DbMgmt", "Audit");
+                    auditLog.Info($"Delete [{string.Join(", ", parameters.DatabaseNames)}] database from ({string.Join(", ", parameters.FromNodes)}) by {clientCert?.Subject} ({clientCert?.Thumbprint})");
+                }
 
                 if (parameters.FromNodes != null && parameters.FromNodes.Length > 0)
                 {
@@ -652,6 +594,13 @@ namespace Raven.Server.Web.System
                         }
                     }
                 }
+                else
+                {
+                    foreach (var databaseName in parameters.DatabaseNames)
+                    {
+                        waitOnRecordDeletion.Add(databaseName);
+                    }
+                }
 
                 long index = -1;
                 foreach (var name in parameters.DatabaseNames)
@@ -660,6 +609,8 @@ namespace Raven.Server.Web.System
                     index = newIndex;
                 }
                 await ServerStore.Cluster.WaitForIndexNotification(index);
+
+                long actualDeletionIndex = index;
 
                 var timeToWaitForConfirmation = parameters.TimeToWaitForConfirmation ?? TimeSpan.FromSeconds(15);
 
@@ -692,6 +643,7 @@ namespace Raven.Server.Web.System
                         }
 
                         await ServerStore.Cluster.WaitForIndexNotification(index, remaining);
+                        actualDeletionIndex = index;
                     }
                     catch (TimeoutException)
                     {
@@ -703,7 +655,10 @@ namespace Raven.Server.Web.System
                 {
                     context.Write(writer, new DynamicJsonValue
                     {
-                        [nameof(DeleteDatabaseResult.RaftCommandIndex)] = index,
+                        // we only send the successful index here, we might fail to delete the index
+                        // because a node is down, and we don't want to cause the client to wait on an
+                        // index that doesn't exists in the Raft log
+                        [nameof(DeleteDatabaseResult.RaftCommandIndex)] = actualDeletionIndex,
                         [nameof(DeleteDatabaseResult.PendingDeletes)] = new DynamicJsonArray(deletedDatabases)
                     });
                 }
@@ -895,7 +850,7 @@ namespace Raven.Server.Web.System
 
                 else
                 {
-                    throw new InvalidOperationException("'database' query string parmater not found, and 'serverScript' query string is not found. Don't know what to apply this script on");
+                    throw new InvalidOperationException("'database' query string parameter not found, and 'serverScript' query string is not found. Don't know what to apply this script on");
                 }
 
                 HttpContext.Response.StatusCode = (int)HttpStatusCode.OK;
@@ -948,7 +903,7 @@ namespace Raven.Server.Web.System
         }
 
         [RavenAction("/admin/compact", "POST", AuthorizationStatus.Operator)]
-        public Task CompactDatabase()
+        public async Task CompactDatabase()
         {
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
@@ -971,7 +926,7 @@ namespace Raven.Server.Web.System
                         throw new InvalidOperationException($"Cannot compact database {compactSettings.DatabaseName} on node {ServerStore.NodeTag}, because it doesn't reside on this node.");
                 }
 
-                var database = ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(compactSettings.DatabaseName).Result;
+                var database = await ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(compactSettings.DatabaseName).ConfigureAwait(false);
 
                 var token = new OperationCancelToken(ServerStore.ServerShutdown);
                 var compactDatabaseTask = new CompactDatabaseTask(
@@ -981,47 +936,57 @@ namespace Raven.Server.Web.System
 
                 var operationId = ServerStore.Operations.GetNextOperationId();
 
-                ServerStore.Operations.AddOperation(
+                var t = ServerStore.Operations.AddOperation(
                     null,
                     "Compacting database: " + compactSettings.DatabaseName,
                     Documents.Operations.Operations.OperationType.DatabaseCompact,
                     taskFactory: onProgress => Task.Run(async () =>
                     {
-                        using (token)
+                        try
                         {
-                            var before = CalculateStorageSizeInBytes(compactSettings.DatabaseName).Result / 1024 / 1024;
-                            var overallResult = new CompactionResult(compactSettings.DatabaseName);
-
-                            // first fill in data 
-                            foreach (var indexName in compactSettings.Indexes)
+                            using (token)
                             {
-                                var indexCompactionResult = new CompactionResult(indexName);
-                                overallResult.IndexesResults.Add(indexName, indexCompactionResult);
-                            }
+                                var before = (await CalculateStorageSize(compactSettings.DatabaseName)).GetValue(SizeUnit.Megabytes);
+                                var overallResult = new CompactionResult(compactSettings.DatabaseName);
 
-                            // then do actual compaction
-                            foreach (var indexName in compactSettings.Indexes)
-                            {
-                                var index = database.IndexStore.GetIndex(indexName);
-                                var indexCompactionResult = overallResult.IndexesResults[indexName];
-                                index.Compact(onProgress, (CompactionResult)indexCompactionResult);
-                                indexCompactionResult.Processed = true;
-                            }
+                                // first fill in data 
+                                foreach (var indexName in compactSettings.Indexes)
+                                {
+                                    var indexCompactionResult = new CompactionResult(indexName);
+                                    overallResult.IndexesResults.Add(indexName, indexCompactionResult);
+                                }
 
-                            if (!compactSettings.Documents)
-                            {
-                                overallResult.Skipped = true;
+                                // then do actual compaction
+                                foreach (var indexName in compactSettings.Indexes)
+                                {
+                                    var index = database.IndexStore.GetIndex(indexName);
+                                    var indexCompactionResult = overallResult.IndexesResults[indexName];
+                                    index.Compact(onProgress, (CompactionResult)indexCompactionResult);
+                                    indexCompactionResult.Processed = true;
+                                }
+
+                                if (compactSettings.Documents == false)
+                                {
+                                    overallResult.Skipped = true;
+                                    overallResult.Processed = true;
+                                    return overallResult;
+                                }
+
+                                await compactDatabaseTask.Execute(onProgress, overallResult);
                                 overallResult.Processed = true;
-                                return overallResult;
+
+                                overallResult.SizeAfterCompactionInMb = (await CalculateStorageSize(compactSettings.DatabaseName)).GetValue(SizeUnit.Megabytes);
+                                overallResult.SizeBeforeCompactionInMb = before;
+
+                                return (IOperationResult)overallResult;
                             }
+                        }
+                        catch (Exception e)
+                        {
+                            if (Logger.IsOperationsEnabled)
+                                Logger.Operations("Compaction process failed", e);
 
-                            await compactDatabaseTask.Execute(onProgress, overallResult);
-                            overallResult.Processed = true;
-
-                            overallResult.SizeAfterCompactionInMb = CalculateStorageSizeInBytes(compactSettings.DatabaseName).Result / 1024 / 1024;
-                            overallResult.SizeBeforeCompactionInMb = before;
-
-                            return (IOperationResult)overallResult;
+                            throw;
                         }
                     }, token.Token),
                     id: operationId, token: token);
@@ -1031,44 +996,13 @@ namespace Raven.Server.Web.System
                     writer.WriteOperationId(context, operationId);
                 }
             }
-            return Task.CompletedTask;
         }
 
-        public async Task<long> CalculateStorageSizeInBytes(string databaseName)
+        private async Task<Size> CalculateStorageSize(string databaseName)
         {
-            long sizeOnDiskInBytes = 0;
-
             var database = await ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(databaseName);
-            var storageEnvironments = database?.GetAllStoragesEnvironment();
-            if (storageEnvironments != null)
-            {
-                foreach (var environment in storageEnvironments)
-                {
-                    Transaction tx = null;
-                    try
-                    {
-                        try
-                        {
-                            tx = environment?.Environment.ReadTransaction();
-                        }
-                        catch (OperationCanceledException)
-                        {
-                            continue;
-                        }
-                        var storageReport = environment?.Environment.GenerateReport(tx);
-                        if (storageReport == null)
-                            continue;
 
-                        var journalSize = storageReport.Journals.Sum(j => j.AllocatedSpaceInBytes);
-                        sizeOnDiskInBytes += storageReport.DataFile.AllocatedSpaceInBytes + journalSize;
-                    }
-                    finally
-                    {
-                        tx?.Dispose();
-                    }
-                }
-            }
-            return sizeOnDiskInBytes;
+            return new Size(database.GetSizeOnDisk().Data.SizeInBytes, SizeUnit.Bytes);
         }
 
         [RavenAction("/admin/migrate", "POST", AuthorizationStatus.ClusterAdmin)]
@@ -1092,10 +1026,9 @@ namespace Raven.Server.Web.System
         [RavenAction("/admin/migrate/offline", "POST", AuthorizationStatus.ClusterAdmin)]
         public async Task MigrateDatabaseOffline()
         {
-            OfflineMigrationConfiguration configuration;
-
             ServerStore.EnsureNotPassive();
 
+            OfflineMigrationConfiguration configuration;
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
                 var migrationConfiguration = await context.ReadForMemoryAsync(RequestBodyStream(), "migration-configuration");
@@ -1160,63 +1093,69 @@ namespace Raven.Server.Web.System
                     {
                         try
                         {
-                            // send some initial progess so studio can open details 
-                            result.AddInfo("Starting migration");
-                            onProgress(overallProgress);
-
-                            while (true)
+                            using (database.PreventFromUnloading())
                             {
-                                var (hasTimeout, readMessage) = await ReadLineOrTimeout(process, timeout, configuration, token.Token);
-                                if (readMessage == null)
-                                {
-                                    // reached end of stream
-                                    break;
-                                }
-                                if (token.Token.IsCancellationRequested)
-                                    throw new TaskCanceledException("Was requested to cancel the offline migration task");
-                                if (hasTimeout)
-                                {
-                                    //renewing the timeout so not to spam timeouts once the timeout is reached
-                                    timeout = Task.Delay(configuration.Timeout.Value, token.Token);
-                                }
-
-                                result.AddInfo(readMessage);
+                                // send some initial progress so studio can open details 
+                                result.AddInfo("Starting migration");
+                                result.AddInfo($"Path of temporary export file: {tmpFile}");
                                 onProgress(overallProgress);
-                            }
 
-                            var ended = await processDone.WaitAsync(configuration.Timeout ?? TimeSpan.MaxValue);
-                            if (ended == false)
-                            {
-                                if (token.Token.IsCancellationRequested)
-                                    throw new TaskCanceledException("Was requested to cancel the offline migration process midway");
-                                token.Cancel(); //To release the MRE
-                                throw new TimeoutException($"After waiting for {configuration.Timeout.HasValue} the export tool didn't exit, aborting.");
-                            }
+                                while (true)
+                                {
+                                    var (hasTimeout, readMessage) = await ReadLineOrTimeout(process, timeout, configuration, token.Token);
+                                    if (readMessage == null)
+                                    {
+                                        // reached end of stream
+                                        break;
+                                    }
 
-                            if (process.ExitCode != 0)
-                            {
-                                throw new ApplicationException($"The data export tool have exited with code {process.ExitCode}.");
-                            }
+                                    if (token.Token.IsCancellationRequested)
+                                        throw new TaskCanceledException("Was requested to cancel the offline migration task");
+                                    if (hasTimeout)
+                                    {
+                                        //renewing the timeout so not to spam timeouts once the timeout is reached
+                                        timeout = Task.Delay(configuration.Timeout.Value, token.Token);
+                                    }
 
-                            result.DataExporter.Processed = true;
+                                    result.AddInfo(readMessage);
+                                    onProgress(overallProgress);
+                                }
 
-                            if (File.Exists(configuration.OutputFilePath) == false)
-                            {
-                                throw new FileNotFoundException($"Was expecting the output file to be located at {configuration.OutputFilePath}, but it is not there.");
-                            }
+                                var ended = await processDone.WaitAsync(configuration.Timeout ?? TimeSpan.MaxValue);
+                                if (ended == false)
+                                {
+                                    if (token.Token.IsCancellationRequested)
+                                        throw new TaskCanceledException("Was requested to cancel the offline migration process midway");
+                                    token.Cancel(); //To release the MRE
+                                    throw new TimeoutException($"After waiting for {configuration.Timeout.HasValue} the export tool didn't exit, aborting.");
+                                }
 
-                            result.AddInfo("Starting the import phase of the migration");
-                            onProgress(overallProgress);
-                            using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
-                            using (var reader = File.OpenRead(configuration.OutputFilePath))
-                            using (var stream = new GZipStream(reader, CompressionMode.Decompress))
-                            using (var source = new StreamSource(stream, context, database))
-                            {
-                                var destination = new DatabaseDestination(database);
-                                var smuggler = new DatabaseSmuggler(database, source, destination, database.Time, result: result, onProgress: onProgress,
-                                    token: token.Token);
+                                if (process.ExitCode != 0)
+                                {
+                                    throw new ApplicationException($"The data export tool have exited with code {process.ExitCode}.");
+                                }
 
-                                smuggler.Execute();
+                                result.DataExporter.Processed = true;
+
+                                if (File.Exists(configuration.OutputFilePath) == false)
+                                {
+                                    throw new FileNotFoundException(
+                                        $"Was expecting the output file to be located at {configuration.OutputFilePath}, but it is not there.");
+                                }
+
+                                result.AddInfo("Starting the import phase of the migration");
+                                onProgress(overallProgress);
+                                using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                                using (var reader = File.OpenRead(configuration.OutputFilePath))
+                                using (var stream = new GZipStream(reader, CompressionMode.Decompress))
+                                using (var source = new StreamSource(stream, context, database))
+                                {
+                                    var destination = new DatabaseDestination(database);
+                                    var smuggler = new DatabaseSmuggler(database, source, destination, database.Time, result: result, onProgress: onProgress,
+                                        token: token.Token);
+
+                                    smuggler.Execute();
+                                }
                             }
                         }
                         catch (Exception e)
@@ -1233,7 +1172,7 @@ namespace Raven.Server.Web.System
                         }
                         return (IOperationResult)result;
                     });
-                }, operationId, token);
+                }, operationId, token: token);
 
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))

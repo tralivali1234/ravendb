@@ -1,6 +1,7 @@
 ﻿using System;
 using System.IO;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations.Counters;
 using Raven.Client.Documents.Smuggler;
 using Raven.Client.ServerWide;
 using Raven.Server.Documents;
@@ -21,13 +22,14 @@ namespace Raven.Server.Smuggler.Documents.Data
         IDocumentActions Conflicts();
         IIndexActions Indexes();
         IKeyValueActions<long> Identities();
-        IKeyValueActions<BlittableJsonReaderObject> CompareExchange();
+        IKeyValueActions<BlittableJsonReaderObject> CompareExchange(JsonOperationContext context);
+        ICounterActions Counters();
     }
 
     public interface IDocumentActions : INewDocumentActions, IDisposable
     {
         void WriteDocument(DocumentItem item, SmugglerProgressBase.CountsWithLastEtag progress);
-        void WriteTombstone(DocumentTombstone tombstone, SmugglerProgressBase.CountsWithLastEtag progress);
+        void WriteTombstone(Tombstone tombstone, SmugglerProgressBase.CountsWithLastEtag progress);
         void WriteConflict(DocumentConflict conflict, SmugglerProgressBase.CountsWithLastEtag progress);
         void DeleteDocument(string id);
     }
@@ -42,6 +44,11 @@ namespace Raven.Server.Smuggler.Documents.Data
     {
         void WriteIndex(IndexDefinitionBase indexDefinition, IndexType indexType);
         void WriteIndex(IndexDefinition indexDefinition);
+    }
+
+    public interface ICounterActions : IDisposable
+    {
+        void WriteCounter(CounterDetail counterDetail);
     }
 
     public interface IKeyValueActions<in T> : IDisposable

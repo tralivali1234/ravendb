@@ -30,16 +30,16 @@ namespace SlowTests.Issues
                 {
                     var query = from u in session.Query<User>()
                                 where u.LastName == "Garcia"
-                                let detail = session.Load<Detail>($"details/{u.DetailShortId}")
+                                let detail = session.Load<Detail>("details/"+u.DetailShortId)
                                 select new
                                 {
                                     Name = u.Name,
                                     Detail = detail
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u) {
-	var detail = load(""details/{0}"".format(u.DetailShortId));
+	var detail = load((""details/""+u.DetailShortId));
 	return { Name : u.Name, Detail : detail };
 }
 from Users as u where u.LastName = $p0 select output(u)", query.ToString());
@@ -83,7 +83,7 @@ from Users as u where u.LastName = $p0 select output(u)", query.ToString());
                     };
                   
                     var query = from u in session.Query<User>()
-                                let detailId = $"d{u.Name.ElementAt(1)}ta{u.LastName.ElementAt(4)}ls{docInfo.Seperator}{u.DetailShortId}-{docInfo.Node}"
+                                let detailId = "d"+u.Name.ElementAt(1)+"ta"+u.LastName.ElementAt(4)+"ls"+docInfo.Seperator+u.DetailShortId+"-"+docInfo.Node
                                 select new
                                 {
                                     Name = u.Name,
@@ -91,9 +91,9 @@ from Users as u where u.LastName = $p0 select output(u)", query.ToString());
                                     Detail = session.Load<Detail>(detailId)
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, $p0, $p1) {
-	var detailId = ""d{0}ta{1}ls{2}{3}-{4}"".format(u.Name[1], u.LastName[4], $p0, u.DetailShortId, $p1);
+	var detailId = ""d""+u.Name[1]+""ta""+u.LastName[4]+""ls""+$p0+u.DetailShortId+""-""+$p1;
 	return { Name : u.Name, DetailId : detailId, Detail : load(detailId) };
 }
 from Users as u select output(u, $p0, $p1)", query.ToString());
@@ -131,7 +131,7 @@ from Users as u select output(u, $p0, $p1)", query.ToString());
                 using (var session = store.OpenSession())
                 {
                     var query = from u in session.Query<User>()
-                                let detailId = $"details/{u.DetailShortId}"
+                                let detailId = "details/"+u.DetailShortId
                                 let detail = session.Load<Detail>(detailId)
                                 select new
                                 {
@@ -139,9 +139,9 @@ from Users as u select output(u, $p0, $p1)", query.ToString());
                                     Detail = detail
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u) {
-	var detailId = ""details/{0}"".format(u.DetailShortId);
+	var detailId = ""details/""+u.DetailShortId;
 	var detail = load(detailId);
 	return { Name : u.Name, Detail : detail };
 }

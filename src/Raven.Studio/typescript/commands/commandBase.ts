@@ -8,7 +8,6 @@ import protractedCommandsDetector = require("common/notifications/protractedComm
 /// Commands encapsulate a read or write operation to the database and support progress notifications and common AJAX related functionality.
 class commandBase {
 
-    // TODO: better place for this?
     static ravenClientVersion = '4.1.0.0';
 
     execute(): JQueryPromise<any> {
@@ -105,6 +104,17 @@ class commandBase {
 
         const url = baseUrl ? baseUrl + appUrl.forDatabaseQuery(db) + relativeUrl : appUrl.forDatabaseQuery(db) + relativeUrl;
 
+        const xhrConfiguration = (xhr: XMLHttpRequest) => {
+            xhr.upload.addEventListener("progress", (evt: ProgressEvent) => {
+                if (evt.lengthComputable) {
+                    const percentComplete = (evt.loaded / evt.total) * 100;
+                    if (percentComplete < 100) {
+                        requestExecution.markProgress();
+                    }
+                }
+            }, false);
+        };
+        
         const defaultOptions = {
             url: url,
             data: args,
@@ -114,24 +124,23 @@ class commandBase {
             headers: <any>undefined,
             xhr: () => {
                 const xhr = new XMLHttpRequest();
-                xhr.upload.addEventListener("progress", (evt: ProgressEvent) => {
-                    if (evt.lengthComputable) {
-                        const percentComplete = (evt.loaded / evt.total) * 100;
-                        if (percentComplete < 100) {
-                            requestExecution.markProgress();
-                        }
-                        //TODO: use event
-                        ko.postbox.publish("UploadProgress", percentComplete);
-                    }
-                }, false);
-
+                xhrConfiguration(xhr);
                 return xhr;
             }
         };
         
         if (options) {
             for (let prop in options) {
-                (<any>defaultOptions)[prop] = (<any>options)[prop];
+                if (prop === "xhr") {
+                    (defaultOptions as any)["xhr"] = () => {
+                        const xhrFactory = (<any>options)["xhr"];
+                        const xhr = xhrFactory();
+                        xhrConfiguration(xhr);
+                        return xhr;
+                    }
+                } else {
+                    (<any>defaultOptions)[prop] = (<any>options)[prop];    
+                }
             }
         }
 
@@ -172,6 +181,34 @@ class commandBase {
 
     reportWarning(title: string, details?: string, httpStatusText?: string) {
         messagePublisher.reportWarning(title, details, httpStatusText);
+    }
+
+    static getOptionsForImport(isUploading: KnockoutObservable<boolean>, uploadStatus: KnockoutObservable<number>) : JQueryAjaxSettings {
+        const options: JQueryAjaxSettings = {
+            processData: false, // Prevents JQuery from automatically transforming the data into a query string. http://api.jquery.com/jQuery.ajax/
+            contentType: false,
+            cache: false,
+            dataType: "",
+            xhr: () => {
+                const xhr = new XMLHttpRequest();
+                xhr.upload.addEventListener("progress", (event: ProgressEvent) => {
+                    if (!isUploading() || !event.lengthComputable) {
+                        return;
+                    }
+
+                    const percentComplete = (event.loaded / event.total) * 100;
+                    if (percentComplete === 100) {
+                        setTimeout(() => isUploading(false), 700);
+                    }
+
+                    uploadStatus(percentComplete);
+                }, false);
+
+                return xhr;
+            }
+        };
+
+        return options;
     }
 }
 

@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using Raven.Client.Util;
+using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications;
+using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
@@ -26,12 +28,15 @@ namespace Raven.Server.NotificationCenter
 
         private TransactionContextPool _contextPool;
 
-        private readonly TableSchema _actionsSchema = new TableSchema();
+        internal readonly TableSchema _actionsSchema = new TableSchema();
 
         static NotificationsStorage()
         {
-            Slice.From(StorageEnvironment.LabelsContext, "ByCreatedAt", ByteStringType.Immutable, out ByCreatedAt);
-            Slice.From(StorageEnvironment.LabelsContext, "ByPostponedUntil", ByteStringType.Immutable, out ByPostponedUntil);
+            using (StorageEnvironment.GetStaticContext(out var ctx))
+            {
+                Slice.From(ctx, "ByCreatedAt", ByteStringType.Immutable, out ByCreatedAt);
+                Slice.From(ctx, "ByPostponedUntil", ByteStringType.Immutable, out ByPostponedUntil);
+            }
         }
 
         public NotificationsStorage(string resourceName)
@@ -69,33 +74,41 @@ namespace Raven.Server.NotificationCenter
 
                 tx.Commit();
             }
+
+            Cleanup();
         }
 
-        public bool Store(Notification notification)
+        public bool Store(Notification notification, DateTime? postponeUntil = null, bool updateExisting = true)
         {
-            if (Logger.IsInfoEnabled)
-                Logger.Info($"Saving notification '{notification.Id}'.");
-
             using (_contextPool.AllocateOperationContext(out TransactionOperationContext context))
-            using (var tx = context.OpenWriteTransaction())
             {
-                // if previous notification had postponed until value pass this value to newly saved notification
-                var existing = Get(notification.Id, context, tx);
-
-                DateTime? postponeUntil = null;
-
-                if (existing?.PostponedUntil == DateTime.MaxValue) // postponed until forever
-                    return false;
-
-                if (existing?.PostponedUntil != null && existing.PostponedUntil.Value > SystemTime.UtcNow)
-                    postponeUntil = existing.PostponedUntil;
-
-                using (var json = context.ReadObject(notification.ToJson(), "notification", BlittableJsonDocumentBuilder.UsageMode.ToDisk))
+                using (var tx = context.OpenReadTransaction())
                 {
-                    Store(context.GetLazyString(notification.Id), notification.CreatedAt, postponeUntil, json, tx);
+                    // if previous notification had postponed until value pass this value to newly saved notification
+                    var existing = Get(notification.Id, context, tx);
+
+                    if (existing != null && updateExisting == false)
+                        return false;
+
+                    if (postponeUntil == null)
+                    {
+                        if (existing?.PostponedUntil == DateTime.MaxValue) // postponed until forever
+                            return false;
+
+                        if (existing?.PostponedUntil != null && existing.PostponedUntil.Value > SystemTime.UtcNow)
+                            postponeUntil = existing.PostponedUntil;
+                    }
                 }
 
-                tx.Commit();
+                if (Logger.IsInfoEnabled)
+                    Logger.Info($"Saving notification '{notification.Id}'.");
+
+                using (var json = context.ReadObject(notification.ToJson(), "notification", BlittableJsonDocumentBuilder.UsageMode.ToDisk))
+                using (var tx = context.OpenWriteTransaction())
+                {
+                    Store(context.GetLazyString(notification.Id), notification.CreatedAt, postponeUntil, json, tx);
+                    tx.Commit();
+                }
             }
 
             return true;
@@ -235,6 +248,16 @@ namespace Raven.Server.NotificationCenter
 
         public long GetAlertCount()
         {
+            return GetNotificationCount(nameof(NotificationType.AlertRaised));
+        }
+
+        public long GetPerformanceHintCount()
+        {
+            return GetNotificationCount(nameof(NotificationType.PerformanceHint));
+        }
+
+        private long GetNotificationCount(string notificationType)
+        {
             var count = 0;
 
             using (_contextPool.AllocateOperationContext(out TransactionOperationContext context))
@@ -243,11 +266,11 @@ namespace Raven.Server.NotificationCenter
                 foreach (var action in ReadActionsByCreatedAtIndex(context))
                 {
                     if (action.Json.TryGetMember(nameof(Notification.Type), out object type) == false)
-                        throw new InvalidOperationException($"Could not find notification type. Notification: {action}");
+                        ThrowCouldNotFindNotificationType(action);
 
                     var typeLsv = (LazyStringValue)type;
 
-                    if (typeLsv.CompareTo(nameof(NotificationType.AlertRaised)) == 0)
+                    if (typeLsv.CompareTo(notificationType) == 0)
                         count++;
                 }
             }
@@ -281,7 +304,7 @@ namespace Raven.Server.NotificationCenter
             using (_contextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (var tx = context.OpenReadTransaction())
             {
-                var item =  Get(id, context, tx);
+                var item = Get(id, context, tx);
                 if (item == null)
                     return null;
                 item.Json.TryGet("Database", out string db);
@@ -304,12 +327,65 @@ namespace Raven.Server.NotificationCenter
                 Memory.Copy(itemCopy.Address, item.Json.BasePointer, item.Json.Size);
 
                 Store(context.GetLazyString(id), item.CreatedAt, postponeUntil,
-                    //we create a copy because we can't update directy from mutated memory
+                    //we create a copy because we can't update directly from mutated memory
                     new BlittableJsonReaderObject(itemCopy.Address, item.Json.Size, context)
                     , tx);
 
                 tx.Commit();
             }
+        }
+
+        private void Cleanup()
+        {
+            RemoveNewVersionAvailableAlertIfNecessary();
+        }
+
+        private void RemoveNewVersionAvailableAlertIfNecessary()
+        {
+            var buildNumber = ServerVersion.Build;
+
+            var id = AlertRaised.GetKey(AlertType.Server_NewVersionAvailable, null);
+            using (Read(id, out var ntv))
+            {
+                if (ntv == null)
+                    return;
+
+                var delete = true;
+
+                if (buildNumber != ServerVersion.DevBuildNumber)
+                {
+                    if (ntv.Json.TryGetMember(nameof(AlertRaised.Details), out var o)
+                        && o is BlittableJsonReaderObject detailsJson)
+                    {
+                        if (detailsJson.TryGetMember(nameof(NewVersionAvailableDetails.VersionInfo), out o)
+                            && o is BlittableJsonReaderObject newVersionDetailsJson)
+                        {
+                            var value = JsonDeserializationServer.LatestVersionCheckVersionInfo(newVersionDetailsJson);
+                            delete = value.BuildNumber <= buildNumber;
+                        }
+                    }
+                }
+
+                if (delete)
+                    Delete(id);
+            }
+        }
+
+        private static void ThrowCouldNotFindNotificationType(NotificationTableValue action)
+        {
+            string notificationJson;
+
+            try
+            {
+                notificationJson = action.Json.ToString();
+            }
+            catch (Exception e)
+            {
+                notificationJson = $"invalid json - {e.Message}";
+            }
+
+            throw new InvalidOperationException(
+                $"Could not find notification type. Notification: {notificationJson}, created at: {action.CreatedAt}, postponed until: {action.PostponedUntil}");
         }
 
         public static class NotificationsSchema

@@ -7,6 +7,7 @@ using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Net.NetworkInformation;
+using System.Security;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
@@ -25,11 +26,16 @@ using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Raven.Client;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Exceptions;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations.Certificates;
+using Raven.Client.ServerWide.Operations.Configuration;
 using Raven.Server.Config;
+using Raven.Server.Config.Categories;
+using Raven.Server.Extensions;
 using Raven.Server.Https;
 using Raven.Server.Json;
+using Raven.Server.Rachis;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Commands;
 using Raven.Server.ServerWide.Context;
@@ -42,13 +48,15 @@ using Sparrow.Logging;
 using Sparrow.Platform;
 using Sparrow.Platform.Posix;
 using Sparrow.Utils;
+using Voron.Platform.Posix;
+using OpenFlags = System.Security.Cryptography.X509Certificates.OpenFlags;
+using StudioConfiguration = Raven.Client.Documents.Operations.Configuration.StudioConfiguration;
 
 namespace Raven.Server.Commercial
 {
     public static class SetupManager
     {
         private static readonly Logger Logger = LoggingSource.Instance.GetLogger<LicenseManager>("Server");
-        public const string LocalNodeTag = "A";
         public const string GoogleDnsApi = "https://dns.google.com";
 
         public static string BuildHostName(string nodeTag, string userDomain, string rootDomain)
@@ -63,7 +71,7 @@ namespace Raven.Server.Commercial
 
             var acmeClient = new LetsEncryptClient(serverStore.Configuration.Core.AcmeUrl);
             await acmeClient.Init(email);
-            return await acmeClient.GetTermsOfServiceUri();
+            return acmeClient.GetTermsOfServiceUri();
         }
 
         public static async Task<IOperationResult> SetupSecuredTask(Action<IOperationProgress> onProgress, SetupInfo setupInfo, ServerStore serverStore, CancellationToken token)
@@ -126,7 +134,7 @@ namespace Raven.Server.Commercial
                 Logger.Operations($"Getting challenge(s) from Let's Encrypt. Using e-mail: {setupInfo.Email}.");
 
             var acmeClient = new LetsEncryptClient(serverStore.Configuration.Core.AcmeUrl);
-            await acmeClient.Init(setupInfo.Email);
+            await acmeClient.Init(setupInfo.Email, token);
 
             // here we explicitly want to refresh the cert, so we don't want it cached
             var cacheKeys = setupInfo.NodeSetupInfos.Select(node => BuildHostName(node.Key, setupInfo.Domain, setupInfo.RootDomain)).ToList();
@@ -137,10 +145,9 @@ namespace Raven.Server.Commercial
             if (Logger.IsOperationsEnabled)
                 Logger.Operations($"Updating DNS record(s) and challenge(s) in {setupInfo.Domain.ToLower()}.{setupInfo.RootDomain.ToLower()}.");
 
-
             try
             {
-                await UpdateDnsRecordsForCertificateRefreshTask(challengeResult.Challenges, setupInfo, token);
+                await UpdateDnsRecordsForCertificateRefreshTask(challengeResult.Challenge, setupInfo, token);
 
                 // Cache the current DNS topology so we can check it again
             }
@@ -184,11 +191,13 @@ namespace Raven.Server.Commercial
                 onProgress(progress);
 
                 byte[] zipBytes;
+                byte[] serverCertBytes;
                 X509Certificate2 serverCert;
                 X509Certificate2 clientCert;
                 BlittableJsonReaderObject settingsJsonObject;
                 License license;
                 Dictionary<string, string> otherNodesUrls;
+                string firstNodeTag;
 
                 try
                 {
@@ -207,7 +216,8 @@ namespace Raven.Server.Commercial
                 {
                     try
                     {
-                        settingsJsonObject = ExtractCertificatesAndSettingsJsonFromZip(zipBytes, continueSetupInfo.NodeTag, context, out serverCert, out clientCert, out otherNodesUrls, out license);
+                        settingsJsonObject = ExtractCertificatesAndSettingsJsonFromZip(zipBytes, continueSetupInfo.NodeTag, context, out serverCertBytes, 
+                            out serverCert, out clientCert, out firstNodeTag, out otherNodesUrls, out license);
                     }
                     catch (Exception e)
                     {
@@ -234,7 +244,8 @@ namespace Raven.Server.Commercial
 
                     try
                     {
-                        await CompleteConfigurationForNewNode(onProgress, progress, continueSetupInfo, settingsJsonObject, serverCert, clientCert, serverStore, otherNodesUrls, license);
+                        await CompleteConfigurationForNewNode(onProgress, progress, continueSetupInfo, settingsJsonObject, serverCertBytes, serverCert, 
+                            clientCert, serverStore, firstNodeTag, otherNodesUrls, license);
                     }
                     catch (Exception e)
                     {
@@ -256,21 +267,39 @@ namespace Raven.Server.Commercial
             return progress;
         }
 
-        public static BlittableJsonReaderObject ExtractCertificatesAndSettingsJsonFromZip(byte[] zipBytes, string nodeTag, JsonOperationContext context, out X509Certificate2 serverCert, out X509Certificate2 clientCert, out Dictionary<string, string> otherNodesUrls, out License license)
+        public static BlittableJsonReaderObject ExtractCertificatesAndSettingsJsonFromZip(byte[] zipBytes, string currentNodeTag, JsonOperationContext context, out byte[] certBytes, out X509Certificate2 serverCert, out X509Certificate2 clientCert, out string firstNodeTag, out Dictionary<string, string> otherNodesUrls, out License license)
         {
-            byte[] certBytes = null;
+            certBytes = null;
             byte[] clientCertBytes = null;
             BlittableJsonReaderObject currentNodeSettingsJson = null;
             license = null;
 
             otherNodesUrls = new Dictionary<string, string>();
 
+            firstNodeTag = "A";
+
             using (var msZip = new MemoryStream(zipBytes))
             using (var archive = new ZipArchive(msZip, ZipArchiveMode.Read, false))
             {
                 foreach (var entry in archive.Entries)
                 {
-                    if (entry.FullName.StartsWith($"{nodeTag}/") && entry.Name.EndsWith(".pfx"))
+                    // try to find setup.json file first, as we make decisions based on its contents 
+                    if (entry.Name.Equals("setup.json"))
+                    {
+                        var json = context.Read(entry.Open(), "license/json");
+
+                        SetupSettings setupSettings = JsonDeserializationServer.SetupSettings(json);
+                        firstNodeTag = setupSettings.Nodes[0].Tag;
+                        
+                        // Since we allow to customize node tags, we stored information about the order of nodes into setup.json file
+                        // The first node is the one in which the cluster should be initialized.
+                        // If the file isn't found, it means we are using a zip which was created in the old codebase => first node has the tag 'A'
+                    }
+                }
+                
+                foreach (var entry in archive.Entries)
+                {
+                    if (entry.FullName.StartsWith($"{currentNodeTag}/") && entry.Name.EndsWith(".pfx"))
                     {
                         using (var ms = new MemoryStream())
                         {
@@ -300,39 +329,46 @@ namespace Raven.Server.Commercial
                         {
                             settingsJson.TryGet(RavenConfiguration.GetKey(x => x.Core.PublicServerUrl), out string publicServerUrl);
                             
-                            if (entry.FullName.StartsWith($"{nodeTag}/"))
+                            if (entry.FullName.StartsWith($"{currentNodeTag}/"))
                             {
                                 currentNodeSettingsJson = settingsJson.Clone(context);
                             }
 
-                            if (entry.FullName.StartsWith("A/") == false && publicServerUrl != null)
-                                otherNodesUrls.Add(entry.FullName[0].ToString(), publicServerUrl);
+                            // This is for the case where we take the zip file and use it to setup the first node as well.
+                            // If this is the first node, we must collect the urls of the other nodes so that
+                            // we will be able to add them to the cluster when we bootstrap the cluster.
+                            if (entry.FullName.StartsWith(firstNodeTag + "/") == false && publicServerUrl != null)
+                            {
+                                var tag = entry.FullName.Substring(0, entry.FullName.Length - "/settings.json".Length);
+                                otherNodesUrls.Add(tag, publicServerUrl);
+                            }
+                                
                         }
                     }
                 }
             }
 
             if (certBytes == null)
-                throw new InvalidOperationException($"Could not extract the server certificate of node '{nodeTag}'. Are you using the correct zip file?");
+                throw new InvalidOperationException($"Could not extract the server certificate of node '{currentNodeTag}'. Are you using the correct zip file?");
             if (clientCertBytes == null)
                 throw new InvalidOperationException("Could not extract the client certificate. Are you using the correct zip file?");
             if (currentNodeSettingsJson == null)
-                throw new InvalidOperationException($"Could not extract settings.json of node '{nodeTag}'. Are you using the correct zip file?");
+                throw new InvalidOperationException($"Could not extract settings.json of node '{currentNodeTag}'. Are you using the correct zip file?");
 
             try
             {
                 currentNodeSettingsJson.TryGet(RavenConfiguration.GetKey(x => x.Security.CertificatePassword), out string certPassword);
 
-                serverCert = new X509Certificate2(certBytes, certPassword, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+                serverCert = new X509Certificate2(certBytes, certPassword, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
             }
             catch (Exception e)
             {
-                throw new InvalidOperationException($"Unable to load the server certificate of node '{nodeTag}'.", e);
+                throw new InvalidOperationException($"Unable to load the server certificate of node '{currentNodeTag}'.", e);
             }
 
             try
             {
-                clientCert = new X509Certificate2(clientCertBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+                clientCert = new X509Certificate2(clientCertBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
             }
             catch (Exception e)
             {
@@ -340,6 +376,22 @@ namespace Raven.Server.Commercial
             }
 
             return currentNodeSettingsJson;
+        }
+
+        public static async Task<LicenseStatus> GetUpdatedLicenseStatus(ServerStore serverStore, License currentLicense, Reference<License> updatedLicense = null)
+        {
+            var license = 
+                await serverStore.LicenseManager.GetUpdatedLicense(currentLicense).ConfigureAwait(false)
+                ?? currentLicense;
+
+            var licenseStatus = serverStore.LicenseManager.GetLicenseStatus(license);
+            if (licenseStatus.Expired)
+                throw new LicenseExpiredException($"The provided license for {license.Name} has expired ({licenseStatus.Expiration})");
+
+            if (updatedLicense != null)
+                updatedLicense.Value = license;
+
+            return licenseStatus;
         }
 
         public static async Task<IOperationResult> SetupLetsEncryptTask(Action<IOperationProgress> onProgress, SetupInfo setupInfo, ServerStore serverStore, CancellationToken token)
@@ -352,10 +404,9 @@ namespace Raven.Server.Commercial
 
             try
             {
-                var licenseStatus = serverStore.LicenseManager.GetLicenseStatus(setupInfo.License);
-
-                if (licenseStatus.Expired)
-                    throw new InvalidOperationException("The provided license for " + setupInfo.License.Name + " has expired (" + licenseStatus.Expiration + ")");
+                var updatedLicense = new Reference<License>();
+                await GetUpdatedLicenseStatus(serverStore, setupInfo.License, updatedLicense).ConfigureAwait(false);
+                setupInfo.License = updatedLicense.Value;
 
                 AssertNoClusterDefined(serverStore);
 
@@ -379,7 +430,7 @@ namespace Raven.Server.Commercial
                 var challengeResult = await InitialLetsEncryptChallenge(setupInfo, acmeClient, token);
 
                 progress.Processed++;
-                progress.AddInfo(challengeResult.Challenges != null
+                progress.AddInfo(challengeResult.Challenge != null
                     ? "Successfully received challenge(s) information from Let's Encrypt."
                     : "Using cached Let's Encrypt certificate.");
 
@@ -389,7 +440,7 @@ namespace Raven.Server.Commercial
 
                 try
                 {
-                    await UpdateDnsRecordsTask(onProgress, progress, challengeResult.Challenges, setupInfo, token);
+                    await UpdateDnsRecordsTask(onProgress, progress, challengeResult.Challenge, setupInfo, token);
                 }
                 catch (Exception e)
                 {
@@ -493,10 +544,10 @@ namespace Raven.Server.Commercial
             await serverStore.Cluster.WaitForIndexNotification(res.Index);
         }
 
-        private static async Task<X509Certificate2> CompleteAuthorizationAndGetCertificate(Action onValdiationSuccessful, SetupInfo setupInfo,  LetsEncryptClient client, 
-            (Dictionary<string, string> Challanges, LetsEncryptClient.CachedCertificateResult Cache) challengeResult,  CancellationToken token)
+        private static async Task<X509Certificate2> CompleteAuthorizationAndGetCertificate(Action onValidationSuccessful, SetupInfo setupInfo,  LetsEncryptClient client, 
+            (string Challange, LetsEncryptClient.CachedCertificateResult Cache) challengeResult,  CancellationToken token)
         {
-            if (challengeResult.Challanges == null && challengeResult.Cache != null)
+            if (challengeResult.Challange == null && challengeResult.Cache != null)
             {
                 return BuildNewPfx(setupInfo, challengeResult.Cache.Certificate, challengeResult.Cache.PrivateKey);
             }
@@ -510,17 +561,17 @@ namespace Raven.Server.Commercial
                 throw new InvalidOperationException("Failed to Complete Let's Encrypt challenge(s).", e);
             }
 
-            onValdiationSuccessful();
+            onValidationSuccessful();
 
 
-            (byte[] Cert, RSA PrivateKey) result;
+            (X509Certificate2 Cert, RSA PrivateKey) result;
             try
             {
                 result = await client.GetCertificate(token);
             }
             catch (Exception e)
             {
-                throw new InvalidOperationException("Failed to aquire certificate from Let's Encrypt.", e);
+                throw new InvalidOperationException("Failed to acquire certificate from Let's Encrypt.", e);
             }
 
             try
@@ -533,9 +584,8 @@ namespace Raven.Server.Commercial
             }
         }
 
-        private static X509Certificate2 BuildNewPfx(SetupInfo setupInfo, byte[] cert, RSA privateKey)
+        private static X509Certificate2 BuildNewPfx(SetupInfo setupInfo, X509Certificate2 certificate, RSA privateKey)
         {
-            var certificate = new X509Certificate2(cert);
             var certWithKey = certificate.CopyWithPrivateKey(privateKey);
 
             Pkcs12Store store = new Pkcs12StoreBuilder().Build();
@@ -564,34 +614,26 @@ namespace Raven.Server.Commercial
             Debug.Assert(certBytes != null);
             setupInfo.Certificate = Convert.ToBase64String(certBytes);
 
-            return new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable);
+            return new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
         }
 
-        private static async Task<(Dictionary<string, string> Challenges, LetsEncryptClient.CachedCertificateResult Cache)> InitialLetsEncryptChallenge(
+        private static async Task<(string Challenge, LetsEncryptClient.CachedCertificateResult Cache)> InitialLetsEncryptChallenge(
             SetupInfo setupInfo, 
             LetsEncryptClient client, 
             CancellationToken token)
         {
             try
             {
-                var hosts = new List<string>();
-                foreach (var tag in setupInfo.NodeSetupInfos)
-                {
-                    hosts.Add(BuildHostName(tag.Key, setupInfo.Domain, setupInfo.RootDomain));
-                }
-
-                hosts.Sort(); // ensure stable sorting 
-
-                if (client.TryGetCachedCertificate(hosts, out var certBytes))
+                var host = (setupInfo.Domain + "." + setupInfo.RootDomain).ToLowerInvariant() ;
+                var wildcardHost = "*." + host;
+                if (client.TryGetCachedCertificate(wildcardHost, out var certBytes))
                     return (null, certBytes);
 
-                var challenges = new Dictionary<string, string>();
-                foreach (var tag in setupInfo.NodeSetupInfos)
-                {
-                    challenges[tag.Key] = await client.GetDnsChallenge(BuildHostName(tag.Key, setupInfo.Domain, setupInfo.RootDomain), token);
-                }
+                var result = await client.NewOrder(new[] { wildcardHost }, token);
 
-                return (challenges, null);
+                result.TryGetValue(host, out var challenge);
+                // we may already be authorized for this? 
+                return (challenge, null);
 
             }
             catch (Exception e)
@@ -608,7 +650,7 @@ namespace Raven.Server.Commercial
         }
 
         private static async Task UpdateDnsRecordsForCertificateRefreshTask(
-            Dictionary<string, string> map,
+            string challenge,
             SetupInfo setupInfo, CancellationToken token)
         {
             using (var cts = CancellationTokenSource.CreateLinkedTokenSource(token, new CancellationTokenSource(TimeSpan.FromMinutes(15)).Token))
@@ -617,6 +659,7 @@ namespace Raven.Server.Commercial
                 {
                     License = setupInfo.License,
                     Domain = setupInfo.Domain,
+                    Challenge = challenge,
                     RootDomain = setupInfo.RootDomain,
                     SubDomains = new List<RegistrationNodeInfo>()
                 };
@@ -626,7 +669,6 @@ namespace Raven.Server.Commercial
                     var regNodeInfo = new RegistrationNodeInfo
                     {
                         SubDomain = (node.Key + "." + setupInfo.Domain).ToLower(),
-                        Challenge = map[node.Key]
                     };
 
                     registrationInfo.SubDomains.Add(regNodeInfo);
@@ -635,7 +677,10 @@ namespace Raven.Server.Commercial
                 var serializeObject = JsonConvert.SerializeObject(registrationInfo);
 
                 if (Logger.IsOperationsEnabled)
-                    Logger.Operations("Start update process for certificate: " + serializeObject);
+                    Logger.Operations($"Start update process for certificate. License Id: {registrationInfo.License.Id}, " +
+                                      $"License Name: {registrationInfo.License.Name}, " +
+                                      $"Domain: {registrationInfo.Domain}, " +
+                                      $"RootDomain: {registrationInfo.RootDomain}");
 
                 HttpResponseMessage response;
                 try
@@ -699,7 +744,7 @@ namespace Raven.Server.Commercial
         private static async Task UpdateDnsRecordsTask(
             Action<IOperationProgress> onProgress,
             SetupProgressAndResult progress,
-            Dictionary<string, string> map,
+            string challenge,
             SetupInfo setupInfo,
             CancellationToken token)
         {
@@ -709,13 +754,14 @@ namespace Raven.Server.Commercial
                 {
                     License = setupInfo.License,
                     Domain = setupInfo.Domain,
+                    Challenge = challenge,
                     RootDomain = setupInfo.RootDomain,
                     SubDomains = new List<RegistrationNodeInfo>()
                 };
 
+
                 foreach (var node in setupInfo.NodeSetupInfos)
                 {
-
                     var regNodeInfo = new RegistrationNodeInfo
                     {
                         SubDomain = (node.Key + "." + setupInfo.Domain).ToLower(),
@@ -727,36 +773,13 @@ namespace Raven.Server.Commercial
                             }
                     };
 
-                    if (map == null)
-                    {
-                        // this means that we already have a cached certificate, so we just need to check if we need to update
-                        // the DNS records.
-                        try
-                        {
-                            var existing = Dns.GetHostAddresses(BuildHostName(node.Key, setupInfo.Domain, setupInfo.RootDomain))
-                                .Select(ip => ip.ToString())
-                                .ToList();
-                            if (node.Value.Addresses.All(existing.Contains))
-                                continue; // we can skip this
-                        }
-                        catch (Exception)
-                        {
-                            // it is expected that this won't exists
-                        }
-                        regNodeInfo.Challenge = "dummy value";
-                    }
-                    else
-                    {
-                        regNodeInfo.Challenge = map[node.Key];
-                    }
-
                     registrationInfo.SubDomains.Add(regNodeInfo);
                 }
                 progress.AddInfo($"Creating DNS record/challenge for node(s): {string.Join(", ", setupInfo.NodeSetupInfos.Keys)}.");
 
                 onProgress(progress);
 
-                if (registrationInfo.SubDomains.Count == 0)
+                if (registrationInfo.SubDomains.Count == 0 && registrationInfo.Challenge == null)
                 {
                     // no need to update anything, can skip doing DNS update
                     progress.AddInfo("Cached DNS values matched, skipping DNS update");
@@ -788,11 +811,14 @@ namespace Raven.Server.Commercial
                         $"Got unsuccessful response from registration request: {response.StatusCode}.{Environment.NewLine}{responseString}");
                 }
 
-
-                if (map == null && registrationInfo.SubDomains.Exists(x => x.SubDomain.StartsWith("A.", StringComparison.OrdinalIgnoreCase)) == false)
+                if (challenge == null)
                 {
-                    progress.AddInfo("DNS update started successfully, since current node (A) DNS record didn't change, not waiting for full DNS propogation.");
-                    return;
+                    var existingSubDomain = registrationInfo.SubDomains.FirstOrDefault(x => x.SubDomain.StartsWith(setupInfo.LocalNodeTag + ".", StringComparison.OrdinalIgnoreCase));
+                    if (existingSubDomain != null && new HashSet<string>(existingSubDomain.Ips).SetEquals(setupInfo.NodeSetupInfos[setupInfo.LocalNodeTag].Addresses))
+                    {
+                        progress.AddInfo("DNS update started successfully, since current node (" + setupInfo.LocalNodeTag + ") DNS record didn't change, not waiting for full DNS propagation."); 
+                        return;
+                    }
                 }
 
                 var id = JsonConvert.DeserializeObject<Dictionary<string, string>>(responseString).First().Value;
@@ -854,7 +880,7 @@ namespace Raven.Server.Commercial
 
         public static async Task AssertLocalNodeCanListenToEndpoints(SetupInfo setupInfo, ServerStore serverStore)
         {
-            var localNode = setupInfo.NodeSetupInfos[LocalNodeTag];
+            var localNode = setupInfo.NodeSetupInfos[setupInfo.LocalNodeTag];
             var localIps = new List<IPEndPoint>();
 
             // Because we can get from user either an ip or a hostname, we resolve the hostname and get the actual ips it is mapped to 
@@ -874,8 +900,18 @@ namespace Raven.Server.Commercial
             var currentServerEndpoints = serverStore.Server.ListenEndpoints.Addresses.Select(ip => new IPEndPoint(ip, serverStore.Server.ListenEndpoints.Port)).ToArray();
 
             var ipProperties = IPGlobalProperties.GetIPGlobalProperties();
-            var activeTcpListeners = ipProperties.GetActiveTcpListeners();
-
+            IPEndPoint[] activeTcpListeners;
+            try
+            {
+                activeTcpListeners = ipProperties.GetActiveTcpListeners();
+            }
+            catch (Exception)
+            {
+                // If GetActiveTcpListeners is not supported, skip the validation
+                // See https://github.com/dotnet/corefx/issues/30909
+                return;
+            }
+            
             foreach (var requestedEndpoint in requestedEndpoints)
             {
                 if (activeTcpListeners.Contains(requestedEndpoint))
@@ -883,14 +919,16 @@ namespace Raven.Server.Commercial
                     if (currentServerEndpoints.Contains(requestedEndpoint))
                         continue; // OK... used by the current server
 
-                    throw new InvalidOperationException($"The requested endpoint '{requestedEndpoint.Address}:{requestedEndpoint.Port}' is already in use by another process. You may go back in the wizard, change the settings and try again.");
+                    throw new InvalidOperationException(
+                        $"The requested endpoint '{requestedEndpoint.Address}:{requestedEndpoint.Port}' is already in use by another process. You may go back in the wizard, change the settings and try again.");
                 }
             }
+            
         }
 
         public static async Task ValidateServerCanRunWithSuppliedSettings(SetupInfo setupInfo, ServerStore serverStore, SetupMode setupMode, CancellationToken token)
         {
-            var localNode = setupInfo.NodeSetupInfos[LocalNodeTag];
+            var localNode = setupInfo.NodeSetupInfos[setupInfo.LocalNodeTag];
             var localIps = new List<IPEndPoint>();
 
             foreach (var hostnameOrIp in localNode.Addresses)
@@ -907,7 +945,7 @@ namespace Raven.Server.Commercial
 
             var serverCert = setupInfo.GetX509Certificate();
 
-            var localServerUrl = GetServerUrlFromCertificate(serverCert, setupInfo, LocalNodeTag, localNode.Port, localNode.TcpPort, out _, out _);
+            var localServerUrl = GetServerUrlFromCertificate(serverCert, setupInfo, setupInfo.LocalNodeTag, localNode.Port, localNode.TcpPort, out _, out _);
 
             try
             {
@@ -933,7 +971,7 @@ namespace Raven.Server.Commercial
                 }
 
                 // Here we send the actual ips we will bind to in the local machine.
-                await SimulateRunningServer(serverCert, localServerUrl, localIps.ToArray(), localNode.Port, serverStore.Configuration.ConfigPath, setupMode, token);
+                await SimulateRunningServer(serverCert, localServerUrl, setupInfo.LocalNodeTag, localIps.ToArray(), localNode.Port, serverStore.Configuration.ConfigPath, setupMode, token);
             }
             catch (Exception e)
             {
@@ -989,7 +1027,7 @@ namespace Raven.Server.Commercial
                 }
 
                 // Here we send the actual ips we will bind to in the local machine.
-                await SimulateRunningServer(cert, publicServerUrl, localIps.ToArray(), port, serverStore.Configuration.ConfigPath, setupMode, token);
+                await SimulateRunningServer(cert, publicServerUrl, nodeTag, localIps.ToArray(), port, serverStore.Configuration.ConfigPath, setupMode, token);
             }
             catch (Exception e)
             {
@@ -1001,7 +1039,7 @@ namespace Raven.Server.Commercial
         {
             if (SetupParameters.Get(serverStore).IsDocker)
             {
-                if (setupInfo.NodeSetupInfos[LocalNodeTag].Addresses.Any(ip => ip.StartsWith("127.")))
+                if (setupInfo.NodeSetupInfos[setupInfo.LocalNodeTag].Addresses.Any(ip => ip.StartsWith("127.")))
                 {
                     throw new InvalidOperationException("When the server is running in Docker, you cannot bind to ip 127.X.X.X, please use the hostname instead.");
                 }
@@ -1009,8 +1047,8 @@ namespace Raven.Server.Commercial
 
             if (setupMode == SetupMode.LetsEncrypt)
             {
-                if (setupInfo.NodeSetupInfos.ContainsKey(LocalNodeTag) == false)
-                    throw new ArgumentException($"At least one of the nodes must have the node tag '{LocalNodeTag}'.");
+                if (setupInfo.NodeSetupInfos.ContainsKey(setupInfo.LocalNodeTag) == false)
+                    throw new ArgumentException($"At least one of the nodes must have the node tag '{setupInfo.LocalNodeTag}'.");
                 if (IsValidEmail(setupInfo.Email) == false)
                     throw new ArgumentException("Invalid email address.");
                 if (IsValidDomain(setupInfo.Domain + "." + setupInfo.RootDomain) == false)
@@ -1022,8 +1060,7 @@ namespace Raven.Server.Commercial
 
             foreach (var node in setupInfo.NodeSetupInfos)
             {
-                if (string.IsNullOrWhiteSpace(node.Key) || node.Key.Length != 1 || !char.IsLetter(node.Key[0]) || !char.IsUpper(node.Key[0]))
-                    throw new ArgumentException("Node Tag [A-Z] (capital) is a mandatory property for a secured setup");
+                Leader.ValidateNodeTag(node.Key);
 
                 if (node.Value.Port == 0)
                     setupInfo.NodeSetupInfos[node.Key].Port = 443;
@@ -1079,18 +1116,33 @@ namespace Raven.Server.Commercial
 
         public static void WriteSettingsJsonLocally(string settingsPath, string json)
         {
-            var tmpPath = settingsPath + ".tmp";
-            using (var file = SafeFileStream.Create(tmpPath, FileMode.Create))
-            using (var writer = new StreamWriter(file))
+            var tmpPath = string.Empty;
+            try
             {
-                writer.Write(json);
-                writer.Flush();
-                file.Flush(true);
+                tmpPath = settingsPath + ".tmp";
+                using (var file = SafeFileStream.Create(tmpPath, FileMode.Create))
+                using (var writer = new StreamWriter(file))
+                {
+                    writer.Write(json);
+                    writer.Flush();
+                    file.Flush(true);
+                }
+            }       
+            catch (Exception e) when (e is UnauthorizedAccessException || e is SecurityException)
+            {
+                throw new UnsuccessfulFileAccessException(e, tmpPath, FileAccess.Write);
             }
 
-            File.Replace(tmpPath, settingsPath, settingsPath + ".bak");
-            if (PlatformDetails.RunningOnPosix)
-                Syscall.FsyncDirectoryFor(settingsPath);
+            try
+            {
+                File.Replace(tmpPath, settingsPath, settingsPath + ".bak");
+                if (PlatformDetails.RunningOnPosix)
+                    Syscall.FsyncDirectoryFor(settingsPath);
+            }
+            catch (UnauthorizedAccessException e)
+            {
+                throw new UnsuccessfulFileAccessException(e, settingsPath, FileAccess.Write);
+            }
         }
 
         private static string GetServerUrlFromCertificate(X509Certificate2 cert, SetupInfo setupInfo, string nodeTag, int port, int tcpPort, out string publicTcpUrl, out string domain)
@@ -1149,7 +1201,7 @@ namespace Raven.Server.Commercial
 
         public static IEnumerable<string> GetCertificateAlternativeNames(X509Certificate2 cert)
         {
-            // If we have alternative names, find the apropriate url using the node tag
+            // If we have alternative names, find the appropriate url using the node tag
             var sanNames = cert.Extensions["2.5.29.17"];
 
             if (sanNames == null)
@@ -1168,9 +1220,11 @@ namespace Raven.Server.Commercial
             SetupProgressAndResult progress,
             ContinueSetupInfo continueSetupInfo,
             BlittableJsonReaderObject settingsJsonObject,
+            byte[] serverCertBytes,
             X509Certificate2 serverCert,
             X509Certificate2 clientCert,
             ServerStore serverStore,
+            string firstNodeTag,
             Dictionary<string, string> otherNodesUrls,
             License license)
         {
@@ -1189,11 +1243,11 @@ namespace Raven.Server.Commercial
             settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.SetupMode), out SetupMode setupMode);
             settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Security.CertificatePath), out string certificateFileName);
 
-            serverStore.Server.Certificate = SecretProtection.ValidateCertificateAndCreateCertificateHolder("Setup", serverCert, serverCert.Export(X509ContentType.Pfx, certPassword), certPassword, serverStore);
+            serverStore.Server.Certificate = SecretProtection.ValidateCertificateAndCreateCertificateHolder("Setup", serverCert, serverCertBytes, certPassword, serverStore);
             
-            if (continueSetupInfo.NodeTag.Equals("A"))
+            if (continueSetupInfo.NodeTag.Equals(firstNodeTag))
             {
-                serverStore.EnsureNotPassive(publicServerUrl);
+                serverStore.EnsureNotPassive(publicServerUrl, firstNodeTag);
 
                 await DeleteAllExistingCertificates(serverStore);
 
@@ -1214,8 +1268,6 @@ namespace Raven.Server.Commercial
                         throw new InvalidOperationException($"Failed to add node '{continueSetupInfo.NodeTag}' to the cluster.", e);
                     }
                 }
-
-                serverStore.EnsureServerCertificateIsInClusterState("Cluster-Wide Certificate");
             }
 
             progress.AddInfo("Registering client certificate in the local server.");
@@ -1233,7 +1285,7 @@ namespace Raven.Server.Commercial
 
             try
             {
-                if (continueSetupInfo.NodeTag.Equals("A"))
+                if (continueSetupInfo.NodeTag.Equals(firstNodeTag))
                 {
                     var res = await serverStore.PutValueInClusterAsync(new PutCertificateCommand(Constants.Certificates.Prefix + clientCert.Thumbprint, certDef));
                     await serverStore.Cluster.WaitForIndexNotification(res.Index);
@@ -1270,7 +1322,7 @@ namespace Raven.Server.Commercial
 
                 using (var certfile = SafeFileStream.Create(certPath, FileMode.Create))
                 {
-                    var certBytes = serverCert.Export(X509ContentType.Pfx, certPassword);
+                    var certBytes = serverCertBytes;
                     certfile.Write(certBytes, 0, certBytes.Length);
                     certfile.Flush(true);
                 }
@@ -1324,10 +1376,11 @@ namespace Raven.Server.Commercial
                         {
                             var base64 = setupInfo.Certificate;
                             serverCertBytes = Convert.FromBase64String(base64);
-                            serverCert = new X509Certificate2(serverCertBytes, setupInfo.Password, X509KeyStorageFlags.Exportable);
+                            serverCert = new X509Certificate2(serverCertBytes, setupInfo.Password, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
 
-                            publicServerUrl = GetServerUrlFromCertificate(serverCert, setupInfo, LocalNodeTag, setupInfo.NodeSetupInfos[LocalNodeTag].Port,
-                                setupInfo.NodeSetupInfos[LocalNodeTag].TcpPort, out var _, out domainFromCert);
+                            var localNodeTag = setupInfo.LocalNodeTag;
+                            publicServerUrl = GetServerUrlFromCertificate(serverCert, setupInfo, localNodeTag, setupInfo.NodeSetupInfos[localNodeTag].Port,
+                                setupInfo.NodeSetupInfos[localNodeTag].TcpPort, out _, out domainFromCert);
 
                             try
                             {
@@ -1339,7 +1392,7 @@ namespace Raven.Server.Commercial
                                 throw new InvalidOperationException("Failed to delete previous cluster topology during setup.", e);
                             }
 
-                            serverStore.EnsureNotPassive(publicServerUrl);
+                            serverStore.EnsureNotPassive(publicServerUrl, setupInfo.LocalNodeTag);
 
                             await DeleteAllExistingCertificates(serverStore);
 
@@ -1351,14 +1404,14 @@ namespace Raven.Server.Commercial
 
                             foreach (var node in setupInfo.NodeSetupInfos)
                             {
-                                if (node.Key == LocalNodeTag)
+                                if (node.Key == setupInfo.LocalNodeTag)
                                     continue;
 
                                 progress.AddInfo($"Adding node '{node.Key}' to the cluster.");
                                 onProgress(progress);
 
                                 setupInfo.NodeSetupInfos[node.Key].PublicServerUrl = GetServerUrlFromCertificate(serverCert, setupInfo, node.Key, node.Value.Port,
-                                    node.Value.TcpPort, out var _, out var _);
+                                    node.Value.TcpPort, out _, out _);
 
                                 try
                                 {
@@ -1369,7 +1422,6 @@ namespace Raven.Server.Commercial
                                     throw new InvalidOperationException($"Failed to add node '{node.Key}' to the cluster.", e);
                                 }
                             }
-                            serverStore.EnsureServerCertificateIsInClusterState("Cluster-Wide Certificate");
                         }
                         catch (Exception e)
                         {
@@ -1390,7 +1442,7 @@ namespace Raven.Server.Commercial
                             // requires server certificate to be loaded
                             var clientCertificateName = $"{name}.client.certificate";
                             certBytes = await GenerateCertificateTask(clientCertificateName, serverStore);
-                            clientCert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet);
+                            clientCert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.Exportable | X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.MachineKeySet);
                         }
                         catch (Exception e)
                         {
@@ -1404,6 +1456,11 @@ namespace Raven.Server.Commercial
                         try
                         {
                             var entry = archive.CreateEntry($"admin.client.certificate.{name}.pfx");
+
+                            // Structure of external attributes field: https://unix.stackexchange.com/questions/14705/the-zip-formats-external-file-attribute/14727#14727
+                            // The permissions go into the most significant 16 bits of an int
+                            entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
+
                             using (var entryStream = entry.Open())
                             {
                                 var export = clientCert.Export(X509ContentType.Pfx);
@@ -1433,6 +1490,8 @@ namespace Raven.Server.Commercial
                                 var licenseString = JsonConvert.SerializeObject(setupInfo.License, Formatting.Indented);
 
                                 var entry = archive.CreateEntry("license.json");
+                                entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
+
                                 using (var entryStream = entry.Open())
                                 using (var writer = new StreamWriter(entryStream))
                                 {
@@ -1447,6 +1506,21 @@ namespace Raven.Server.Commercial
                         }
 
                         settingsJson.Modifications[RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString();
+
+                        if (setupInfo.EnableExperimentalFeatures)
+                        {
+                            settingsJson.Modifications[RavenConfiguration.GetKey(x => x.Core.FeaturesAvailability)] = FeaturesAvailability.Experimental;
+                        }
+
+                        if (setupInfo.Environment != StudioConfiguration.StudioEnvironment.None)
+                        {
+                            var res = await serverStore.PutValueInClusterAsync(new PutServerWideStudioConfigurationCommand(new ServerWideStudioConfiguration
+                            {
+                                Disabled = false,
+                                Environment = setupInfo.Environment
+                            }));
+                            await serverStore.Cluster.WaitForIndexNotification(res.Index);
+                        }
 
                         var certificateFileName = $"cluster.server.certificate.{name}.pfx";
 
@@ -1494,7 +1568,7 @@ namespace Raven.Server.Commercial
                             var modifiedJsonObj = context.ReadObject(currentNodeSettingsJson, "modified-settings-json");
 
                             var indentedJson = IndentJsonString(modifiedJsonObj.ToString());
-                            if (node.Key == LocalNodeTag && setupInfo.ModifyLocalServer)
+                            if (node.Key == setupInfo.LocalNodeTag && setupInfo.ModifyLocalServer)
                             {
                                 try
                                 {
@@ -1511,6 +1585,8 @@ namespace Raven.Server.Commercial
                             try
                             {
                                 var entry = archive.CreateEntry($"{node.Key}/settings.json");
+                                entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
+
                                 using (var entryStream = entry.Open())
                                 using (var writer = new StreamWriter(entryStream))
                                 {
@@ -1521,6 +1597,8 @@ namespace Raven.Server.Commercial
                                 // we save this multiple times on each node, to make it easier 
                                 // to deploy by just copying the node
                                 entry = archive.CreateEntry($"{node.Key}/{certificateFileName}");
+                                entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
+
                                 using (var entryStream = entry.Open())
                                 {
                                     entryStream.Write(serverCertBytes, 0, serverCertBytes.Length);
@@ -1534,12 +1612,14 @@ namespace Raven.Server.Commercial
 
                         progress.AddInfo("Adding readme file to zip archive.");
                         onProgress(progress);
-                        string readmeString = CreateReadmeText("A", publicServerUrl, setupInfo.NodeSetupInfos.Count > 1, setupInfo.RegisterClientCert);
+                        string readmeString = CreateReadmeText(setupInfo.LocalNodeTag, publicServerUrl, setupInfo.NodeSetupInfos.Count > 1, setupInfo.RegisterClientCert);
 
                         progress.Readme = readmeString;
                         try
                         {
                             var entry = archive.CreateEntry("readme.txt");
+                            entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
+
                             using (var entryStream = entry.Open())
                             using (var writer = new StreamWriter(entryStream))
                             {
@@ -1552,6 +1632,39 @@ namespace Raven.Server.Commercial
                         catch (Exception e)
                         {
                             throw new InvalidOperationException("Failed to write readme.txt to zip archive.", e);
+                        }
+                        
+                        progress.AddInfo("Adding setup.json file to zip archive.");
+                        onProgress(progress);
+
+                        try
+                        {
+                            var settings = new SetupSettings
+                            {
+                                Nodes = setupInfo.NodeSetupInfos.Select(tag => new SetupSettings.Node
+                                {
+                                    Tag = tag.Key
+                                }).ToArray()
+                            };
+                            
+                            var modifiedJsonObj = context.ReadObject(settings.ToJson(), "setup-json");
+
+                            var indentedJson = IndentJsonString(modifiedJsonObj.ToString());
+                            
+                            var entry = archive.CreateEntry("setup.json");
+                            entry.ExternalAttributes = ((int)(FilePermissions.S_IRUSR | FilePermissions.S_IWUSR)) << 16;
+                            
+                            using (var entryStream = entry.Open())
+                            using (var writer = new StreamWriter(entryStream))
+                            {
+                                writer.Write(indentedJson);
+                                writer.Flush();
+                                await entryStream.FlushAsync(token);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            throw new InvalidOperationException("Failed to write setup.json to zip archive.", e);
                         }
                     }
                     return ms.ToArray();
@@ -1674,7 +1787,7 @@ namespace Raven.Server.Commercial
                     "The new server node will join the already existing cluster." +
                     Environment.NewLine +
                     Environment.NewLine +
-                    "When the wizard is done and the new node was restared, the cluster will automatically detect it. " +
+                    "When the wizard is done and the new node was restarted, the cluster will automatically detect it. " +
                     Environment.NewLine +
                     "There is no need to manually add it again from the studio. Simply access the 'Cluster' view and " +
                     Environment.NewLine +
@@ -1709,7 +1822,7 @@ namespace Raven.Server.Commercial
             }
         }
 
-        public static async Task SimulateRunningServer(X509Certificate2 serverCertificate, string serverUrl, IPEndPoint[] addresses, int port, string settingsPath, SetupMode setupMode, CancellationToken token)
+        public static async Task SimulateRunningServer(X509Certificate2 serverCertificate, string serverUrl, string nodeTag, IPEndPoint[] addresses, int port, string settingsPath, SetupMode setupMode, CancellationToken token)
         {
             var configuration = new RavenConfiguration(null, ResourceType.Server, settingsPath);
             configuration.Initialize();
@@ -1722,7 +1835,7 @@ namespace Raven.Server.Commercial
                 {
                     var responder = new UniqueResponseResponder(guid);
 
-                    webHost = new WebHostBuilder()
+                    var webHostBuilder = new WebHostBuilder()
                         .CaptureStartupErrors(captureStartupErrors: true)
                         .UseKestrel(options =>
                         {
@@ -1732,7 +1845,7 @@ namespace Raven.Server.Commercial
                                 options.Listen(defaultIp,
                                     listenOptions => listenOptions.ConnectionAdapters.Add(new HttpsConnectionAdapter(serverCertificate)));
                                 if (Logger.IsInfoEnabled)
-                                    Logger.Info($"List of ip addresses for node '{LocalNodeTag}' is empty. Webhost listening to {defaultIp}");
+                                    Logger.Info($"List of ip addresses for node '{nodeTag}' is empty. Webhost listening to {defaultIp}");
                             }
 
                             foreach (var addr in addresses)
@@ -1742,12 +1855,13 @@ namespace Raven.Server.Commercial
                             }
                         })
                         .UseSetting(WebHostDefaults.ApplicationKey, "Setup simulation")
-                        .ConfigureServices(collection =>
-                        {
-                            collection.AddSingleton(typeof(IStartup), responder);
-                        })
-                        .UseShutdownTimeout(TimeSpan.FromMilliseconds(150))
-                        .Build();
+                        .ConfigureServices(collection => { collection.AddSingleton(typeof(IStartup), responder); })
+                        .UseShutdownTimeout(TimeSpan.FromMilliseconds(150));
+
+                    if (configuration.Http.UseLibuv)
+                        webHostBuilder = webHostBuilder.UseLibuv();
+
+                    webHost = webHostBuilder.Build();
 
                     await webHost.StartAsync(token);
                 }
@@ -1764,7 +1878,7 @@ namespace Raven.Server.Commercial
                         ? $"It can {also} happen if the ip is external (behind a firewall, docker). If this is the case, try going back to the previous screen and add the same ip as an external ip."
                         : "";
                     
-                    throw new InvalidOperationException($"Failed to start webhost on node '{LocalNodeTag}'. The specified ip address might not be reachable due to network issues. {linuxMsg}{Environment.NewLine}{externalIpMsg}{Environment.NewLine}" +
+                    throw new InvalidOperationException($"Failed to start webhost on node '{nodeTag}'. The specified ip address might not be reachable due to network issues. {linuxMsg}{Environment.NewLine}{externalIpMsg}{Environment.NewLine}" +
                                                         $"Settings file:{settingsPath}.{Environment.NewLine}" +
                                                         $"IP addresses: {string.Join(", ", addresses.Select(addr => addr.ToString()))}.", e);
                 }
@@ -1850,7 +1964,7 @@ namespace Raven.Server.Commercial
 
         private static async Task AssertDnsUpdatedSuccessfully(string serverUrl, IPEndPoint[] expectedAddresses, CancellationToken token)
         {
-            // First we'll try to resolve the hostname through googls's public dns api
+            // First we'll try to resolve the hostname through google's public dns api
             using (var cancellationTokenSource = new CancellationTokenSource(TimeSpan.FromSeconds(30)))
             using (var cts = CancellationTokenSource.CreateLinkedTokenSource(token, cancellationTokenSource.Token))
             {

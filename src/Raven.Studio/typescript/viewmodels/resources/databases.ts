@@ -1,7 +1,7 @@
 import app = require("durandal/app");
 import appUrl = require("common/appUrl");
 import viewModelBase = require("viewmodels/viewModelBase");
-import accessHelper = require("viewmodels/shell/accessHelper");
+import accessManager = require("common/shell/accessManager");
 import deleteDatabaseConfirm = require("viewmodels/resources/deleteDatabaseConfirm");
 import createDatabase = require("viewmodels/resources/createDatabase");
 import disableDatabaseToggleConfirm = require("viewmodels/resources/disableDatabaseToggleConfirm");
@@ -14,7 +14,6 @@ import changesContext = require("common/changesContext");
 import compactDatabaseCommand = require("commands/resources/compactDatabaseCommand");
 import notificationCenter = require("common/notifications/notificationCenter");
 import getIndexNamesCommand = require("commands/database/index/getIndexNamesCommand");
-
 import databasesInfo = require("models/resources/info/databasesInfo");
 import getDatabasesCommand = require("commands/resources/getDatabasesCommand");
 import getDatabaseCommand = require("commands/resources/getDatabaseCommand");
@@ -25,12 +24,16 @@ import databaseGroupNode = require("models/resources/info/databaseGroupNode");
 import databaseNotificationCenterClient = require("common/databaseNotificationCenterClient");
 import changeSubscription = require("common/changeSubscription");
 import databasesManager = require("common/shell/databasesManager");
-import generalUtils = require("common/generalUtils"); 
+import generalUtils = require("common/generalUtils");
+import popoverUtils = require("common/popoverUtils");
+import eventsCollector = require("common/eventsCollector");
 
 class databases extends viewModelBase {
 
     databases = ko.observable<databasesInfo>();
     clusterManager = clusterTopologyManager.default;
+    
+    formatBytes = generalUtils.formatBytesToSize;
 
     filters = {
         searchText: ko.observable<string>(),
@@ -49,8 +52,9 @@ class databases extends viewModelBase {
     
     statsSubscription: changeSubscription;
 
-    isGlobalAdmin = accessHelper.isGlobalAdmin;
-    
+    accessManager = accessManager.default.databasesView;
+    isAboveUserAccess = accessManager.default.operatorAndAbove;
+   
     constructor() {
         super();
 
@@ -131,11 +135,20 @@ class databases extends viewModelBase {
         this.updateUrl(appUrl.forDatabases());
     }
     
+    compositionComplete() {
+        super.compositionComplete();
+        
+        this.initTooltips();
+    }
+    
     deactivate() {
         if (this.statsSubscription) {
             this.statsSubscription.off();
             this.statsSubscription = null;
         }
+        
+        // make we all propovers are hidden
+        $('[data-toggle="more-nodes-tooltip"]').popover('hide');
     }
 
     private fetchDatabases(): JQueryPromise<Raven.Client.ServerWide.Operations.DatabasesInfo> {
@@ -175,7 +188,49 @@ class databases extends viewModelBase {
             .done((result: Raven.Client.ServerWide.Operations.DatabaseInfo) => {
                 this.databases().updateDatabase(result);
                 this.filterDatabases();
+                this.initTooltips();
             });
+    }
+    
+    private initTooltips() {
+        const self = this;
+
+        const contentProvider = (dbInfo: databaseInfo) => {
+            const nodesPart = dbInfo.nodes().map(node => {
+                return `
+                <a href="${this.createAllDocumentsUrlObservableForNode(dbInfo, node)()}" 
+                    target="${node.tag() === this.clusterManager.localNodeTag() ? "" : "_blank"}" 
+                    class="margin-left margin-right ${dbInfo.isBeingDeleted() ? "link-disabled" : ''}" 
+                    title="${node.type()}">
+                        <i class="${node.cssIcon()}"></i> <span>Node ${node.tag()}</span>
+                    </a>
+                `
+            }).join(" ");
+            
+            return `<div class="more-nodes-tooltip">
+                <div>
+                    <i class="icon-dbgroup"></i>
+                    <span>
+                        Database Group for ${dbInfo.name}
+                    </span>
+                </div>
+                <hr />
+                <div class="flex-horizontal flex-wrap">
+                    ${nodesPart}    
+                </div>
+            </div>`;
+        };
+        
+        $('.databases [data-toggle="more-nodes-tooltip"]').each((idx, element) => {
+            popoverUtils.longWithHover($(element), {
+                content: () => { 
+                    const context = ko.dataFor(element);
+                    return contentProvider(context);
+                },
+                placement: "top",
+                container: "body"
+            });
+        })
     }
 
     private filterDatabases(): void {
@@ -414,6 +469,8 @@ class databases extends viewModelBase {
         const enableIndexing = db.indexingDisabled();
         const message = enableIndexing ? "Enable" : "Disable";
 
+        eventsCollector.default.reportEvent("databases", "toggle-indexing");
+
         this.confirmationMessage("Are you sure?", message + " indexing?")
             .done(result => {
                 if (result.can) {
@@ -431,6 +488,8 @@ class databases extends viewModelBase {
     }
     
     compactDatabase(db: databaseInfo) {
+        eventsCollector.default.reportEvent("databases", "compact");
+        
         this.confirmationMessage("Are you sure?", "Do you want to compact '" + db.name + "'?", ["No", "Yes, compact"])
             .done(result => {
                 if (result.can) {
@@ -456,6 +515,8 @@ class databases extends viewModelBase {
     }
 
     togglePauseDatabaseIndexing(db: databaseInfo) {
+        eventsCollector.default.reportEvent("databases", "pause-indexing");
+        
         const pauseIndexing = db.indexingPaused();
         const message = pauseIndexing ? "Resume" : "Pause";
 
@@ -478,11 +539,15 @@ class databases extends viewModelBase {
     }
     
     newDatabaseFromBackup() {
+        eventsCollector.default.reportEvent("databases", "new-from-backup");
+        
         const createDbView = new createDatabase("restore");
         app.showBootstrapDialog(createDbView);
     }
     
     newDatabaseFromLegacyDatafiles() {
+        eventsCollector.default.reportEvent("databases", "new-from-legacy");
+        
         const createDbView = new createDatabase("legacyMigration");
         app.showBootstrapDialog(createDbView);
     }

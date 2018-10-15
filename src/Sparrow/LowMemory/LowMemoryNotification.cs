@@ -1,9 +1,11 @@
 ﻿using System;
+using System.Buffers;
 using System.Collections.Generic;
 using System.Threading;
 using Sparrow.Collections;
 using Sparrow.Logging;
 using Sparrow.Platform;
+using Sparrow.Platform.Posix;
 using Sparrow.Utils;
 
 namespace Sparrow.LowMemory
@@ -19,7 +21,6 @@ namespace Sparrow.LowMemory
         private const string NotificationThreadName = "Low memory notification thread";
         private readonly Logger _logger;
         private readonly ConcurrentSet<WeakReference<ILowMemoryHandler>> _lowMemoryHandlers = new ConcurrentSet<WeakReference<ILowMemoryHandler>>();
-
         public enum LowMemReason
         {
             None = 0,
@@ -45,6 +46,7 @@ namespace Sparrow.LowMemory
         public LowMemEventDetails[] LowMemEventDetailsStack = new LowMemEventDetails[256];
         private int _lowMemEventDetailsIndex;
         private int _clearInactiveHandlersCounter;
+        private bool _wasLowMemory;
 
         private void RunLowMemoryHandlers(bool isLowMemory)
         {
@@ -58,7 +60,7 @@ namespace Sparrow.LowMemory
                         {
                             if (isLowMemory)
                                 handler.LowMemory();
-                            else
+                            else if (_wasLowMemory)
                                 handler.LowMemoryOver();
                         }
                         catch (Exception e)
@@ -70,6 +72,7 @@ namespace Sparrow.LowMemory
                             }
                             catch
                             {
+                                // ignored
                             }
                         }
                     }
@@ -83,11 +86,14 @@ namespace Sparrow.LowMemory
                 }
                 foreach (var x in _inactiveHandlers)
                 {
+                    if (x == null)
+                        continue;
                     _lowMemoryHandlers.TryRemove(x);
                 }
             }
             finally
             {
+                _wasLowMemory = isLowMemory;
                 _inactiveHandlers.Clear();
             }
         }
@@ -146,24 +152,9 @@ namespace Sparrow.LowMemory
             thread.Start();
         }
 
-        public static Size GetCurrentProcessMemoryMappedShared()
-        {
-            // because we are usually using memory mapped files, we don't want
-            // to account for memory that was loaded into our own working set
-            // but that the OS can discard with no cost (because it can load
-            // the data from disk without needing to write it)
-
-            var stats = MemoryInformation.MemoryStats();
-
-            var sharedMemory = stats.WorkingSet - stats.TotalUnmanagedAllocations - stats.ManagedMemory - stats.MappedTemp;
-
-            // if this is negative, we'll just ignore this
-            var mappedShared = new Size(Math.Max(0, sharedMemory), SizeUnit.Bytes);
-            return mappedShared;
-        }
-
         private void MonitorMemoryUsage()
         {
+            SmapsReader smapsReader = PlatformDetails.RunningOnLinux ? new SmapsReader(new[] {new byte[SmapsReader.BufferSize], new byte[SmapsReader.BufferSize]}) : null;
             NativeMemory.EnsureRegistered();
             var memoryAvailableHandles = new WaitHandle[] { _simulatedLowMemory, _shutdownRequested };
             var timeout = 5 * 1000;
@@ -177,7 +168,7 @@ namespace Sparrow.LowMemory
                         switch (result)
                         {
                             case WaitHandle.WaitTimeout:
-                                timeout = CheckMemoryStatus();
+                                timeout = CheckMemoryStatus(smapsReader);
                                 break;
                             case 0:
                                 SimulateLowMemory();
@@ -218,19 +209,22 @@ namespace Sparrow.LowMemory
         {
             _simulatedLowMemory.Reset();
             LowMemoryState = !LowMemoryState;
-            var memInfoForLog = MemoryInformation.GetMemoryInfo();
-            var availableMemForLog = memInfoForLog.AvailableMemory.GetValue(SizeUnit.Bytes);
+
+            var memInfoForLog = MemoryInformation.GetMemInfoUsingOneTimeSmapsReader();
+            var availableMemForLog = memInfoForLog.AvailableWithoutTotalCleanMemory.GetValue(SizeUnit.Bytes);
+
             AddLowMemEvent(LowMemoryState ? LowMemReason.LowMemStateSimulation : LowMemReason.BackToNormalSimulation,
                 availableMemForLog,
                 -2,
                 memInfoForLog.TotalPhysicalMemory.GetValue(SizeUnit.Bytes),
                 memInfoForLog.CurrentCommitCharge.GetValue(SizeUnit.Bytes));
+
             if (_logger.IsInfoEnabled)
                 _logger.Info("Simulating : " + (LowMemoryState ? "Low memory event" : "Back to normal memory usage"));
             RunLowMemoryHandlers(LowMemoryState);
         }
 
-        private int CheckMemoryStatus()
+        internal int CheckMemoryStatus(SmapsReader smapsReader)
         {
             int timeout;
             bool isLowMemory;
@@ -238,7 +232,8 @@ namespace Sparrow.LowMemory
             (Size AvailableMemory, Size TotalPhysicalMemory, Size CurrentCommitCharge) stats;
             try
             {
-                isLowMemory = GetLowMemory(out totalUnmanagedAllocations, out stats);
+                totalUnmanagedAllocations = MemoryInformation.GetUnManagedAllocationsInBytes();
+                isLowMemory = GetLowMemory(out stats, smapsReader);
             }
             catch (OutOfMemoryException)
             {
@@ -294,43 +289,59 @@ namespace Sparrow.LowMemory
             return timeout;
         }
 
-        private bool GetLowMemory(out long totalUnmanagedAllocations,
-            out (Size AvailableMemory, Size TotalPhysicalMemory, Size CurrentCommitCharge) memStats)
+        private bool GetLowMemory(
+            out (Size AvailableMemory, Size TotalPhysicalMemory, Size CurrentCommitCharge) memStats,
+            SmapsReader smapsReader)
         {
-            totalUnmanagedAllocations = 0;
             if (++_clearInactiveHandlersCounter > 60) // 5 minutes == WaitAny 5 Secs * 60
             {
                 _clearInactiveHandlersCounter = 0;
                 ClearInactiveHandlers();
             }
-            foreach (var stats in NativeMemory.ThreadAllocations.Values)
-            {
-                if (stats.IsThreadAlive() == false)
-                    continue;
-
-                totalUnmanagedAllocations += stats.TotalAllocated;
-            }
 
             var memInfo = MemoryInformation.GetMemoryInfo();
+            var isLowMemory = IsLowMemory(memInfo, smapsReader);
 
-            var currentProcessMemoryMappedShared = GetCurrentProcessMemoryMappedShared();
-            var availableMem = (memInfo.AvailableMemory + currentProcessMemoryMappedShared);
+            // memInfo.AvailableMemory is updated in IsLowMemory for Linux (adding shared clean)
+            memStats = (memInfo.AvailableMemory, memInfo.TotalPhysicalMemory, memInfo.CurrentCommitCharge);
+            return isLowMemory;
+        }
 
-            // We consider low memory only if we don't have enough free pyhsical memory or
-            // the commited memory size if larger than our pyhsical memory.
+        public bool IsLowMemory(MemoryInfoResult memInfo, SmapsReader smapsReader)
+        {
+            // We consider low memory only if we don't have enough free physical memory or
+            // the commited memory size if larger than our physical memory.
             // This is to ensure that from one hand we don't hit the disk to do page faults and from the other hand
             // we don't want to stay in low memory due to retained memory.
-            var isLowMemory = availableMem < _lowMemoryThreshold;
+            var isLowMemory = IsAvailableMemoryBelowThreshold(memInfo);
+            if (isLowMemory && PlatformDetails.RunningOnMacOsx == false)
+            {
+                // getting extendedInfo (for windows: Process.GetCurrentProcess) or using the smaps might be expensive
+                // we'll do it if we suspect low memory
+                memInfo = MemoryInformation.GetMemoryInfo(smapsReader, extendedInfo: true);
+                isLowMemory = IsAvailableMemoryBelowThreshold(memInfo);
+            }
 
             if (PlatformDetails.RunningOnPosix == false)
             {
                 // this is relevant only on Windows
-                var commitChargePlusMinSizeToKeepFree = memInfo.CurrentCommitCharge + (memInfo.TotalCommittableMemory * _commitChargeThreshold);
+                var commitChargePlusMinSizeToKeepFree = memInfo.CurrentCommitCharge + GetCommitChargeThreshold(memInfo);
                 isLowMemory |= memInfo.TotalCommittableMemory <= commitChargePlusMinSizeToKeepFree;
             }
 
-            memStats = (availableMem, memInfo.TotalPhysicalMemory, memInfo.CurrentCommitCharge);
             return isLowMemory;
+        }
+
+        private bool IsAvailableMemoryBelowThreshold(MemoryInfoResult memInfo)
+        {
+            return memInfo.AvailableWithoutTotalCleanMemory < _lowMemoryThreshold;
+        }
+
+        public Size LowMemoryThreshold => _lowMemoryThreshold;
+
+        public Size GetCommitChargeThreshold(MemoryInfoResult memInfo)
+        {
+            return memInfo.TotalCommittableMemory * _commitChargeThreshold;
         }
 
         private void AddLowMemEvent(LowMemReason reason, long availableMem, long totalUnmanaged, long physicalMem, long currentcommitCharge)

@@ -127,7 +127,23 @@ namespace Voron
 
         public UpgraderDelegate SchemaUpgrader { get; set; }
 
-        public long MaxScratchBufferSize { get; set; }
+        public long MaxScratchBufferSize
+        {
+            get => _maxScratchBufferSize;
+            set
+            {
+                if (value < 0)
+                    throw new InvalidOperationException($"Cannot set {nameof(MaxScratchBufferSize)} to negative value: {value}");
+
+                if (_forceUsing32BitsPager && _maxScratchBufferSize > 0)
+                {
+                    _maxScratchBufferSize = Math.Min(value, _maxScratchBufferSize);
+                    return;
+                }
+
+                _maxScratchBufferSize = value;
+            }
+        }
 
         public bool OwnsPagers { get; set; }
 
@@ -189,9 +205,9 @@ namespace Voron
 
             IoMetrics = new IoMetrics(256, 256, ioChangesNotifications);
 
-            _log = LoggingSource.Instance.GetLogger<StorageEnvironment>(tempPath.FullPath);
+            _log = LoggingSource.Instance.GetLogger<StorageEnvironmentOptions>(tempPath.FullPath);
 
-            _catastrophicFailureNotification = catastrophicFailureNotification ?? new CatastrophicFailureNotification((e) =>
+            _catastrophicFailureNotification = catastrophicFailureNotification ?? new CatastrophicFailureNotification((id, path, e) =>
             {
                 if (_log.IsOperationsEnabled)
                     _log.Operations($"Catastrophic failure in {this}", e);
@@ -202,12 +218,15 @@ namespace Voron
             bool result;
             if (bool.TryParse(shouldForceEnvVar, out result))
                 ForceUsing32BitsPager = result;
+
+            PrefetchSegmentSize = 4 * Constants.Size.Megabyte;
+            PrefetchResetThreshold = 8 * (long)Constants.Size.Gigabyte;
         }
 
         public void SetCatastrophicFailure(ExceptionDispatchInfo exception)
         {
             _catastrophicFailure = exception;
-            _catastrophicFailureNotification.RaiseNotificationOnce(exception.SourceException);
+            _catastrophicFailureNotification.RaiseNotificationOnce(_environmentId, ToString(), exception.SourceException);
         }
 
         public bool IsCatastrophicFailureSet => _catastrophicFailure != null;
@@ -316,10 +335,10 @@ namespace Voron
                 if (Directory.Exists(_basePath.FullPath) == false)
                     Directory.CreateDirectory(_basePath.FullPath);
 
-                if (Equals(_basePath, tempPath) == false && Directory.Exists(TempPath.FullPath) == false)
+                if (Equals(_basePath, TempPath) == false && Directory.Exists(TempPath.FullPath) == false)
                     Directory.CreateDirectory(TempPath.FullPath);
 
-                if (Equals(_journalPath, tempPath) == false && Directory.Exists(_journalPath.FullPath) == false)
+                if (Equals(_journalPath, TempPath) == false && Directory.Exists(_journalPath.FullPath) == false)
                     Directory.CreateDirectory(_journalPath.FullPath);
 
                 _dataPager = new Lazy<AbstractPager>(() =>
@@ -616,30 +635,73 @@ namespace Voron
                     File.Delete(file);
             }
 
+            private AbstractPager GetTemporaryPager(string name, long initialSize, Func<StorageEnvironmentOptions, long?, VoronPathSetting, bool, bool, AbstractPager> getMemoryMapPagerFunc)
+            {
+                // here we can afford to rename the file if needed because this is a scratch / temp
+                // file that is used. We _know_ that no one expects anything from it and that 
+                // the name it uses isn't _that_ important in any way, shape or form. 
+                int index = 0;
+                void Rename()
+                {
+                    var ext = Path.GetExtension(name);
+                    var filename = Path.GetFileNameWithoutExtension(name);
+                    name = filename + "-ren-" + (index++) + ext;
+                }
+                Exception err = null;
+                for (int i = 0; i < 15; i++)
+                {
+                    var tempFile = TempPath.Combine(name);
+                    try
+                    {
+                        if (File.Exists(tempFile.FullPath))
+                            File.Delete(tempFile.FullPath);
+                    }
+                    catch (IOException e)
+                    {
+                        // this can happen if someone is holding the file, shouldn't happen
+                        // but might if there is some FS caching involved where it shouldn't
+                        Rename();
+                        err = e;
+                        continue;
+                    }
+                    try
+                    {
+                        return getMemoryMapPagerFunc(this, initialSize, tempFile,
+                            true, // deleteOnClose
+                            false); //usePageProtection
+                    }
+                    catch (FileNotFoundException e)
+                    {
+                        // unique case, when file was previously deleted, but still exists. 
+                        // This can happen on cifs mount, see RavenDB-10923
+                        // if this is a temp file we can try recreate it in a different name
+                        Rename();
+                        err = e;
+                    }
+                }
+
+                throw new InvalidOperationException("Unable to create temporary mapped file " + name + ", even after trying multiple times.", err);
+            }
+
             public override AbstractPager CreateScratchPager(string name, long initialSize)
             {
-                var scratchFile = TempPath.Combine(name);
-                if (File.Exists(scratchFile.FullPath))
-                    File.Delete(scratchFile.FullPath);
-
-                return GetMemoryMapPager(this, initialSize, scratchFile, deleteOnClose: true);
+                return GetTemporaryPager(name, initialSize, GetMemoryMapPager);
             }
 
             // This is used for special pagers that are used as temp buffers and don't 
             // require encryption: compression, recovery, lazyTxBuffer.
             public override AbstractPager CreateTemporaryBufferPager(string name, long initialSize)
             {
-                var scratchFile = TempPath.Combine(name);
-                if (File.Exists(scratchFile.FullPath))
-                    File.Delete(scratchFile.FullPath);
+                var pager = GetTemporaryPager(name, initialSize, GetMemoryMapPagerInternal);
 
-                var pager = GetMemoryMapPagerInternal(this, initialSize, scratchFile, deleteOnClose: true);
                 if (EncryptionEnabled)
                 {
                     // even though we don't care need encryption here, we still need to ensure that this
                     // isn't paged to disk
                     pager.LockMemory = true;
                     pager.DoNotConsiderMemoryLockFailureAsCatastrophicError = DoNotConsiderMemoryLockFailureAsCatastrophicError;
+
+                    pager.SetPagerState(pager.PagerState); // with LockMemory = true set
                 }
                 return pager;
             }
@@ -1048,6 +1110,9 @@ namespace Voron
             set => _timeToSyncAfterFlashInSec = value;
         }
 
+        public long PrefetchSegmentSize { get; set; }
+        public long PrefetchResetThreshold { get; set; }
+
         public byte[] MasterKey;
 
         public const Win32NativeFileAttributes SafeWin32OpenFlags = Win32NativeFileAttributes.Write_Through | Win32NativeFileAttributes.NoBuffering;
@@ -1061,6 +1126,8 @@ namespace Voron
         private int _numOfConcurrentSyncsPerPhysDrive;
         private int _timeToSyncAfterFlashInSec;
         public long CompressTxAboveSizeInBytes;
+        private Guid _environmentId;
+        private long _maxScratchBufferSize;
 
         public virtual void SetPosixOptions()
         {
@@ -1124,6 +1191,11 @@ namespace Voron
                     // nothing we can do about it
                 }
             }
+        }
+
+        public void SetEnvironmentId(Guid environmentId)
+        {
+            _environmentId = environmentId;
         }
     }
 }

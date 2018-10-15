@@ -1,11 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Threading;
 using System.Threading.Tasks;
 using FastTests.Server.Replication;
 using Raven.Client.Documents;
-using Raven.Client.Http;
 using Raven.Server.Config;
 using Raven.Tests.Core.Utils.Entities;
 using Tests.Infrastructure;
@@ -15,24 +13,30 @@ namespace RachisTests
 {
     public class DisableNodeOnClusterTest : ReplicationTestBase
     {
-        [NightlyBuildFact]
+        [Fact]
         public async Task BackToFirstNodeAfterRevive()
         {
-            var leader = await CreateRaftClusterAndGetLeader(3, shouldRunInMemory: false);
-            await CreateDatabaseInCluster("MainDB", 3, leader.WebUrl);
+            var db = GetDatabaseName();
+
+            // we don't want to move the node to rehab, since it should be restored to the top of the list.
+            var settings = new Dictionary<string, string>()
+            {
+                [RavenConfiguration.GetKey(x => x.Cluster.StabilizationTime)] = "1"
+            };
+
+            var leader = await CreateRaftClusterAndGetLeader(3, shouldRunInMemory: false, customSettings: settings);
+            await CreateDatabaseInCluster(db, 3, leader.WebUrl);
 
             using (var leaderStore = new DocumentStore
             {
-                Database = "MainDB",
+                Database = db,
                 Urls = new[] { leader.WebUrl }
             }.Initialize())
             {
-
-                await WaitForDatabaseTopology(leaderStore, leaderStore.Database, 3);
-
                 var re = leaderStore.GetRequestExecutor();
                 using (var session = leaderStore.OpenSession())
                 {
+                    session.Advanced.WaitForReplicationAfterSaveChanges(replicas: 2, timeout: TimeSpan.FromSeconds(30));
                     session.Store(new User
                     {
                         Name = "Idan"
@@ -42,13 +46,14 @@ namespace RachisTests
 
                 var firstNodeUrl = re.Url;
                 var firstNode = Servers.Single(s => s.WebUrl == firstNodeUrl);
-                var nodePath = firstNode.Configuration.Core.DataDirectory;
-
-                firstNode.Dispose();
+                var tag = firstNode.ServerStore.NodeTag;
+                var nodePath = firstNode.Configuration.Core.DataDirectory.FullPath.Split('/').Last();
+                await DisposeServerAndWaitForFinishOfDisposalAsync(firstNode);
 
                 // check that replication works.
                 using (var session = leaderStore.OpenSession())
                 {
+                    session.Advanced.WaitForReplicationAfterSaveChanges(replicas: 1, timeout: TimeSpan.FromSeconds(30));
                     session.Store(new User
                     {
                         Name = "Karmel"
@@ -57,29 +62,11 @@ namespace RachisTests
                 }
 
                 Assert.NotEqual(re.Url, firstNodeUrl);
-                var customSettings = new Dictionary<string, string>
-                {
-                    {RavenConfiguration.GetKey(x => x.Core.ServerUrls), firstNodeUrl},
-                    {RavenConfiguration.GetKey(x => x.Core.DataDirectory), nodePath.FullPath}
-                };
-                GetNewServer(customSettings, runInMemory: false);
-
-                Assert.True(SpinWait.SpinUntil(() => firstNodeUrl == re.Url, TimeSpan.FromSeconds(15)));
-                Assert.Equal(firstNodeUrl, re.Url);
+                settings[RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = firstNodeUrl;
+                Servers.Add(GetNewServer(settings, runInMemory: false, deletePrevious: false, partialPath: nodePath));
+                await re.CheckNodeStatusNow(tag);
+                Assert.True(WaitForValue(() => firstNodeUrl == re.Url, true));
             }
-        }
-
-        private static async Task WaitForDatabaseTopology(IDocumentStore store, string databaseName, int replicationFactor)
-        {
-            do
-            {
-                await store.GetRequestExecutor()
-                    .UpdateTopologyAsync(new ServerNode
-                    {
-                        Url = store.Urls[0],
-                        Database = databaseName,
-                    }, Timeout.Infinite);
-            } while (store.GetRequestExecutor().TopologyNodes.Count != replicationFactor);
         }
     }
 }

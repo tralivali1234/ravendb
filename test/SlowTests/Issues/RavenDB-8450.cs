@@ -1,4 +1,5 @@
-﻿using System.IO;
+﻿using System;
+using System.IO;
 using System.Net.Http;
 using System.Text;
 using FastTests;
@@ -16,8 +17,10 @@ namespace SlowTests.Issues
 {
     public class RavenDB_8450 : RavenTestBase
     {
-        [Fact]
-        public void CanGetSubscriptionsResultsWithEscapeHandling()
+        [Theory]
+        [InlineData("hello\nthere", "\n")]
+        [InlineData("hello\r\nthere", "\r\n")]
+        public void CanGetSubscriptionsResultsWithEscapeHandling(string input, string shouldNotContain)
         {
             using (var store = GetDocumentStore())
             {
@@ -27,7 +30,7 @@ namespace SlowTests.Issues
                     {
                         Address = new Address
                         {
-                            Country = "hello\r\nthere"
+                            Country = input
                         }
                     });
                     s.SaveChanges();
@@ -38,7 +41,7 @@ namespace SlowTests.Issues
                     Query = "from PersonWithAddresses as u select { Self: u }"
                 }));
 
-                Assert.DoesNotContain("\r\n", result);
+                Assert.DoesNotContain(shouldNotContain, result);
             }
         }
 

@@ -23,7 +23,10 @@ class connectionStrings extends viewModelBase {
     editedSqlEtlConnectionString = ko.observable<connectionStringSqlEtlModel>(null);
 
     testConnectionResult = ko.observable<Raven.Server.Web.System.NodeConnectionTestResult>();
-    spinners = { test: ko.observable<boolean>(false) };
+    testConnectionHttpSuccess: KnockoutComputed<boolean>;
+    spinners = { 
+        test: ko.observable<boolean>(false) 
+    };
     fullErrorDetailsVisible = ko.observable<boolean>(false);
 
     shortErrorText: KnockoutObservable<string>;
@@ -57,6 +60,16 @@ class connectionStrings extends viewModelBase {
             }
             return generalUtils.trimMessage(result.Error);
         });
+        
+        this.testConnectionHttpSuccess = ko.pureComputed(() => {
+            const testResult = this.testConnectionResult();
+            
+            if (!testResult) {
+                return false;
+            }
+            
+            return testResult.HTTPSuccess || false;
+        })
     }
 
     activate(args: any) {
@@ -67,8 +80,7 @@ class connectionStrings extends viewModelBase {
                     if (args.name) {
                         if (args.type === 'sql') {                           
                             this.onEditSqlEtl(args.name);
-                        }
-                        else {
+                        } else {
                             this.onEditRavenEtl(args.name);
                         }
                     }
@@ -101,7 +113,7 @@ class connectionStrings extends viewModelBase {
             const task = tasksThatUseConnectionStrings[i];
             
             let taskData = { TaskId: task.TaskId,
-                TaskName: !task.TaskName ? ongoingTaskModel.generateTaskName(task): task.TaskName,
+                TaskName: task.TaskName,
                 TaskType: task.TaskType };
             let stringName: string;
             
@@ -119,8 +131,7 @@ class connectionStrings extends viewModelBase {
 
             if (this.connectionStringsTasksInfo[stringName]) {
                 this.connectionStringsTasksInfo[stringName].push(taskData);
-            }
-            else {
+            } else {
                 this.connectionStringsTasksInfo[stringName] = [taskData];
             }        
         }    

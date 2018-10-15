@@ -8,7 +8,7 @@ namespace Raven.Server.Documents.Indexes.Static.Roslyn.Rewriters
     {
         public static readonly NullRewriter Instance = new NullRewriter();
 
-        private static readonly SyntaxNode Null = SyntaxFactory.ParseExpression($"{nameof(DynamicNullObject)}.{nameof(DynamicNullObject.ExplicitNull)}");
+        private static readonly SyntaxNode Null = SyntaxFactory.ParseExpression($"(dynamic){nameof(DynamicNullObject)}.{nameof(DynamicNullObject.ExplicitNull)}");
 
         private NullRewriter()
         {
@@ -37,6 +37,9 @@ namespace Raven.Server.Documents.Indexes.Static.Roslyn.Rewriters
                 var toCheck = conditionalExpressionSyntax.WhenFalse == node
                     ? conditionalExpressionSyntax.WhenTrue
                     : conditionalExpressionSyntax.WhenFalse;
+
+                if (toCheck.IsKind(SyntaxKind.ParenthesizedExpression))
+                    toCheck = ((ParenthesizedExpressionSyntax)toCheck).Expression;
 
                 if (toCheck.IsKind(SyntaxKind.CastExpression) == false)
                     return true;

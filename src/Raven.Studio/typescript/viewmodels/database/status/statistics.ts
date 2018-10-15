@@ -1,10 +1,10 @@
 import viewModelBase = require("viewmodels/viewModelBase");
-import getDatabaseStatsCommand = require("commands/resources/getDatabaseStatsCommand");
+import getDatabaseDetailedStatsCommand = require("commands/resources/getDatabaseDetailedStatsCommand");
 import getIndexesStatsCommand = require("commands/database/index/getIndexesStatsCommand");
 import appUrl = require("common/appUrl");
 import app = require("durandal/app");
 import indexStalenessReasons = require("viewmodels/database/indexes/indexStalenessReasons");
-
+import getStorageReportCommand = require("commands/database/debug/getStorageReportCommand");
 import statsModel = require("models/database/stats/statistics");
 
 class statistics extends viewModelBase {
@@ -14,6 +14,8 @@ class statistics extends viewModelBase {
 
     private refreshStatsObservable = ko.observable<number>();
     private statsSubscription: KnockoutSubscription;
+
+    dataLocation = ko.observable<string>();
 
     constructor() {
         super();
@@ -31,6 +33,23 @@ class statistics extends viewModelBase {
             return appUrl.forStatsRawData(this.activeDatabase());
         });
     }
+    
+    compositionComplete() {
+        super.compositionComplete();
+
+        const self = this;
+        $('.stats .js-size-tooltip').tooltip({
+            container: "body",
+            html: true,
+            placement: "right",
+            title: () => {
+                return `Data: <strong>${this.stats().dataSizeOnDisk}</strong><br />
+                Temp: <strong>${this.stats().tempBuffersSizeOnDisk}</strong><br />
+                Total: <strong>${this.stats().totalSizeOnDisk}</strong>
+                `
+            }
+        });
+    }
 
     detached() {
         super.detached();
@@ -43,16 +62,22 @@ class statistics extends viewModelBase {
     fetchStats(): JQueryPromise<Raven.Client.Documents.Operations.DatabaseStatistics> {
         const db = this.activeDatabase();
 
-        const dbStatsTask = new getDatabaseStatsCommand(db)
+        const dbStatsTask = new getDatabaseDetailedStatsCommand(db)
             .execute();
 
         const indexesStatsTask = new getIndexesStatsCommand(db)
             .execute();
-
-        return $.when<any>(dbStatsTask, indexesStatsTask)
-            .done(([dbStats]: [Raven.Client.Documents.Operations.DatabaseStatistics], [indexesStats]: [Raven.Client.Documents.Indexes.IndexStats[]]) => {
+ 
+        const dbDataLocationTask = new getStorageReportCommand(db)
+            .execute();
+        
+        return $.when<any>(dbStatsTask, indexesStatsTask, dbDataLocationTask)
+            .done(([dbStats]: [Raven.Client.Documents.Operations.DetailedDatabaseStatistics],
+                   [indexesStats]: [Raven.Client.Documents.Indexes.IndexStats[]],
+                   [dbLocation]: [storageReportDto]) => {
                 this.processStatsResults(dbStats, indexesStats);
-                });
+                this.dataLocation(dbLocation.BasePath)
+            });
     }
 
     afterClientApiConnected(): void {
@@ -61,7 +86,7 @@ class statistics extends viewModelBase {
         this.addNotification(changesApi.watchAllIndexes((e) => this.refreshStatsObservable(new Date().getTime())))
     }
 
-    processStatsResults(dbStats: Raven.Client.Documents.Operations.DatabaseStatistics, indexesStats: Raven.Client.Documents.Indexes.IndexStats[]) {
+    processStatsResults(dbStats: Raven.Client.Documents.Operations.DetailedDatabaseStatistics, indexesStats: Raven.Client.Documents.Indexes.IndexStats[]) {
         this.stats(new statsModel(dbStats, indexesStats));
     }
     

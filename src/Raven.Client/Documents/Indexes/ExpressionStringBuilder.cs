@@ -125,8 +125,20 @@ namespace Raven.Client.Documents.Indexes
 
         private void OutMember(Expression instance, MemberInfo member, Type exprType)
         {
-            bool isId = false;
-            var name = GetPropertyName(member.Name, exprType);
+            var isId = false;
+
+            string name = null;
+            if (_conventions.PropertyNameConverter != null)
+            {
+                //do not use convention for types in system namespaces
+                if (member.DeclaringType?.Namespace?.StartsWith("System") == false &&
+                   member.DeclaringType?.Namespace?.StartsWith("Microsoft") == false)
+                    name = _conventions.PropertyNameConverter(member);
+            }
+
+            if (string.IsNullOrWhiteSpace(name))
+                name = GetPropertyName(member.Name, exprType);
+
             if (TranslateToDocumentId(instance, member, exprType))
             {
                 isId = true;
@@ -568,7 +580,7 @@ namespace Raven.Client.Documents.Indexes
                 if (innerPrecedence == ExpressionOperatorPrecedence.NullCoalescing && TypeExistsOnServer(rightOp.Type))
                 {
                     Out("((");
-                    Out(ConvertTypeToCSharpKeyword(rightOp.Type));
+                    Out(ConvertTypeToCSharpKeyword(rightOp.Type, out _));
                     Out(")(");
                 }
                 Visit(leftOp, innerPrecedence);
@@ -747,9 +759,13 @@ namespace Raven.Client.Documents.Indexes
             if (node.Value is Enum)
             {
                 var enumType = node.Value.GetType();
-                if (TypeExistsOnServer(enumType))
+                if (_insideWellKnownType || TypeExistsOnServer(enumType))
                 {
-                    Out(enumType.FullName.Replace("+", "."));
+                    var name = _insideWellKnownType 
+                        ? enumType.Name 
+                        : enumType.FullName;
+
+                    Out(name.Replace("+", "."));
                     Out('.');
                     Out(s);
                     return node;
@@ -814,17 +830,18 @@ namespace Raven.Client.Documents.Indexes
                 return;
 
             Out("(");
-            Out(ConvertTypeToCSharpKeyword(type));
+            Out(ConvertTypeToCSharpKeyword(type, out var isValueTypeServerSide));
 
-            if (isNullableType && nonNullableType != typeof(Guid))
+            if (isNullableType && nonNullableType != typeof(Guid) && isValueTypeServerSide)
             {
                 Out("?");
             }
             Out(")");
         }
 
-        private string ConvertTypeToCSharpKeyword(Type type)
+        private string ConvertTypeToCSharpKeyword(Type type, out bool isValueTypeOnTheServerSide)
         {
+            isValueTypeOnTheServerSide = true;
             if (type.GetTypeInfo().IsGenericType)
             {
                 if (TypeExistsOnServer(type) == false)
@@ -842,18 +859,14 @@ namespace Raven.Client.Documents.Indexes
                 {
                     if (i != 0)
                         sb.Append(", ");
-                    sb.Append(ConvertTypeToCSharpKeyword(arguments[i]));
+                    sb.Append(ConvertTypeToCSharpKeyword(arguments[i], out _));
                 }
 
                 sb.Append(">");
-
+                isValueTypeOnTheServerSide = type.GetTypeInfo().IsValueType;// KeyValuePair<K,V>
                 return sb.ToString();
             }
 
-            if (type == typeof(string))
-            {
-                return "string";
-            }
             if (type == typeof(Guid) || type == typeof(Guid?))
             {
                 // on the server, Guids are represented as strings
@@ -927,7 +940,14 @@ namespace Raven.Client.Documents.Indexes
             {
                 return "byte?";
             }
+
+            isValueTypeOnTheServerSide = false;
+
             if (type.GetTypeInfo().IsEnum)
+            {
+                return "string";
+            }
+            if (type == typeof(string))
             {
                 return "string";
             }
@@ -935,15 +955,20 @@ namespace Raven.Client.Documents.Indexes
             {
                 return "object";
             }
-
             const string knownNamespace = "System";
-            if (knownNamespace == type.Namespace)
+            if (_insideWellKnownType || knownNamespace == type.Namespace)
+            {
+                isValueTypeOnTheServerSide = type.GetTypeInfo().IsValueType;
                 return type.Name;
+            }
             return type.FullName;
         }
 
         private bool TypeExistsOnServer(Type type)
         {
+            if (_insideWellKnownType)
+                return true;
+
             if (type.GetTypeInfo().Assembly == typeof(object).GetTypeInfo().Assembly) // mscorlib
                 return true;
 
@@ -957,7 +982,7 @@ namespace Raven.Client.Documents.Indexes
                 type.GetTypeInfo().Assembly.FullName.Contains("PublicKeyToken=85089178b9ac3181"))
                 return true;
 
-            return false;
+            return _conventions.TypeIsKnownServerSide(type);
         }
 
         /// <summary>
@@ -986,8 +1011,8 @@ namespace Raven.Client.Documents.Indexes
             Out("default(");
 
             var nonNullable = Nullable.GetUnderlyingType(node.Type);
-            Out(ConvertTypeToCSharpKeyword(nonNullable ?? node.Type));
-            if (nonNullable != null && nonNullable != typeof(Guid))
+            Out(ConvertTypeToCSharpKeyword(nonNullable ?? node.Type, out var isValueTypeServerSide));
+            if (nonNullable != null && nonNullable != typeof(Guid) && isValueTypeServerSide)
                 Out("?");
 
             Out(")");
@@ -1265,7 +1290,7 @@ namespace Raven.Client.Documents.Indexes
             if (constantExpression != null && constantExpression.Value == null)
             {
                 var memberType = GetMemberType(assignment.Member);
-                if (ShouldConvert(memberType))
+                if (_insideWellKnownType || ShouldConvert(memberType))
                 {
                     Visit(Expression.Convert(assignment.Expression, memberType));
                 }
@@ -1288,6 +1313,11 @@ namespace Raven.Client.Documents.Indexes
         /// </returns>
         protected override Expression VisitMemberInit(MemberInitExpression node)
         {
+            var originalInsideWellKnownType = _insideWellKnownType;
+
+            if (node.Type == typeof(CreateFieldOptions))
+                _insideWellKnownType = true;
+
             if ((node.NewExpression.Arguments.Count == 0) && node.NewExpression.Type.Name.Contains("<"))
             {
                 Out("new");
@@ -1315,6 +1345,10 @@ namespace Raven.Client.Documents.Indexes
                 num++;
             }
             Out("}");
+
+            if (node.Type == typeof(CreateFieldOptions))
+                _insideWellKnownType = originalInsideWellKnownType;
+
             return node;
         }
 
@@ -1513,12 +1547,15 @@ namespace Raven.Client.Documents.Indexes
                     }
 
                     var oldAvoidDuplicateParameters = _avoidDuplicatedParameters;
+                    var oldIsSelectMany = _isSelectMany;
+
                     _isSelectMany = node.Method.Name == "SelectMany";
                     if (node.Method.Name == "Select" || _isSelectMany)
-                    {
                         _avoidDuplicatedParameters = true;
-                    }
+
                     Visit(node.Arguments[num2]);
+
+                    _isSelectMany = oldIsSelectMany;
                     _avoidDuplicatedParameters = oldAvoidDuplicateParameters;
                 }
                 finally
@@ -1737,7 +1774,7 @@ namespace Raven.Client.Documents.Indexes
                     Out("?");
                     return;
                 }
-                Out(ConvertTypeToCSharpKeyword(type));
+                Out(ConvertTypeToCSharpKeyword(type, out _));
                 return;
             }
             var genericArguments = type.GetGenericArguments();
@@ -1790,7 +1827,7 @@ namespace Raven.Client.Documents.Indexes
         {
             if (!CheckIfAnonymousType(node.Type.GetElementType()) && TypeExistsOnServer(node.Type.GetElementType()))
             {
-                Out(ConvertTypeToCSharpKeyword(node.Type.GetElementType()));
+                Out(ConvertTypeToCSharpKeyword(node.Type.GetElementType(), out _));
             }
             else
             {
@@ -1901,6 +1938,7 @@ namespace Raven.Client.Documents.Indexes
             "while"
         });
 
+        private bool _insideWellKnownType;
         private bool _avoidDuplicatedParameters;
         private bool _isSelectMany;
 
@@ -2173,8 +2211,11 @@ namespace Raven.Client.Documents.Indexes
             return node;
         }
 
-        private static bool ShouldConvert(Type nonNullableType)
+        private bool ShouldConvert(Type nonNullableType)
         {
+            if (_insideWellKnownType)
+                return false;
+
             if (nonNullableType.GetTypeInfo().IsEnum)
                 return true;
 

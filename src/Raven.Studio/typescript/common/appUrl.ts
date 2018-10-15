@@ -3,7 +3,6 @@
 import database = require("models/resources/database");
 import activeDatabase = require("common/shell/activeDatabaseTracker");
 import router = require("plugins/router");
-import collection = require("models/database/documents/collection");
 import messagePublisher = require("common/messagePublisher");
 import databaseInfo = require("models/resources/info/databaseInfo");
 
@@ -30,6 +29,7 @@ class appUrl {
         databases: ko.pureComputed(() => appUrl.forDatabases()),
         manageDatabaseGroup: ko.pureComputed(() => appUrl.forManageDatabaseGroup(appUrl.currentDatabase())),
         clientConfiguration: ko.pureComputed(() => appUrl.forClientConfiguration(appUrl.currentDatabase())),
+        studioConfiguration: ko.pureComputed(() => appUrl.forStudioConfiguration(appUrl.currentDatabase())),
         documents: ko.pureComputed(() => appUrl.forDocuments(null, appUrl.currentDatabase())),
         revisionsBin: ko.pureComputed(() => appUrl.forRevisionsBin(appUrl.currentDatabase())),
         conflicts: ko.pureComputed(() => appUrl.forConflicts(appUrl.currentDatabase())),
@@ -47,7 +47,9 @@ class appUrl {
         terms: (indexName?: string) => ko.pureComputed(() => appUrl.forTerms(indexName, appUrl.currentDatabase())),
         importDatabaseFromFileUrl: ko.pureComputed(() => appUrl.forImportDatabaseFromFile(appUrl.currentDatabase())),
         importCollectionFromCsv: ko.pureComputed(() => appUrl.forImportCollectionFromCsv(appUrl.currentDatabase())),
+        importDatabaseFromSql: ko.pureComputed(() => appUrl.forImportFromSql(appUrl.currentDatabase())),
         exportDatabaseUrl: ko.pureComputed(() => appUrl.forExportDatabase(appUrl.currentDatabase())),
+        migrateRavenDbDatabaseUrl: ko.pureComputed(() => appUrl.forMigrateRavenDbDatabase(appUrl.currentDatabase())),
         migrateDatabaseUrl: ko.pureComputed(() => appUrl.forMigrateDatabase(appUrl.currentDatabase())),
         sampleDataUrl: ko.pureComputed(() => appUrl.forSampleData(appUrl.currentDatabase())),
         ongoingTasksUrl: ko.pureComputed(() => appUrl.forOngoingTasks(appUrl.currentDatabase())),
@@ -78,8 +80,6 @@ class appUrl {
         isAreaActive: (routeRoot: string) => ko.pureComputed(() => appUrl.checkIsAreaActive(routeRoot)),
         isActive: (routeTitle: string) => ko.pureComputed(() => router.navigationModel().find(m => m.isActive() && m.title === routeTitle) != null),
         databasesManagement: ko.pureComputed(() => appUrl.forDatabases()),
-        
-
     };
 
     static checkIsAreaActive(routeRoot: string): boolean {
@@ -128,7 +128,11 @@ class appUrl {
     static forGlobalClientConfiguration(): string {
         return "#admin/settings/clientConfiguration";
     }
-    
+
+    static forGlobalStudioConfiguration(): string {
+        return "#admin/settings/studioConfiguration";
+    }
+
     static forCertificates(): string {
         return "#admin/settings/certificates";
     }
@@ -154,14 +158,14 @@ class appUrl {
     static forEditDoc(id: string, db: database | databaseInfo, collection?: string): string {
         const collectionPart = collection ? "&collection=" + encodeURIComponent(collection) : "";
         const databaseUrlPart = appUrl.getEncodedDbPart(db);
-        const docIdUrlPart = id ? "&id=" + encodeURI(id) : "";
+        const docIdUrlPart = id ? "&id=" + encodeURIComponent(id) : "";
         return "#databases/edit?" + collectionPart + databaseUrlPart + docIdUrlPart;
     }
 
     static forViewDocumentAtRevision(id: string, revisionChangeVector: string, db: database | databaseInfo): string {
         const databaseUrlPart = appUrl.getEncodedDbPart(db);
         const revisionPart = "&revision=" + encodeURIComponent(revisionChangeVector);        
-        const docIdUrlPart = "&id=" + encodeURI(id);
+        const docIdUrlPart = "&id=" + encodeURIComponent(id);
         return "#databases/edit?" + databaseUrlPart + revisionPart + docIdUrlPart;
     }
 
@@ -259,6 +263,10 @@ class appUrl {
         return "#databases/settings/clientConfiguration?" + appUrl.getEncodedDbPart(db);
     }
 
+    static forStudioConfiguration(db: database | databaseInfo): string {
+        return "#databases/settings/studioConfiguration?" + appUrl.getEncodedDbPart(db);
+    }
+
     static forDocuments(collectionName: string, db: database | databaseInfo | string): string {
         if (collectionName === "All Documents")
             collectionName = null;
@@ -275,7 +283,7 @@ class appUrl {
 
     static forDocumentsByDatabaseName(collection: string, dbName: string): string {
         const collectionPart = collection ? "collection=" + encodeURIComponent(collection) : "";
-        return "#/databases/documents?" + collectionPart + "&database=" + encodeURIComponent(dbName);;
+        return "#/databases/documents?" + collectionPart + "&database=" + encodeURIComponent(dbName);
     }
 
     static forCmpXchg(db: database | databaseInfo): string {
@@ -348,15 +356,25 @@ class appUrl {
         const databasePart = appUrl.getEncodedDbPart(db);
         return "#databases/tasks/import/csv?" + databasePart;
     }
+    
+    static forImportFromSql(db: database | databaseInfo): string {
+        const databasePart = appUrl.getEncodedDbPart(db);
+        return "#databases/tasks/import/sql?" + databasePart;
+    }
 
     static forExportDatabase(db: database | databaseInfo): string {
         const databasePart = appUrl.getEncodedDbPart(db);
         return "#databases/tasks/exportDatabase?" + databasePart;
     }
 
+    static forMigrateRavenDbDatabase(db: database | databaseInfo): string {
+        const databasePart = appUrl.getEncodedDbPart(db);
+        return "#databases/tasks/import/migrateRavenDB?" + databasePart;
+    }
+
     static forMigrateDatabase(db: database | databaseInfo): string {
         const databasePart = appUrl.getEncodedDbPart(db);
-        return "#databases/tasks/import/migrate?" + databasePart;//TODO: update? 
+        return "#databases/tasks/import/migrate?" + databasePart;
     }
 
     static forOngoingTasks(db: database | databaseInfo): string {
@@ -498,7 +516,7 @@ class appUrl {
         router.mapUnknownRoutes((instruction: DurandalRouteInstruction) => {
             const queryString = !!instruction.queryString ? ("?" + instruction.queryString) : "";
 
-            messagePublisher.reportError("Unknown route", "The route " + instruction.fragment + queryString + " doesn't exist, redirecting...");
+            messagePublisher.reportWarning("Unknown route", "The route " + instruction.fragment + queryString + " doesn't exist, redirecting...");
 
             const appUrls = appUrl.currentDbComputeds;
             location.href = appUrls.databasesManagement();
@@ -517,16 +535,10 @@ class appUrl {
 
             if (value instanceof Array) {
                 for (let i = 0; i < value.length; i++) {
-
-                    // we want : doc/76 (so use encodeURI)
-                    // encodeURI(doc/76) ==> "doc/76"
-                    // encodeURIComponent(doc/76) ==> "doc%2F76"     
-                    propNameAndValues.push(prop + "=" + (prop === 'id' ? encodeURI(value[i]) : encodeURIComponent(value[i]))); 
-                    
+                    propNameAndValues.push(prop + "=" + encodeURIComponent(value[i]));
                 }
             } else if (value !== undefined) {
-                propNameAndValues.push(prop + "=" + (prop === 'id' ? encodeURI(value) : encodeURIComponent(value)));
-                
+                propNameAndValues.push(prop + "=" + encodeURIComponent(value));
             }
         }
 

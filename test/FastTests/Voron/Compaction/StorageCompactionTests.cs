@@ -9,8 +9,8 @@ using System.Collections.Generic;
 using System.IO;
 using System.Linq;
 using FastTests.Voron.FixedSize;
+using Raven.Server.Utils;
 using Sparrow;
-using Sparrow.LowMemory;
 using Sparrow.Threading;
 using Xunit;
 using Voron;
@@ -23,14 +23,11 @@ namespace FastTests.Voron.Compaction
     {
         public StorageCompactionTests()
         {
-            if (Directory.Exists(DataDir))
-                StorageTest.DeleteDirectory(DataDir);
+            IOExtensions.DeleteDirectory(DataDir);
 
             var compactedData = Path.Combine(DataDir, "Compacted");
-            if (Directory.Exists(compactedData))
-                StorageTest.DeleteDirectory(compactedData);
+            IOExtensions.DeleteDirectory(compactedData);
         }
-
 
         [Theory]
         [InlineDataWithRandomSeed(250)]
@@ -278,7 +275,18 @@ namespace FastTests.Voron.Compaction
             var files = d.GetFiles();
             var size = files
                 .Where(x=>Path.GetFileNameWithoutExtension(x.Name) != StorageEnvironmentOptions.RecyclableJournalFileNamePrefix)
-                .Sum(x => x.Length);
+                .Sum(x =>
+                {
+                    try
+                    {
+                        return x.Length;
+                    }
+                    catch (IOException)
+                    {
+                        // we may have temp files that were removed in the meantime
+                        return 0;
+                    }
+                });
 
             var directories = d.GetDirectories();
             size += directories.Sum(x => GetDirSize(x));

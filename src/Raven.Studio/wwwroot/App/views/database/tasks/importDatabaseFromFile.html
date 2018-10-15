@@ -20,53 +20,61 @@
             </div>
             <br />
             <div data-bind="with: model">
-                <div class="flex-horizontal flex-stretch-items">
-                    <div>
+                <div class="row">
+                    <div class="col-xs-12 col-sm-5 col-lg-3">
                         <div class="toggle">
-                            <input id="import_database_record" type="checkbox" data-bind="checked: includeDatabaseRecord">
-                            <label for="import_database_record">Include Database Record</label>
-                        </div>
-                        <div class="toggle">
-                            <input id="import_documents" type="checkbox" data-bind="checked: includeDocuments">
-                            <label for="import_documents">Include Documents</label>
-                        </div>
-                        <div class="toggle">
-                            <input id="import_conflicts" type="checkbox" data-bind="checked: includeConflicts">
-                            <label for="import_conflicts">Include Conflicts</label>
+                            <input id="importDocuments" type="checkbox" data-bind="checked: includeDocuments">
+                            <label for="importDocuments">Include Documents</label>
                         </div>
                         <div class="toggle" data-toggle="tooltip" data-placement="top">
-                            <input id="import_revisions" type="checkbox" data-bind="checked: includeRevisionDocuments"/>
-                            <label for="import_revisions">Include Document Revisions</label>
+                            <input id="importRevisions" type="checkbox" data-bind="checked: includeRevisionDocuments"/>
+                            <label for="importRevisions">Include Revisions</label>
                         </div>
                         <div class="toggle">
-                            <input id="import_identities" type="checkbox" data-bind="checked: includeIdentities">
-                            <label for="import_identities">Include Identities</label>
+                            <input id="importIndexes" type="checkbox" data-bind="checked: includeIndexes">
+                            <label for="importIndexes">Include Indexes</label>
                         </div>
                         <div class="toggle">
-                            <input id="import_cmp_xch" type="checkbox" data-bind="checked: includeCompareExchange">
-                            <label for="import_cmp_xch">Include Compare Exchange</label>
+                            <input id="importIdentities" type="checkbox" data-bind="checked: includeIdentities">
+                            <label for="importIdentities">Include Identities</label>
                         </div>
-
+                        <div class="toggle">
+                            <input id="importConfiguration" type="checkbox" data-bind="checked: includeDatabaseRecord">
+                            <label for="importConfiguration">Include Configuration</label>
+                            <small id="configurationPopover"><i class="icon-info text-info"></i></small>
+                        </div>
+                    </div>
+                    <div class="col-xs-12 col-sm-5 col-lg-4">
+                        <div class="toggle">
+                            <input id="importCounters" type="checkbox" data-bind="checked: includeCounters">
+                            <label for="importCounters">Include Counters</label>
+                        </div>
+                        <div class="toggle">
+                            <input id="importCmpXch" type="checkbox" data-bind="checked: includeCompareExchange">
+                            <label for="importCmpXch">Include Compare Exchange</label>
+                        </div>
+                        <div class="toggle">
+                            <input id="importConflicts" type="checkbox" data-bind="checked: includeConflicts">
+                            <label for="importConflicts">Include Conflicts</label>
+                        </div>
+                        <div class="toggle">
+                            <input id="importAnalyzers" type="checkbox" data-bind="checked: removeAnalyzers">
+                            <label for="importAnalyzers">Remove Analyzers</label>
+                        </div>
+                        <div class="toggle">
+                            <input id="importLegacyAttachments" type="checkbox" data-bind="checked: includeLegacyAttachments">
+                            <label for="importLegacyAttachments">Include Legacy Attachments</label>
+                        </div>
+                    </div>
+                </div>
+                <div class="row">
+                    <div class="col-xs-12 col-sm-6">
                         <div data-bind="validationElement: importDefinitionHasIncludes">
                             <div class="help-block" data-bind="validationMessage: importDefinitionHasIncludes"></div>
                         </div>
                     </div>
-                    <div>
-                        <div class="toggle">
-                            <input id="import_indexes" type="checkbox" data-bind="checked: includeIndexes">
-                            <label for="import_indexes">Include Indexes</label>
-                        </div>
-                        <div class="toggle">
-                            <input id="import_remove_analyzers" type="checkbox" data-bind="checked: removeAnalyzers">
-                            <label for="import_remove_analyzers">Remove Analyzers</label>
-                        </div>
-                        <div class="toggle">
-                            <input id="import_legacy_attachments" type="checkbox" data-bind="checked: includeLegacyAttachments">
-                            <label for="import_legacy_attachments">Include Legacy Attachments</label>
-                        </div>
-                    </div>
                 </div>
-            </div>
+            </div>            
             <br />
             <div data-bind="collapse: showAdvancedOptions, with: model">
                 <!-- TODO: see issue 8493 ! -->
@@ -80,7 +88,7 @@
                     <div class="toggle">
                         <input id="useTransformScript" type="checkbox" data-bind="checked: $root.showTransformScript">
                         <label for="useTransformScript" class="use-transform-script">Use Transform script </label>
-                        <small class="scriptPopover"><i class="icon-info text-info"></i></small>
+                        <small id="scriptPopover"><i class="icon-info text-info"></i></small>
                     </div>
                     <div data-bind="collapse: $root.showTransformScript">
                         <pre class="form-control" style="height: 200px;" data-bind="aceEditor: { code: transformScript, lang: 'ace/mode/javascript', completer: $root.completer }, validationOptions: { errorsAsTitle: false }, validationElement: transformScript"></pre>
@@ -89,17 +97,34 @@
                         </div>
                     </div>
                 </div>
-                <div class="form-group">
-                    <label class="control-label">Command</label>
-                    <div class="input-group">
-                        <span class="input-group-btn">
-                            <button data-bind="click: $root.copyCommandToClipboard" class="btn btn-default">
-                                <i class="icon-copy"></i>
-                                <span>Copy to clipboard</span>
-                            </button>
-                        </span>
-                        <input onClick="this.select();" class="form-control" readonly data-bind="value: $root.importCommand">
+
+                <div class="flex-horizontal">
+                    <div class="btn-group">
+                        <button data-bind="click: _.partial($root.copyCommandToClipboard, $root.importCommandPowerShell())" class="btn btn-default">
+                            <i class="icon-copy"></i>
+                            <span>Copy command as PowerShell</span>
+                        </button>
+                        <button type="button" class="btn btn-default dropdown-toggle" data-toggle="dropdown">
+                            <span class="caret"></span>
+                            <span class="sr-only">Toggle Dropdown</span>
+                        </button>
+                        <ul class="dropdown-menu">
+                            <li>
+                                <a href="#" data-bind="click: _.partial($root.copyCommandToClipboard, $root.importCommandCmd())">
+                                    <i class="icon-copy"></i> Copy as cURL (cmd)
+                                </a>
+                            </li>
+                            <li>
+                                <a href="#" data-bind="click: _.partial($root.copyCommandToClipboard, $root.importCommandBash())">
+                                    <i class="icon-copy"></i> Copy as cURL (bash)
+                                </a>
+                            </li>
+                        </ul>
                     </div>
+                    <div class="flex-grow">
+                        <input onClick="this.select();" class="form-control" readonly data-bind="value: $root.importCommandPowerShell" />    
+                    </div>
+                    
                 </div>
             </div>
             <hr />

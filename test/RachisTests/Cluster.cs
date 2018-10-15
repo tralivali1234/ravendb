@@ -27,7 +27,7 @@ namespace RachisTests
             return res.Topology.Members.Count;
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task PutUniqeValueToDifferentNode()
         {
             var clusterSize = 3;
@@ -39,14 +39,17 @@ namespace RachisTests
                 Database = databaseName
             }.Initialize())
             {
-                var doc = new DatabaseRecord(databaseName);
-                doc.Topology = new DatabaseTopology
+                var doc = new DatabaseRecord(databaseName)
                 {
-                    Members = new List<string>
+                    Topology = new DatabaseTopology
                     {
-                        "B"
+                        Members = new List<string>
+                        {
+                            "B"
+                        }
                     }
                 };
+
                 var res = await store.Maintenance.Server.SendAsync(new CreateDatabaseOperation(doc));
                 Assert.NotEqual(res.Topology.Members.First(), leader.ServerStore.NodeTag);
 
@@ -56,13 +59,13 @@ namespace RachisTests
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task CanCreateAddAndDeleteDatabaseFromNodes()
         {
             var clusterSize = 3;
             var leader = await CreateRaftClusterAndGetLeader(clusterSize);
             var replicationFactor = 2;
-            var databaseName = "test";
+            var databaseName = GetDatabaseName();
             using (var store = new DocumentStore()
             {
                 Urls = new[] { leader.WebUrl },

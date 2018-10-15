@@ -1,5 +1,4 @@
 /// <reference path="../../typings/tsd.d.ts"/>
-
 import virtualGrid = require("widgets/virtualGrid/virtualGrid");
 import listView = require("widgets/listView/listView");
 import genUtils = require("common/generalUtils");
@@ -75,37 +74,7 @@ class extensions {
         
         return null;
     }
-    
-    private static validateDatabaseName(databaseName: string): string {
-        if (!databaseName) {
-            return null;
-        }
-
-        const regex1 = /^[^\\/:\*\?"<>\|]*$/; // forbidden characters \ / : * ? " < > |
-        if (!regex1.test(databaseName)) {
-            return `Database name can't contain any of the following characters: \\ / : * ? " < > |`;
-        }
-
-        const regex2 = /^(nul|null|prn|con|lpt[0-9]|com[0-9])(\.|$)/i; // forbidden file names
-        if (regex2.test(databaseName)) {
-            return "`The name is forbidden for use!";
-        }
-
-        if (databaseName.startsWith(".")) {
-            return "Database name can't start with a dot!";
-        }
-
-        if (databaseName.endsWith(".")) {
-            return "Database name can't end with a dot!";
-        }
-
-        if (databaseName.length > 230) {
-            return "Database name can't exceed 230 characters";
-        }
-
-        return null;
-    }
-
+     
     private static configureValidation() {
 
         // Validate that url is in the following format: http(s)://hostName (e.g. http://localhost)
@@ -113,13 +82,6 @@ class extensions {
             validator: (val: string) => !extensions.validateUrl(val),
             message: (params: any, url: KnockoutObservable<string>) => {
                 return extensions.validateUrl(url());
-            }
-        };
-
-        (ko.validation.rules as any)['validDatabaseName'] = {
-            validator: (val: string) => !extensions.validateDatabaseName(val),
-            message: (params: any, databaseName: KnockoutObservable<string>) => {
-                return extensions.validateDatabaseName(databaseName());
             }
         };
 
@@ -236,7 +198,22 @@ class extensions {
     }
 
     private static installBindingHandlers() {
-      
+
+        ko.bindingHandlers["tooltipText"] = {
+            init: (element: any, valueAccessor: KnockoutObservable<string>) => {
+                const text = ko.utils.unwrapObservable(valueAccessor());
+                $(element).tooltip({
+                    title: text,
+                    container: element
+                });
+            },
+            update: (element: any, valueAccessor: KnockoutObservable<string>) => {
+                const text = ko.utils.unwrapObservable(valueAccessor());
+                $(element).attr("data-original-title", text);
+                $(".tooltip .tooltip-inner", element).html(text);
+            }
+        };
+
         ko.bindingHandlers["scrollTo"] = {
             update: (element: any, valueAccessor: KnockoutObservable<boolean>) => {
                 if (valueAccessor()) {
@@ -262,11 +239,21 @@ class extensions {
                 const value = valueAccessor();
                 const valueUnwrapped = ko.unwrap(value);
                 const $element = $(element);
-                $element
-                    .addClass('collapse')
-                    .collapse({
-                        toggle: valueUnwrapped
-                    });
+                
+                if (valueUnwrapped) {
+                    $element
+                        .addClass('collapse')
+                        .addClass('in')
+                        .collapse({
+                            toggle: !valueUnwrapped
+                        });
+                } else {
+                    $element
+                        .addClass('collapse')
+                        .collapse({
+                            toggle: valueUnwrapped
+                        });
+                }
 
                 // mark element is being initialized to allow initial animation to take place
                 $(element).data('bs.collapse').initializing = true;

@@ -53,9 +53,15 @@
     .database-item {
         padding-left: 30px;
         position: relative;
-        
+
         .state-remote {
             background-color: #43495e;
+        }
+
+        @media (min-width: @screen-lg) {
+            .info-grow {
+                width: 350px;
+            }
         }
 
         @media (min-width:@screen-sm) and (max-width:@screen-lg-max) {
@@ -95,8 +101,16 @@
             transition: background-color 0.15s ease;
         }
 
+        .database-encryption-status {
+            text-align: center;
+            width: 21px;
+            margin-right: @grid-gutter-width/4;
+            align-self: flex-start;
+        }
+
         .dbgroup-node-type {
-            margin-left: 36px;
+            display: flex;
+            flex-wrap: wrap;
 
             a {
                 color: @gray-light;
@@ -134,7 +148,7 @@
             font-size: 19px;
             display: flex;
             align-items: center;
-            width: 380px;
+            max-width: 380px;
             flex-shrink: 0;
 
             .checkbox {
@@ -170,13 +184,25 @@
     }
 
     .properties-container {
-        align-content: flex-start;
-        align-items: center;
-        overflow: hidden;
         flex-grow: 1;
+        align-self: center;
         min-height: 52px;
+        display: grid;
+        grid-template-columns: 1fr 1fr;
+        justify-items: stretch;
+        grid-auto-flow: dense;
+
+        @media (min-width: @screen-lg) {
+            grid-template-columns: 1fr 1fr 1fr;
+            grid-template-rows: auto auto auto;
+            grid-auto-flow: column;
+        }
+
 
         .properties-item {
+            &.item-last-backup {
+                grid-column-start: 2;
+            }
 
             .set-size {
                 padding: 0px 10px;
@@ -191,60 +217,6 @@
             &:hover {
                 color: lighten(@gray-light, 25%);
                 transition: color .15s ease;
-            }
-        }
-    }
-
-    &.databases_compact {
-        .panel {
-            margin-bottom: 10px;
-        }
-
-        .hidden-compact {
-            display: none;
-        }
-
-        .properties-item {
-            min-width: 0;
-        }
-
-        .info-container {
-            width: 330px;
-        }
-
-        .properties-container {
-            min-height: 0;
-        }
-
-        .database-item {
-            .database-name {
-                font-size: 18px;
-                line-height: 120%;
-            }
-
-            .state::before {
-                content: '';
-            }
-
-            .properties-container {
-
-                .properties-item {
-                    width: auto;
-                    float: left;
-                    font-size: 90%;
-                    text-overflow: ellipsis;
-
-                    .set-size {
-                        position: static;
-                        padding-right: 10px;
-                    }
-                }
-            }
-
-            .database-item {
-                .btn-group .btn {
-                    .btn-sm;
-                }
             }
         }
     }
@@ -274,5 +246,31 @@
     img, canvas {
         padding: 30px;
         background-color: white;
+    }
+}
+
+#newDatabase {
+    .dropdown {
+        .dropdown-menu {
+            &.has-info {
+                .bg-info {
+                    padding: 3px 20px;
+                    text-align: unset;
+                }
+            }
+        }
+    }
+}
+
+.more-nodes-tooltip {
+    max-width: 340px;
+    
+    a {
+        color: @gray-light;
+
+        &:hover {
+            color: lighten(@gray-light, 25%);
+            transition: color .15s ease;
+        }
     }
 }

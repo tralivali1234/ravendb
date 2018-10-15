@@ -1,24 +1,34 @@
 using System;
+using System.Globalization;
+using System.IO;
 using System.Linq;
+using System.Net.Sockets;
 using System.Runtime.Loader;
 using System.Threading;
 using System.Threading.Tasks;
+using Microsoft.AspNetCore.Connections;
 using Microsoft.Extensions.CommandLineUtils;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
+using Raven.Server.Config.Settings;
 using Raven.Server.ServerWide;
 using Raven.Server.Utils;
 using Raven.Server.Utils.Cli;
 using Sparrow.Logging;
+using Sparrow.Platform;
 
 namespace Raven.Server
 {
     public class Program
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<Program>("Raven/Server");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<Program>("Server");
 
         public static int Main(string[] args)
         {
+            UseOnlyInvariantCultureInRavenDB();
+
+            SetCurrentDirectoryToServerPath();
+
             string[] configurationArgs;
             try
             {
@@ -45,6 +55,18 @@ namespace Raven.Server
 
             new WelcomeMessage(Console.Out).Print();
 
+            var targetSettingsFile = new PathSetting(string.IsNullOrEmpty(CommandLineSwitches.CustomConfigPath)
+                ? "settings.json"
+                : CommandLineSwitches.CustomConfigPath);
+
+            var destinationSettingsFile = new PathSetting("settings.default.json");
+
+            if (File.Exists(targetSettingsFile.FullPath) == false &&
+                File.Exists(destinationSettingsFile.FullPath)) //just in case
+            {
+                File.Copy(destinationSettingsFile.FullPath, targetSettingsFile.FullPath);
+            }
+
             var configuration = new RavenConfiguration(null, ResourceType.Server, CommandLineSwitches.CustomConfigPath);
 
             if (configurationArgs != null)
@@ -53,10 +75,12 @@ namespace Raven.Server
             configuration.Initialize();
 
             LoggingSource.Instance.SetupLogMode(configuration.Logs.Mode, configuration.Logs.Path.FullPath);
+            LoggingSource.UseUtcTime = configuration.Logs.UseUtcTime;
+
             if (Logger.IsInfoEnabled)
                 Logger.Info($"Logging to {configuration.Logs.Path} set to {configuration.Logs.Mode} level.");
 
-            if(Logger.IsOperationsEnabled)
+            if (Logger.IsOperationsEnabled)
                 Logger.Operations(RavenCli.GetInfoText());
 
             if (WindowsServiceRunner.ShouldRunAsWindowsService())
@@ -119,7 +143,7 @@ namespace Raven.Server
                             {
                                 if (Logger.IsInfoEnabled)
                                     Logger.Info("Unable to OpenPipe. Admin Channel will not be available to the user", e);
-                                Console.WriteLine("Warning: Admin Channel is not available");
+                                Console.WriteLine("Warning: Admin Channel is not available:" + e);
                             }
 
                             server.Initialize();
@@ -166,8 +190,33 @@ namespace Raven.Server
                         }
                         catch (Exception e)
                         {
+                            string message = null;
+                            if (e.InnerException is AddressInUseException)
+                            {
+                                message =
+                                    $"{Environment.NewLine}Port might be already in use.{Environment.NewLine}Try running with an unused port.{Environment.NewLine}" +
+                                    $"You can change the port using one of the following options:{Environment.NewLine}" +
+                                    $"1) Change the ServerUrl property in setting.json file.{Environment.NewLine}" +
+                                    $"2) Run the server from the command line with --ServerUrl option.{Environment.NewLine}" +
+                                    $"3) Add RAVEN_ServerUrl to the Environment Variables.{Environment.NewLine}" +
+                                    "For more information go to https://ravendb.net/l/EJS81M/4.1";
+                            }else if (e is SocketException && PlatformDetails.RunningOnPosix)
+                            {
+                                message =
+                                    $"{Environment.NewLine}In Linux low-level port (below 1024) will need a special permission, if this is your case please run{Environment.NewLine}" +
+                                    $"sudo setcap CAP_NET_BIND_SERVICE=+eip {typeof(RavenServer).Assembly.Location}";
+                            }
+
                             if (Logger.IsOperationsEnabled)
+                            {
                                 Logger.Operations("Failed to initialize the server", e);
+                                Logger.Operations(message);
+                            }
+
+                            Console.WriteLine(message);
+
+                            Console.WriteLine();
+
                             Console.WriteLine(e);
 
                             return -1;
@@ -190,6 +239,28 @@ namespace Raven.Server
             } while (rerun);
 
             return 0;
+        }
+
+        private static void UseOnlyInvariantCultureInRavenDB()
+        {
+            Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
+            Thread.CurrentThread.CurrentUICulture = CultureInfo.InvariantCulture;
+            CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+            CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
+        }
+
+        private static void SetCurrentDirectoryToServerPath()
+        {
+            try
+            {
+                Directory.SetCurrentDirectory(AppContext.BaseDirectory);
+            }
+            catch (Exception exception)
+            {
+                var msg = $"Error setting current directory: {AppContext.BaseDirectory}.";
+                Logger.Operations(msg, exception);
+                Console.WriteLine($"{msg} Exception: {exception}");
+            }
         }
 
         public static ManualResetEvent ShutdownServerMre = new ManualResetEvent(false);
@@ -231,21 +302,23 @@ namespace Raven.Server
 
         private static bool RunInteractive(RavenServer server)
         {
-            var configuration = server.Configuration;
-
             //stop dumping logs
             LoggingSource.Instance.DisableConsoleLogging();
-            
-            // set log mode to the previous original mode:
-            LoggingSource.Instance.SetupLogMode(configuration.Logs.Mode, configuration.Logs.Path.FullPath);
 
-            return new RavenCli().Start(server, Console.Out, Console.In, true);
+            bool consoleColoring = true;
+            if (server.Configuration.Embedded.ParentProcessId.HasValue)
+                //When opening an embedded server we must disable console coloring to avoid exceptions,
+                //due to the fact, we redirect standard input from the console.
+                consoleColoring = false;
+
+            return new RavenCli().Start(server, Console.Out, Console.In, consoleColoring);
         }
 
         public static void WriteServerStatsAndWaitForEsc(RavenServer server)
         {
+            var workingSetText = PlatformDetails.RunningOnPosix == false ? "working set" : "    RSS    ";
             Console.WriteLine("Showing stats, press any key to close...");
-            Console.WriteLine("    working set     | native mem      | managed mem     | mmap size         | reqs/sec       | docs (all dbs)");
+            Console.WriteLine($"    {workingSetText}     | native mem      | managed mem     | mmap size         | reqs/sec       | docs (all dbs)");
             var i = 0;
             while (Console.KeyAvailable == false)
             {
@@ -288,6 +361,65 @@ namespace Raven.Server
             Console.ReadKey(true);
             Console.WriteLine();
             Console.WriteLine($"Stats halted.");
+        }
+
+        public static void WriteThreadsInfoAndWaitForEsc(RavenServer server, int maxTopThreads, int updateIntervalInMs, double cpuUsageThreshold)
+        {
+            Console.WriteLine("Showing threads info, press any key to close...");
+            var i = 0L;
+            var threadsUsage = new ThreadsUsage();
+            Thread.Sleep(100);
+
+            var cursorLeft = Console.CursorLeft;
+            var cursorTop = Console.CursorTop;
+
+            var waitIntervals = updateIntervalInMs / 100;
+            var maxNameLength = 0;
+            while (Console.KeyAvailable == false)
+            {
+                Console.SetCursorPosition(cursorLeft, cursorTop);
+
+                var threadsInfo = threadsUsage.Calculate();
+                Console.Write($"{(i++ % 2 == 0 ? "*" : "+")} ");
+                Console.WriteLine($"CPU usage: {threadsInfo.CpuUsage:0.00}% (total threads: {threadsInfo.List.Count:#,#0}, active cores: {threadsInfo.ActiveCores})   ");
+                
+                var count = 0;
+                var isFirst = true;
+                foreach (var threadInfo in threadsInfo.List
+                    .Where(x => x.CpuUsage >= cpuUsageThreshold)
+                    .OrderByDescending(x => x.CpuUsage))
+                {
+                    if (isFirst)
+                    {
+                        Console.WriteLine("  thread id  |  cpu usage  |   priority    |     thread name       ");
+                        isFirst = false;
+                    }
+
+                    if (++count > maxTopThreads)
+                        break;
+
+                    var nameLength = threadInfo.Name.Length;
+                    maxNameLength = Math.Max(maxNameLength, nameLength);
+                    var numberOfEmptySpaces = maxNameLength - nameLength + 1;
+                    var emptySpaces = numberOfEmptySpaces > 0 ? new string(' ', numberOfEmptySpaces) : string.Empty;
+
+                    Console.Write($"    {threadInfo.Id,-7} ");
+                    Console.Write($" |    {$"{threadInfo.CpuUsage:0.00}%",-8}");
+                    Console.Write($" | {threadInfo.Priority,-12} ");
+                    Console.Write($" | {threadInfo.Name}{emptySpaces}");
+
+                    Console.WriteLine();
+                }
+
+                for (var j = 0; j < waitIntervals && Console.KeyAvailable == false; j++)
+                {
+                    Thread.Sleep(100);
+                }
+            }
+
+            Console.ReadKey(true);
+            Console.WriteLine();
+            Console.WriteLine("Threads info halted.");
         }
     }
 }

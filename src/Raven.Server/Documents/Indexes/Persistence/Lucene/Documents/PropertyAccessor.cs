@@ -3,21 +3,41 @@ using System.Collections.Generic;
 using System.Reflection;
 using System.Reflection.Emit;
 using System.Runtime.CompilerServices;
+using Jint;
+using Jint.Native;
+using Jint.Native.Object;
+using Jint.Runtime.Interop;
 using Microsoft.CSharp.RuntimeBinder;
+using Sparrow.Json;
+using Raven.Server.Documents.Indexes.Static.Roslyn.Rewriters;
 
 namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
 {
     public delegate object DynamicGetter(object target);
 
-    public class PropertyAccessor
+    public class PropertyAccessor : IPropertyAccessor
     {
-        public readonly Dictionary<string, Accessor> Properties = new Dictionary<string, Accessor>();
+        private readonly Dictionary<string, Accessor> Properties = new Dictionary<string, Accessor>();
 
-        public readonly List<KeyValuePair<string, Accessor>> PropertiesInOrder =
+        private readonly List<KeyValuePair<string, Accessor>> _propertiesInOrder =
             new List<KeyValuePair<string, Accessor>>();
 
-        public static PropertyAccessor Create(Type type)
+        public IEnumerable<(string Key, object Value, CompiledIndexField GroupByField, bool IsGroupByField)> GetPropertiesInOrder(object target)
         {
+            foreach ((var key, var value) in _propertiesInOrder)
+            {
+                yield return (key, value.GetValue(target), value.GroupByField, value.IsGroupByField);
+            }
+        }
+
+        public static IPropertyAccessor Create(Type type, object instance)
+        {
+            if (type == typeof(ObjectInstance))
+                return new JintPropertyAccessor(null);
+
+            if (instance is Dictionary<string, object> dict)
+                return DictionaryAccessor.Create(dict);
+
             return new PropertyAccessor(type);
         }
 
@@ -29,7 +49,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
             throw new InvalidOperationException(string.Format("The {0} property was not found", name));
         }
 
-        private PropertyAccessor(Type type, HashSet<string> groupByFields = null)
+        protected PropertyAccessor(Type type, HashSet<CompiledIndexField> groupByFields = null)
         {
             var isValueType = type.GetTypeInfo().IsValueType;
             foreach (var prop in type.GetProperties())
@@ -38,11 +58,21 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
                     ? (Accessor)CreateGetMethodForValueType(prop, type)
                     : CreateGetMethodForClass(prop, type);
 
-                if (groupByFields != null && groupByFields.Contains(prop.Name))
-                    getMethod.IsGroupByField = true;
+                if (groupByFields != null)
+                {
+                    foreach (var groupByField in groupByFields)
+                    {
+                        if (groupByField.IsMatch(prop.Name))
+                        {
+                            getMethod.GroupByField = groupByField;
+                            getMethod.IsGroupByField = true;
+                            break;
+                        }
+                    }
+                }
 
                 Properties.Add(prop.Name, getMethod);
-                PropertiesInOrder.Add(new KeyValuePair<string, Accessor>(prop.Name, getMethod));
+                _propertiesInOrder.Add(new KeyValuePair<string, Accessor>(prop.Name, getMethod));
             }
         }
 
@@ -115,11 +145,111 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene.Documents
             public abstract object GetValue(object target);
 
             public bool IsGroupByField;
+
+            public CompiledIndexField GroupByField;
         }
 
-        internal static PropertyAccessor CreateMapReduceOutputAccessor(Type type, HashSet<string> _groupByFields)
+        internal static IPropertyAccessor CreateMapReduceOutputAccessor(Type type, object instance, HashSet<CompiledIndexField> groupByFields, bool isObjectInstance = false)
         {
-            return new PropertyAccessor(type, _groupByFields);
+            if (isObjectInstance || type == typeof(ObjectInstance))
+                return new JintPropertyAccessor(groupByFields);
+
+            if (instance is Dictionary<string, object> dict)
+                return DictionaryAccessor.Create(dict, groupByFields);
+
+            return new PropertyAccessor(type, groupByFields);
+        }
+
+    }
+
+    internal class JintPropertyAccessor : IPropertyAccessor
+    {
+        private readonly HashSet<CompiledIndexField> _groupByFields;
+
+        public JintPropertyAccessor(HashSet<CompiledIndexField> groupByFields)
+        {
+            _groupByFields = groupByFields;
+        }
+
+        public IEnumerable<(string Key, object Value, CompiledIndexField GroupByField, bool IsGroupByField)> GetPropertiesInOrder(object target)
+        {
+            if (!(target is ObjectInstance oi))
+                throw new ArgumentException($"JintPropertyAccessor.GetPropertiesInOrder is expecting a target of type ObjectInstance but got one of type {target.GetType().Name}.");
+            foreach (var property in oi.GetOwnProperties())
+            {
+                CompiledIndexField field = null;
+                var isGroupByField = _groupByFields?.TryGetValue(new SimpleField(property.Key), out field) ?? false;
+
+                yield return (property.Key, GetValue(property.Value.Value), field, isGroupByField);
+            }
+        }
+
+        public object GetValue(string name, object target)
+        {
+            if (!(target is ObjectInstance oi))
+                throw new ArgumentException($"JintPropertyAccessor.GetValue is expecting a target of type ObjectInstance but got one of type {target.GetType().Name}.");
+            if (oi.HasOwnProperty(name) == false)
+                throw new MissingFieldException($"The target for 'JintPropertyAccessor.GetValue' doesn't contain the property {name}.");
+            return GetValue(oi.GetProperty(name).Value);
+        }
+
+        private static object GetValue(JsValue jsValue)
+        {
+            if (jsValue.IsNull())
+                return null;
+            if (jsValue.IsString())
+                return jsValue.AsString();
+            if (jsValue.IsBoolean())
+                return jsValue.AsBoolean();
+            if (jsValue.IsNumber())
+                return jsValue.AsNumber();
+            if (jsValue.IsDate())
+                return jsValue.AsDate();
+            if (jsValue is ObjectWrapper ow)
+            {
+                var target = ow.Target;
+                switch (target)
+                {
+                    case LazyStringValue lsv:
+                        return lsv;
+                    case LazyCompressedStringValue lcsv:
+                        return lcsv;
+                    case LazyNumberValue lnv:
+                        return lnv; //should be already blittable supported type.
+                }
+                ThrowInvalidObject(jsValue);
+            }
+            else if (jsValue.IsArray())
+            {
+                var arr = jsValue.AsArray();
+                var array = new object[arr.GetLength()];
+                var i = 0;
+                foreach ((var key, var val) in arr.GetOwnProperties())
+                {
+                    if (key == "length")
+                        continue;
+
+                    array[i++] = GetValue(val.Value);
+                }
+
+                return array;
+            }
+            else if (jsValue.IsObject())
+            {
+                return jsValue.AsObject();
+            }
+            if (jsValue.IsUndefined())
+            {
+                return null;
+            }
+
+            ThrowInvalidObject(jsValue);
+            return null;
+        }
+
+        private static void ThrowInvalidObject(JsValue jsValue)
+        {
+            throw new NotSupportedException($"Was requested to extract the value out of a JsValue object but could not figure its type, value={jsValue}");
         }
     }
 }

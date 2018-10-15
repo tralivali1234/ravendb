@@ -8,6 +8,7 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.BulkInsert;
 using Raven.Client.Documents.Changes;
@@ -27,9 +28,7 @@ namespace Raven.Client.Documents
     {
         private readonly AtomicDictionary<IDatabaseChanges> _databaseChanges = new AtomicDictionary<IDatabaseChanges>(StringComparer.OrdinalIgnoreCase);
 
-        private ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>> _aggressiveCacheChanges = new ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>>();
-
-        private readonly ConcurrentDictionary<string, EvictItemsFromCacheBasedOnChanges> _observeChangesAndEvictItemsFromCacheForDatabases = new ConcurrentDictionary<string, EvictItemsFromCacheBasedOnChanges>();
+        private readonly ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>> _aggressiveCacheChanges = new ConcurrentDictionary<string, Lazy<EvictItemsFromCacheBasedOnChanges>>();
 
         private readonly ConcurrentDictionary<string, Lazy<RequestExecutor>> _requestExecutors = new ConcurrentDictionary<string, Lazy<RequestExecutor>>(StringComparer.OrdinalIgnoreCase);
 
@@ -68,13 +67,18 @@ namespace Raven.Client.Documents
         /// </summary>
         public override void Dispose()
         {
-            BeforeDispose?.Invoke(this,EventArgs.Empty);
+            BeforeDispose?.Invoke(this, EventArgs.Empty);
 #if DEBUG
             GC.SuppressFinalize(this);
 #endif
 
-            foreach (var observeChangesAndEvictItemsFromCacheForDatabase in _observeChangesAndEvictItemsFromCacheForDatabases)
-                observeChangesAndEvictItemsFromCacheForDatabase.Value.Dispose();
+            foreach (var value in _aggressiveCacheChanges.Values)
+            {
+                if (value.IsValueCreated == false)
+                    continue;
+
+                value.Value.Dispose();
+            }
 
             var tasks = new List<Task>();
             foreach (var changes in _databaseChanges)
@@ -141,11 +145,10 @@ namespace Raven.Client.Documents
             EnsureNotClosed();
 
             var sessionId = Guid.NewGuid();
-            var databaseName = options.Database ?? Database;
-            var requestExecutor = options.RequestExecutor ?? GetRequestExecutor(databaseName);
-            var session = new DocumentSession(databaseName, this, sessionId, requestExecutor);
+            var session = new DocumentSession(this, sessionId, options);
             RegisterEvents(session);
-            // AfterSessionCreated(session);
+            AfterSessionCreated(session);
+
             return session;
         }
 
@@ -158,22 +161,26 @@ namespace Raven.Client.Documents
             if (database == null)
                 database = Database;
 
-            if (_requestExecutors.TryGetValue(database, out Lazy<RequestExecutor> lazy))
+            if (_requestExecutors.TryGetValue(database, out var lazy))
                 return lazy.Value;
 
+            RequestExecutor CreateRequestExecutor()
+            {
+                var requestExecutor = RequestExecutor.Create(Urls, database, Certificate, Conventions);
+                RequestExecutorCreated?.Invoke(this, requestExecutor);
+                return requestExecutor;
+            }
+
+            RequestExecutor CreateRequestExecutorForSingleNode()
+            {
+                var forSingleNode = RequestExecutor.CreateForSingleNodeWithConfigurationUpdates(Urls[0], database, Certificate, Conventions);
+                RequestExecutorCreated?.Invoke(this, forSingleNode);
+                return forSingleNode;
+            }
+
             lazy = Conventions.DisableTopologyUpdates == false
-                ? new Lazy<RequestExecutor>(() =>
-                {
-                    var requestExecutor = RequestExecutor.Create(Urls, database, Certificate, Conventions);
-                    RequestExecutorCreated?.Invoke(this, requestExecutor);
-                    return requestExecutor;
-                })
-                : new Lazy<RequestExecutor>(() =>
-                {
-                    var forSingleNode = RequestExecutor.CreateForSingleNodeWithConfigurationUpdates(Urls[0], database, Certificate, Conventions);
-                    RequestExecutorCreated?.Invoke(this, forSingleNode);
-                    return forSingleNode;
-                });
+                ? new Lazy<RequestExecutor>(CreateRequestExecutor)
+                : new Lazy<RequestExecutor>(CreateRequestExecutorForSingleNode);
 
             lazy = _requestExecutors.GetOrAdd(database, lazy);
 
@@ -183,6 +190,9 @@ namespace Raven.Client.Documents
         public override IDisposable SetRequestTimeout(TimeSpan timeout, string database = null)
         {
             AssertInitialized();
+
+            database = (database ?? Database) ?? throw new InvalidOperationException("Cannot use SetRequestTimeout without a default database defined " +
+                                                                                     "unless 'database' parameter is provided. Did you forget to pass 'database' parameter?");
 
             var requestExecutor = GetRequestExecutor(database);
             var oldTimeout = requestExecutor.DefaultTimeout;
@@ -248,7 +258,9 @@ namespace Raven.Client.Documents
         public override IDisposable DisableAggressiveCaching(string database = null)
         {
             AssertInitialized();
-            var re = GetRequestExecutor(database ?? Database);
+            database = (database ?? Database) ?? throw new InvalidOperationException("Cannot use DisableAggressiveCaching without a default database defined " +
+                                                                                   "unless 'database' parameter is provided. Did you forget to pass 'database' parameter?");
+            var re = GetRequestExecutor(database);
             var old = re.AggressiveCaching.Value;
             re.AggressiveCaching.Value = null;
             return new DisposableAction(() => re.AggressiveCaching.Value = old);
@@ -290,7 +302,8 @@ namespace Raven.Client.Documents
         public override IDisposable AggressivelyCacheFor(TimeSpan cacheDuration, string database = null)
         {
             AssertInitialized();
-            database = database ?? Database;
+            database = (database ?? Database) ?? throw new InvalidOperationException("Cannot use AggressivelyCache and AggressivelyCacheFor without a default database defined " +
+                                                                                     "unless 'database' parameter is provided. Did you forget to pass 'database' parameter?");
             if (_aggressiveCachingUsed == false)
             {
                 ListenToChangesAndUpdateTheCache(database);
@@ -324,11 +337,10 @@ namespace Raven.Client.Documents
             EnsureNotClosed();
 
             var sessionId = Guid.NewGuid();
-            var databaseName = options.Database ?? Database;
-            var requestExecutor = options.RequestExecutor ?? GetRequestExecutor(databaseName);
-            var session = new AsyncDocumentSession(databaseName, this, requestExecutor, sessionId);
+            var session = new AsyncDocumentSession(this, sessionId, options);
             RegisterEvents(session);
-            //AfterSessionCreated(session);
+            AfterSessionCreated(session);
+
             return session;
         }
 
@@ -383,10 +395,10 @@ namespace Raven.Client.Documents
             }
         }
 
-        public override BulkInsertOperation BulkInsert(string database = null)
+        public override BulkInsertOperation BulkInsert(string database = null, CancellationToken token = default)
         {
             AssertInitialized();
-            return new BulkInsertOperation(database ?? Database, this);
+            return new BulkInsertOperation(database ?? Database, this, token);
         }
     }
 }

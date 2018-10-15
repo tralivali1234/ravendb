@@ -11,5 +11,9 @@ namespace Raven.Client.Documents.Operations.Backups
         public string DataDirectory { get; set; }
 
         public string EncryptionKey { get; set; }
+
+        public bool DisableOngoingTasks { get; set; }
+
+        public bool SkipIndexes { get; set; }
     }
 }

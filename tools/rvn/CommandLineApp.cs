@@ -93,7 +93,7 @@ namespace rvn
         {
             _app.Command("admin-channel", cmd =>
             {
-                cmd.ExtendedHelpText = cmd.Description = "Open RavenDB CLI session on local machine (using piped name connection). If PID ommited - will try auto pid discovery.";
+                cmd.ExtendedHelpText = cmd.Description = "Open RavenDB CLI session on local machine (using piped name connection). If PID omitted - will try auto pid discovery.";
                 cmd.HelpOption(HelpOptionString);
                 var pidArg = cmd.Argument("ProcessID", "RavenDB Server process ID");
                 cmd.OnExecute(() =>
@@ -362,16 +362,30 @@ namespace rvn
             return cmd.Option("--server-dir", "RavenDB Server directory", CommandOptionType.SingleValue);
         }
 
-        private static void ValidateRavenSystemDir(CommandArgument systemDirArg)
+        private static void ValidateRavenDirectory(CommandArgument argument)
         {
-            if (string.IsNullOrEmpty(systemDirArg.Value))
+            if (string.IsNullOrWhiteSpace(argument.Value))
             {
                 throw new InvalidOperationException("RavenDB system directory argument is mandatory.");
             }
 
-            if (Directory.Exists(systemDirArg.Value) == false)
+            var trimmedFullPath = argument.Value.TrimEnd(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+            var directory = new DirectoryInfo(trimmedFullPath);
+
+            if (directory.Exists == false)
             {
-                throw new InvalidOperationException($"Directory does not exist: { systemDirArg.Value }.");
+                throw new InvalidOperationException($"Directory does not exist: { argument.Value }.");
+            }
+
+            if (directory.Name.Equals("System"))
+            {
+                if (File.Exists(Path.Combine(directory.FullName, Voron.Global.Constants.DatabaseFilename)) == false)
+                    throw new InvalidOperationException("Please provide a valid System directory.");
+            }
+            else
+            {
+                if (Directory.Exists(Path.Combine(directory.FullName, "Journals")) == false)
+                    throw new InvalidOperationException("Please provide a valid System/Database directory.");
             }
         }
 
@@ -379,7 +393,7 @@ namespace rvn
         {
             try
             {
-                ValidateRavenSystemDir(systemDirArg);
+                ValidateRavenDirectory(systemDirArg);
                 var result = offlineOperation();
                 cmd.Out.WriteLine(result);
                 return 0;

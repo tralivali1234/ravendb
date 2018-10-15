@@ -36,7 +36,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
         private const int LongStatementWarnThresholdInMs = 3000;
 
         public RelationalDatabaseWriter(SqlEtl etl, DocumentDatabase database)
-            : base(etl.Configuration.FactoryName)
+            : base(etl.Configuration.GetFactoryName())
         {
             _etl = etl;
             _database = database;
@@ -88,13 +88,14 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
         private DbProviderFactory GetDbProviderFactory(SqlEtlConfiguration configuration)
         {
             DbProviderFactory providerFactory;
+
             try
             {
-                providerFactory = DbProviderFactories.GetFactory(configuration.FactoryName);
+                providerFactory = DbProviderFactories.GetFactory(configuration.GetFactoryName());
             }
             catch (Exception e)
             {
-                var message = $"Could not find provider factory {configuration.FactoryName} to replicate to sql for {configuration.Name}, ignoring.";
+                var message = $"Could not find provider factory {configuration.GetFactoryName()} to replicate to sql for {configuration.Name}, ignoring.";
 
                 if (_logger.IsInfoEnabled)
                     _logger.Info(message, e);
@@ -169,7 +170,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                         if (column.Id == pkName)
                             continue;
                         var colParam = cmd.CreateParameter();
-                        colParam.ParameterName = column.Id;
+                        colParam.ParameterName = GetParameterName(column.Id);
                         SetParamValue(colParam, column, _stringParserList);
                         cmd.Parameters.Add(colParam);
                         sb.Append(GetParameterName(column.Id)).Append(", ");
@@ -211,7 +212,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                         var elapsedMilliseconds = sp.ElapsedMilliseconds;
 
                         if (_logger.IsInfoEnabled)
-                            _logger.Info($"Insert took: {elapsedMilliseconds}ms, statement: {stmt}");
+                            _logger.Info($"Insert took: {elapsedMilliseconds:#,#;;0}ms, statement: {stmt}");
 
                         var tableMetrics = _etl.SqlMetrics.GetTableMetrics(tableName);
                         tableMetrics.InsertActionsMeter.Mark(1);
@@ -315,23 +316,23 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
                             _logger.Info($"Failure to replicate deletions to relational database for: {_etl.Name}, " +
                                          "will continue trying." + Environment.NewLine + cmd.CommandText, e);
 
-                        _etl.Statistics.RecordLoadError($"Delete statement:{Environment.NewLine}{cmd.CommandText}{Environment.NewLine}. Error:{Environment.NewLine}{e}", null);
+                        _etl.Statistics.RecordLoadError($"Delete statement:{Environment.NewLine}{cmd.CommandText}{Environment.NewLine}Error:{Environment.NewLine}{e}", null);
                     }
                     finally
                     {
                         sp.Stop();
 
-                        var elapsedMiliseconds = sp.ElapsedMilliseconds;
+                        var elapsedMilliseconds = sp.ElapsedMilliseconds;
 
                         if (_logger.IsInfoEnabled)
-                            _logger.Info($"Delete took: {elapsedMiliseconds}ms, statement: {stmt}");
+                            _logger.Info($"Delete took: {elapsedMilliseconds:#,#;;0}ms, statement: {stmt}");
 
                         var tableMetrics = _etl.SqlMetrics.GetTableMetrics(tableName);
                         tableMetrics.DeleteActionsMeter.Mark(1);
 
-                        if (elapsedMiliseconds > LongStatementWarnThresholdInMs)
+                        if (elapsedMilliseconds > LongStatementWarnThresholdInMs)
                         {
-                            HandleSlowSql(elapsedMiliseconds, stmt);
+                            HandleSlowSql(elapsedMilliseconds, stmt);
                         }
                     }
                 }
@@ -340,15 +341,15 @@ namespace Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters
             return deleted;
         }
 
-        private void HandleSlowSql(long elapsedMiliseconds, string stmt)
+        private void HandleSlowSql(long elapsedMilliseconds, string stmt)
         {
             if (_logger.IsInfoEnabled)
-                _logger.Info($"[{_etl.Name}] Slow SQL detected. Execution took: {elapsedMiliseconds}ms, statement: {stmt}");
+                _logger.Info($"[{_etl.Name}] Slow SQL detected. Execution took: {elapsedMilliseconds:#,#;;0}ms, statement: {stmt}");
 
             _etl.Statistics.RecordSlowSql(new SlowSqlStatementInfo
             {
                 Date = SystemTime.UtcNow,
-                Duration = elapsedMiliseconds,
+                Duration = elapsedMilliseconds,
                 Statement = stmt
             });
         }

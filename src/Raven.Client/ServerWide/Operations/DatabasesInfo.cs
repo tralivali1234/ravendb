@@ -2,6 +2,7 @@
 using System.Collections.Generic;
 using System.Linq;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations.Configuration;
 using Raven.Client.Util;
 using Sparrow.Json.Parsing;
 
@@ -33,6 +34,7 @@ namespace Raven.Client.ServerWide.Operations
         public string Name { get; set; }
         public bool Disabled { get; set; }
         public Size TotalSize { get; set; }
+        public Size TempBuffersSize { get; set; }
 
         public bool IsAdmin { get; set; }
         public bool IsEncrypted { get; set; }
@@ -55,6 +57,8 @@ namespace Raven.Client.ServerWide.Operations
         public int ReplicationFactor { get; set; }
         public bool DynamicNodesDistribution { get; set; }
         public Dictionary<string, DeletionInProgressStatus> DeletionInProgress { get; set; }
+        
+        public StudioConfiguration.StudioEnvironment Environment { get; set; }
 
         public DynamicJsonValue ToJson()
         {
@@ -67,7 +71,11 @@ namespace Raven.Client.ServerWide.Operations
                     [nameof(Size.HumaneSize)] = TotalSize.HumaneSize,
                     [nameof(Size.SizeInBytes)] = TotalSize.SizeInBytes
                 },
-
+                [nameof(TempBuffersSize)] = new DynamicJsonValue
+                {
+                    [nameof(Size.HumaneSize)] = TempBuffersSize.HumaneSize,
+                    [nameof(Size.SizeInBytes)] = TempBuffersSize.SizeInBytes
+                },
                 [nameof(IsAdmin)] = IsAdmin,
                 [nameof(IsEncrypted)] = IsEncrypted,
                 [nameof(UpTime)] = UpTime?.ToString(),
@@ -86,7 +94,8 @@ namespace Raven.Client.ServerWide.Operations
                 [nameof(NodesTopology)] = NodesTopology?.ToJson(),
                 [nameof(ReplicationFactor)] = ReplicationFactor,
                 [nameof(DynamicNodesDistribution)] = DynamicNodesDistribution,
-                [nameof(DeletionInProgress)] = DynamicJsonValue.Convert(DeletionInProgress)
+                [nameof(DeletionInProgress)] = DynamicJsonValue.Convert(DeletionInProgress),
+                [nameof(Environment)] = Environment
             };
         }
     }
@@ -97,12 +106,15 @@ namespace Raven.Client.ServerWide.Operations
 
         public long UsedSpace { get; set; }
 
+        public long UsedSpaceByTempBuffers { get; set; }
+
         public DynamicJsonValue ToJson()
         {
             return new DynamicJsonValue
             {
                 [nameof(DiskSpaceResult)] = DiskSpaceResult.ToJson(),
-                [nameof(UsedSpace)] = UsedSpace
+                [nameof(UsedSpace)] = UsedSpace,
+                [nameof(UsedSpaceByTempBuffers)] = UsedSpaceByTempBuffers
             };
         }
     }

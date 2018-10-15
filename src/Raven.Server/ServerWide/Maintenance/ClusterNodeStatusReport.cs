@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using Raven.Client.Documents.Indexes;
 using Sparrow.Json.Parsing;
 
 namespace Raven.Server.ServerWide.Maintenance
@@ -12,7 +13,8 @@ namespace Raven.Server.ServerWide.Maintenance
         Loading = 2,
         Faulted = 4,
         Unloaded = 8,
-        Shutdown = 16
+        Shutdown = 16,
+        NoChange = 32
     }
 
     public class DatabaseStatusReport : IDynamicJson
@@ -29,16 +31,24 @@ namespace Raven.Server.ServerWide.Maintenance
         {
             public bool IsSideBySide;
             public long LastIndexedEtag;
+            public TimeSpan? LastQueried;
             public bool IsStale;
+            public IndexState State;
+            public long LastTransactionId; // this is local, so we don't serialize it
         }
 
         public long LastEtag;
         public long LastTombstoneEtag;
         public long NumberOfConflicts;
         public long NumberOfDocuments;
+        public long LastCompletedClusterTransaction;
 
         public DatabaseStatus Status;
         public string Error;
+        public TimeSpan? UpTime;
+
+        public long LastTransactionId; // this is local, so we don't serialize it
+        public long EnvironmentsHash; // this is local, so we don't serialize it
 
         public DynamicJsonValue ToJson()
         {
@@ -52,8 +62,10 @@ namespace Raven.Server.ServerWide.Maintenance
                 [nameof(NumberOfConflicts)] = NumberOfConflicts,
                 [nameof(NumberOfDocuments)] = NumberOfDocuments,
                 [nameof(DatabaseChangeVector)] = DatabaseChangeVector,
+                [nameof(LastCompletedClusterTransaction)] = LastCompletedClusterTransaction,
                 [nameof(LastSentEtag)] = DynamicJsonValue.Convert(LastSentEtag),
-                [nameof(Error)] = Error
+                [nameof(Error)] = Error,
+                [nameof(UpTime)] = UpTime
             };
             var indexStats = new DynamicJsonValue();
             foreach (var stat in LastIndexStats)
@@ -61,8 +73,10 @@ namespace Raven.Server.ServerWide.Maintenance
                 indexStats[stat.Key] = new DynamicJsonValue
                 {
                     [nameof(stat.Value.LastIndexedEtag)] = stat.Value.LastIndexedEtag,
+                    [nameof(stat.Value.LastQueried)] = stat.Value.LastQueried,
                     [nameof(stat.Value.IsSideBySide)] = stat.Value.IsSideBySide,
-                    [nameof(stat.Value.IsStale)] = stat.Value.IsStale
+                    [nameof(stat.Value.IsStale)] = stat.Value.IsStale,
+                    [nameof(stat.Value.State)] = stat.Value.State
                 };
             }
             dynamicJsonValue[nameof(LastIndexStats)] = indexStats;
@@ -115,13 +129,14 @@ namespace Raven.Server.ServerWide.Maintenance
                 var dbName = dbReport.Key;
                 var dbStatus = dbReport.Value.Status;
 
-                if (reportStatus != ReportStatus.Ok || dbStatus != DatabaseStatus.Loaded)
-                { 
-                    SetLastDbGoodTime(lastSuccessfulReport, dbName);
+                if (reportStatus == ReportStatus.Ok && 
+                    (dbStatus == DatabaseStatus.Loaded || dbStatus == DatabaseStatus.NoChange))
+                {
+                    LastGoodDatabaseStatus[dbName] = updateDateTime;
                 }
                 else
                 {
-                    LastGoodDatabaseStatus[dbName] = updateDateTime;
+                    SetLastDbGoodTime(lastSuccessfulReport, dbName);
                 }
             }
         }

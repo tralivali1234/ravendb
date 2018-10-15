@@ -8,6 +8,8 @@ import jsonUtil = require("common/jsonUtil");
 class discoveryUrl {
     discoveryUrlName = ko.observable<string>();
     validationGroup: KnockoutValidationGroup;
+
+    static usingHttps = location.protocol === "https:";
     
     dirtyFlag: () => DirtyFlag;
     
@@ -25,6 +27,16 @@ class discoveryUrl {
         this.discoveryUrlName.extend({         
             validUrl: true
         });
+        
+        if (!discoveryUrl.usingHttps) {
+            this.discoveryUrlName.extend({
+                validation: [
+                    {
+                        validator: (val: string) => !val || val.startsWith("http://"),
+                        message: "Connecting from unsecured server (http) to secured (https) is not supported."
+                    }]
+            });
+        }
 
         this.validationGroup = ko.validatedObservable({
             discoveryUrlName: this.discoveryUrlName
@@ -140,7 +152,7 @@ class connectionStringRavenEtlModel extends connectionStringModel {
     }
 
     testConnection(urlToTest: string) : JQueryPromise<Raven.Server.Web.System.NodeConnectionTestResult> {       
-        return new testClusterNodeConnectionCommand(urlToTest)
+        return new testClusterNodeConnectionCommand(urlToTest, this.database())
             .execute();
     }
 

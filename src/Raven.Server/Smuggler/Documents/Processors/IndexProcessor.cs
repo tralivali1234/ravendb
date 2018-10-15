@@ -1,5 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
+using System.Linq;
+using System.Text.RegularExpressions;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Util;
 using Raven.Server.Documents;
@@ -36,6 +38,8 @@ namespace Raven.Server.Smuggler.Documents.Processors
                             return AutoMapReduceIndexDefinition.LoadFromJson(reader);
                         case IndexType.Map:
                         case IndexType.MapReduce:
+                        case IndexType.JavaScriptMap:
+                        case IndexType.JavaScriptMapReduce:
                             return JsonDeserializationServer.IndexDefinition(reader);
                         default:
                             throw new NotSupportedException(type.ToString());
@@ -61,6 +65,8 @@ namespace Raven.Server.Smuggler.Documents.Processors
                     break;
                 case IndexType.Map:
                 case IndexType.MapReduce:
+                case IndexType.JavaScriptMap:
+                case IndexType.JavaScriptMapReduce:
                     var indexDefinition = (IndexDefinition)definition;
                     if (removeAnalyzers)
                     {
@@ -89,7 +95,7 @@ namespace Raven.Server.Smuggler.Documents.Processors
 
             writer.WritePropertyName(nameof(IndexDefinition));
 
-            if (index.Type == IndexType.Map || index.Type == IndexType.MapReduce)
+            if (index.Type == IndexType.Map || index.Type == IndexType.MapReduce || index.Type == IndexType.JavaScriptMap || index.Type == IndexType.JavaScriptMapReduce)
             {
                 var indexDefinition = index.GetIndexDefinition();
                 writer.WriteIndexDefinition(context, indexDefinition, removeAnalyzers);
@@ -138,6 +144,8 @@ namespace Raven.Server.Smuggler.Documents.Processors
 
             if (indexDefinition.Maps != null)
             {
+                indexDefinition.Maps = indexDefinition.Maps.Select(ReplaceLegacyProperties).ToHashSet();
+
                 foreach (var map in indexDefinition.Maps)
                 {
                     if (IsFunctionValid(map, out var message) == false)
@@ -147,6 +155,8 @@ namespace Raven.Server.Smuggler.Documents.Processors
 
             if (indexDefinition.Reduce != null)
             {
+                indexDefinition.Reduce = ReplaceLegacyProperties(indexDefinition.Reduce);
+
                 if (IsFunctionValid(indexDefinition.Reduce, out var message) == false)
                     throw new InvalidOperationException($"Reduce function of legacy index '{name}' is invalid. {message}");
             }
@@ -219,6 +229,16 @@ namespace Raven.Server.Smuggler.Documents.Processors
             }
 
             return indexDefinition;
+        }
+
+        private static string ReplaceLegacyProperties(string str)
+        {
+            if (string.IsNullOrWhiteSpace(str))
+                return str;
+
+            str = str.Replace("new Raven.Abstractions.Linq.DynamicList", "new DynamicArray");
+            var regex = new Regex(@"([\w_.]+)\.__document_id");
+            return regex.Replace(str, "Id($1)");
         }
 
         private static bool IsFunctionValid(string function, out string message)

@@ -30,12 +30,13 @@ namespace Raven.Client.Documents.Changes
         /// <summary>
         /// Document type name.
         /// </summary>
+        [Obsolete("DatabaseChanges.ForDocumentsOfType is not supported anymore. Will be removed in next major version of the product.")]
         public string TypeName { get; set; }
 
         /// <summary>
         /// Document change vector
         /// </summary>
-        public string ChangeVector { get; set; } 
+        public string ChangeVector { get; set; }
 
         internal bool TriggeredByReplicationThread;
 
@@ -51,7 +52,6 @@ namespace Raven.Client.Documents.Changes
                 [nameof(Type)] = Type.ToString(),
                 [nameof(Id)] = Id,
                 [nameof(CollectionName)] = CollectionName,
-                [nameof(TypeName)] = TypeName,
                 [nameof(ChangeVector)] = ChangeVector
             };
         }
@@ -60,7 +60,6 @@ namespace Raven.Client.Documents.Changes
         {
             value.TryGet(nameof(CollectionName), out string collectionName);
             value.TryGet(nameof(ChangeVector), out string changeVector);
-            value.TryGet(nameof(TypeName), out string typeName);
             value.TryGet(nameof(Id), out string id);
             value.TryGet(nameof(Type), out string type);
 
@@ -69,7 +68,6 @@ namespace Raven.Client.Documents.Changes
                 CollectionName = collectionName,
                 ChangeVector = changeVector,
                 Id = id,
-                TypeName = typeName,
                 Type = (DocumentChangeTypes)Enum.Parse(typeof(DocumentChangeTypes), type, ignoreCase: true)
             };
         }
@@ -87,6 +85,7 @@ namespace Raven.Client.Documents.Changes
         BulkInsertError = 16,
         DeleteOnTombstoneReplication = 32,
         Conflict = 64,
+
         Common = Put | Delete
     }
 
@@ -113,6 +112,75 @@ namespace Raven.Client.Documents.Changes
         IndexPaused = 4096,
         LockModeChanged = 8192,
         PriorityChanged = 16384
+    }
+
+    [Flags]
+    public enum CounterChangeTypes
+    {
+        None = 0,
+        Put = 1,
+        Delete = 2,
+        Increment = 4
+    }
+
+    public class CounterChange : DatabaseChange
+    {
+        /// <summary>
+        /// Counter name.
+        /// </summary>
+        public string Name { get; set; }
+
+        /// <summary>
+        /// Counter value.
+        /// </summary>
+        public long Value { get; set; }
+
+        /// <summary>
+        /// Counter document identifier.
+        /// </summary>
+        public string DocumentId { get; set; }
+
+        /// <summary>
+        /// Counter change vector.
+        /// </summary>
+        public string ChangeVector { get; set; }
+
+        /// <summary>
+        /// Type of change that occurred on counter.
+        /// </summary>
+        public CounterChangeTypes Type { get; set; }
+
+        internal bool TriggeredByReplicationThread;
+
+        public DynamicJsonValue ToJson()
+        {
+            return new DynamicJsonValue
+            {
+                [nameof(Name)] = Name,
+                [nameof(Value)] = Value,
+                [nameof(DocumentId)] = DocumentId,
+                [nameof(ChangeVector)] = ChangeVector,
+                [nameof(Type)] = Type.ToString()
+            };
+        }
+
+        internal static CounterChange FromJson(BlittableJsonReaderObject value)
+        {
+            value.TryGet(nameof(Name), out string name);
+            value.TryGet(nameof(Value), out long val);
+            value.TryGet(nameof(DocumentId), out string documentId);
+            value.TryGet(nameof(ChangeVector), out string changeVector);
+            value.TryGet(nameof(Type), out string type);
+
+            return new CounterChange
+            {
+                Name = name,
+                Value = val,
+                DocumentId = documentId,
+                ChangeVector = changeVector,
+                Type = (CounterChangeTypes)Enum.Parse(typeof(CounterChangeTypes), type, ignoreCase: true)
+            };
+        }
     }
 
     public class IndexChange : DatabaseChange
@@ -173,7 +241,23 @@ namespace Raven.Client.Documents.Changes
         public string AbsoluteUri { get; set; }
         public string DatabaseName { get; set; }
         public string CustomInfo { get; set; }
+        public TrafficWatchChangeType Type { get; set; }
         public int InnerRequestsCount { get; set; }
         public object QueryTimings { get; set; }
+    }
+
+    public enum TrafficWatchChangeType
+    {
+        None,
+        Queries,
+        Operations,
+        MultiGet,
+        BulkDocs,
+        Index,
+        Counters,
+        Hilo,
+        Subscriptions,
+        Streams,
+        Documents
     }
 }

@@ -8,7 +8,6 @@
             </div>
         </div>
     </div>
-
     <div class="flex-vertical absolute-fill" data-bind="visible: sortedGroups().length">
         <div class="flex-header">
             <div class="clearfix toolbar" data-bind="if: sortedGroups().length">
@@ -61,7 +60,8 @@
                                 </div>
                                 <div class="btn-group">
                                     <button type="button" class="btn btn-default dropdown-toggle" title="Change the options of selected indexes"
-                                            data-bind="enable: $root.globalIndexingStatus() === 'Running' && selectedIndexesName().length && !spinners.globalLockChanges(), css: { 'btn-spinner': spinners.globalLockChanges() }" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
+                                            data-bind="enable: selectedIndexesName().length && !spinners.globalLockChanges(), 
+                                                       css: { 'btn-spinner': spinners.globalLockChanges() }" data-toggle="dropdown" aria-haspopup="true" aria-expanded="false">
                                         <i class="icon-lock"></i><span>Set lock mode...</span>
                                         <span class="caret"></span>
                                         <span class="sr-only">Toggle Dropdown</span>
@@ -110,13 +110,11 @@
             </div>
         </div>
         <div class="flex-grow scroll">
-
             <div data-bind="foreach: sortedGroups">
-                <h2 data-bind="text: entityName, visible: !groupHidden()"></h2>
+                <h2 data-bind="text: entityName, visible: !groupHidden(), attr: { title: 'Collection: ' + entityName }"></h2>
                 <div data-bind="foreach: indexes, visible: !groupHidden()">
                     <div data-bind="css: { 'sidebyside-indexes': replacement }, visible: !filteredOut()">
                         <div class="panel panel-state index" data-bind="template: { name: 'index-template' }, css: { 'has-replacement': replacement }">
-
                         </div>
                         <div class="sidebyside-actions" data-bind="with: replacement, visible: replacement">
                             <div class="panel panel-state panel-warning">
@@ -151,7 +149,7 @@
                     <label></label>
                 </div>
                 <h3 class="index-name">
-                    <a href="#" data-bind="text: name, attr: { href: editUrl(), title: name }"></a>
+                    <a href="#" data-bind="text: name, attr: { href: editUrl(), title: 'Index: ' + name }"></a>
                 </h3>
                 <div class="index-type">
                     <span data-bind="text: getTypeForUI()"></span>
@@ -213,11 +211,11 @@
                         </ul>
                     </div>
                 </div>
-                <div class="properties-item priority">
+                <div class="properties-item priority" data-bind="if: !isSideBySide()">
                     <span class="properties-label">Priority:</span>
                     <div class="btn-group properties-value">
                         <button type="button" class="btn set-size dropdown-toggle" data-toggle="dropdown"
-                                data-bind="css: { 'btn-spinner': _.includes($root.spinners.localPriority(), name) }, enable: $root.globalIndexingStatus() === 'Running' && !_.includes($root.spinners.localPriority(), name)">
+                                data-bind="css: { 'btn-spinner': _.includes($root.spinners.localPriority(), name) }, enable: !_.includes($root.spinners.localPriority(), name)">
                             <span data-bind="visible: isNormalPriority()">
                                 <i class="icon-check"></i>
                                 <span>Normal</span>
@@ -251,12 +249,11 @@
                         </ul>
                     </div>
                 </div>
-                <div class="properties-item mode">
+                <div class="properties-item mode" data-bind="css: { 'hidden': type === 'AutoMap' || type === 'AutoMapReduce' || isSideBySide() }">
                     <span class="properties-label">Mode:</span>
                     <div class="btn-group properties-value">
                         <button type="button" class="btn set-size dropdown-toggle" data-toggle="dropdown"
-                                data-bind="css: { 'btn-spinner': _.includes($root.spinners.localLockChanges(), name) }, enable: $root.globalIndexingStatus() === 'Running' &&
-                                !_.includes($root.spinners.localLockChanges(), name)">
+                                data-bind="css: { 'btn-spinner': _.includes($root.spinners.localLockChanges(), name) }, enable: !_.includes($root.spinners.localLockChanges(), name)">
                             <span data-bind="visible: lockMode() === 'Unlock'">
                                 <i class="icon-unlock"></i><span>Unlocked</span>
                             </span>
@@ -357,12 +354,12 @@
             </div>
         </div>
 
-        <div data-bind="with: progress, visible: !isErrorState()">
+        <div data-bind="with: progress, visible: !isErrorState() && !isFaulty()">
             <hr class="small" />
             <div class="progress-container">
                 <div class="progress-overall">
                     <div class="flex-horizontal" data-bind="with: globalProgress">
-                        <h3 class="flex-grow"><span data-bind="text: formattedTimeLeftToProcess, attr: { title: formattedTimeLeftToProcessTitle }"></span></h3>
+                        <h3 class="flex-grow"><span data-bind="text: formattedTimeLeftToProcess"></span></h3>
                         <div class="percentage" data-bind="text: percentageFormatted,  css: { 'text-success': completed }, attr: { title: textualProgress }"></div>
                     </div>
                     <div class="progress" data-bind="with: globalProgress">

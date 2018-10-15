@@ -23,9 +23,10 @@ using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Client.Extensions;
 using Raven.Server.Documents.ETL.Providers.SQL;
 using Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters;
+using Raven.Server.Documents.ETL.Providers.SQL.Test;
 using Raven.Server.ServerWide.Context;
 using Raven.Tests.Core.Utils.Entities;
-using Sparrow.Platform;
+using Sparrow;
 using Xunit;
 
 namespace SlowTests.Server.Documents.ETL.SQL
@@ -34,56 +35,40 @@ namespace SlowTests.Server.Documents.ETL.SQL
     {
         public static readonly Lazy<string> MasterDatabaseConnection = new Lazy<string>(() =>
         {
-            var local = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3";
-            try
+            var cString = @"Data Source=localhost\sqlexpress;Integrated Security=SSPI;Connection Timeout=3";
+
+            if (TryConnect(cString))
+                return cString;
+
+            cString = @"Data Source=ci1\sqlexpress;Integrated Security=SSPI;Connection Timeout=3";
+
+            if (TryConnect(cString))
+                return cString;
+
+            cString = Environment.GetEnvironmentVariable("RAVEN_MSSQL_CONNECTION_STRING");
+
+            if (TryConnect(cString))
+                return cString;
+
+            throw new InvalidOperationException("Use a valid connection");
+
+            bool TryConnect(string connectionString)
             {
-                using (var con = new SqlConnection(local))
-                {
-                    con.Open();
-                }
-                return local;
-            }
-            catch (Exception)
-            {
+                if (string.IsNullOrWhiteSpace(connectionString))
+                    return false;
+
                 try
                 {
-                    local = @"Data Source=ci1\sqlexpress;Integrated Security=SSPI;Connection Timeout=3";
-                    using (var con = new SqlConnection(local))
+                    using (var connection = new SqlConnection(connectionString))
                     {
-                        con.Open();
+                        connection.Open();
                     }
-                    return local;
+
+                    return true;
                 }
-                catch
+                catch (Exception)
                 {
-                    try
-                    {
-                        local = @"Data Source=(localdb)\v11.0;Integrated Security=SSPI;Connection Timeout=3";
-                        using (var con = new SqlConnection(local))
-                        {
-                            con.Open();
-                        }
-                        return local;
-                    }
-                    catch
-                    {
-                        try
-                        {
-                            string path;
-                            if (PlatformDetails.RunningOnPosix)
-                                path = @"/tmp/sqlReplicationPassword.txt";
-                            else
-                                path = @"P:\Build\SqlReplicationPassword.txt";
-
-                            var readAllLines = File.ReadAllLines(path);
-                            return $@"Data Source=ci1\sqlexpress;User Id={readAllLines[0]};Password={readAllLines[1]};Connection Timeout=1";
-                        }
-                        catch (Exception e)
-                        {
-                            throw new InvalidOperationException("Use a valid connection", e);
-                        }
-
-                    }
+                    return false;
                 }
             }
         });
@@ -111,7 +96,7 @@ for (var i = 0; i < this.OrderLines.length; i++) {
 loadToOrders(orderData);
 ";
 
-        [NonLinuxFact]
+        [Fact]
         public async Task ReplicateMultipleBatches()
         {
             using (var store = GetDocumentStore())
@@ -223,7 +208,7 @@ CREATE DATABASE [SqlReplication-{store.Database}]
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task SimpleTransformation()
         {
             using (var store = GetDocumentStore())
@@ -265,7 +250,7 @@ CREATE DATABASE [SqlReplication-{store.Database}]
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task NullPropagation()
         {
             using (var store = GetDocumentStore())
@@ -305,13 +290,13 @@ loadToOrders(orderData);");
                         dbCommand.CommandText = " SELECT COUNT(*) FROM Orders";
                         Assert.Equal(1, dbCommand.ExecuteScalar());
                         dbCommand.CommandText = " SELECT OrderLinesCount FROM Orders";
-                        Assert.Equal(DBNull.Value, dbCommand.ExecuteScalar());
+                        Assert.Equal(0, dbCommand.ExecuteScalar());
                     }
                 }
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task NullPropagation_WithExplicitNull()
         {
             using (var store = GetDocumentStore())
@@ -360,7 +345,7 @@ loadToOrders(orderData);");
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task RavenDB_3341()
         {
             using (var store = GetDocumentStore())
@@ -414,7 +399,7 @@ loadToOrders(orderData);");
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task CanUpdateToBeNoItemsInChildTable()
         {
             using (var store = GetDocumentStore())
@@ -456,7 +441,7 @@ loadToOrders(orderData);");
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task CanDelete()
         {
             using (var store = GetDocumentStore())
@@ -495,7 +480,7 @@ loadToOrders(orderData);");
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task RavenDB_3172()
         {
             using (var store = GetDocumentStore())
@@ -544,7 +529,7 @@ loadToOrders(orderData);");
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task WillLog()
         {
             using (var client = new ClientWebSocket())
@@ -559,6 +544,9 @@ loadToOrders(orderData);");
                 }
                 string str = string.Format("{0}/admin/logs/watch", store.Urls.First().Replace("http", "ws"));
                 StringBuilder sb = new StringBuilder();
+
+                var mre = new AsyncManualResetEvent();
+
                 await client.ConnectAsync(new Uri(str), CancellationToken.None);
                 var task = Task.Run((Func<Task>)(async () =>
                {
@@ -568,6 +556,7 @@ loadToOrders(orderData);");
                        var value = await ReadFromWebSocket(buffer, client);
                        lock (sb)
                        {
+                           mre.Set();
                            sb.AppendLine(value);
                        }
                        const string expectedValue = "skipping document: orders/1";
@@ -576,25 +565,31 @@ loadToOrders(orderData);");
 
                    }
                }));
+                await mre.WaitAsync(TimeSpan.FromSeconds(60));
                 SetupSqlEtl(store, @"output ('Tralala'); 
 
 undefined();
 
 var nameArr = this.StepName.split('.'); loadToOrders({});");
 
-                var condition = await task.WaitWithTimeout(TimeSpan.FromSeconds(30));
+                var condition = await task.WaitWithTimeout(TimeSpan.FromSeconds(60));
                 if (condition == false)
                 {
                     var msg = "Could not process SQL Replication script for OrdersAndLines, skipping document: orders/1";
                     var tempFileName = Path.GetTempFileName();
-                    File.WriteAllText(tempFileName, sb.ToString());
+                    lock (sb)
+                    {
+                        File.WriteAllText(tempFileName, sb.ToString());
+                    }
                     throw new InvalidOperationException($"{msg}. Full log is: \r\n{tempFileName}");
                 }
             }
         }
 
-        [NonLinuxFact]
-        public async Task SimulationTest()
+        [Theory]
+        [InlineData(true)]
+        [InlineData(false)]
+        public async Task CanTestScript(bool performRolledBackTransaction)
         {
             using (var store = GetDocumentStore())
             {
@@ -617,6 +612,7 @@ var nameArr = this.StepName.split('.'); loadToOrders({});");
                 {
                     Name = "simulate",
                     ConnectionString = GetConnectionString(store),
+                    FactoryName = "System.Data.SqlClient",
                 }));
 
                 var database = GetDatabase(store.Database).Result;
@@ -624,51 +620,52 @@ var nameArr = this.StepName.split('.'); loadToOrders({});");
                 using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                 using (context.OpenReadTransaction())
                 {
-                    for (int i = 0; i < 2; i++)
+                    var result = (SqlEtlTestScriptResult) SqlEtl.TestScript(new TestSqlEtlScript
                     {
-                        var result = SqlEtl.SimulateSqlEtl(new SimulateSqlEtl
+                        PerformRolledBackTransaction = performRolledBackTransaction,
+                        DocumentId = "orders/1-A",
+                        Configuration = new SqlEtlConfiguration()
                         {
-                            PerformRolledBackTransaction = i % 2 != 0,
-                            DocumentId = "orders/1-A",
-                            Configuration = new SqlEtlConfiguration()
+                            Name = "simulate",
+                            ConnectionStringName = "simulate",
+                            SqlTables =
                             {
-                                Name = "simulate",
-                                ConnectionStringName = "simulate",
-                                FactoryName = "System.Data.SqlClient",
-                                SqlTables =
+                                new SqlEtlTable {TableName = "Orders", DocumentIdColumn = "Id"},
+                                new SqlEtlTable {TableName = "OrderLines", DocumentIdColumn = "OrderId"},
+                                new SqlEtlTable {TableName = "NotUsedInScript", DocumentIdColumn = "OrderId"},
+                            },
+                            Transforms =
+                            {
+                                new Transformation()
                                 {
-                                    new SqlEtlTable {TableName = "Orders", DocumentIdColumn = "Id"},
-                                    new SqlEtlTable {TableName = "OrderLines", DocumentIdColumn = "OrderId"},
-                                },
-                                Transforms =
-                                {
-                                    new Transformation()
-                                    {
-                                        Collections = {"Orders"},
-                                        Name = "OrdersAndLines",
-                                        Script = defaultScript
-                                    }
+                                    Collections = {"Orders"},
+                                    Name = "OrdersAndLines",
+                                    Script = defaultScript + "output('test output')"
                                 }
                             }
-                        }, database, database.ServerStore, context);
+                        }
+                    }, database, database.ServerStore, context);
 
-                        Assert.Null(result.LastAlert);
-                        Assert.Equal(2, result.Summary.Count);
+                    Assert.Equal(0, result.TransformationErrors.Count);
+                    Assert.Equal(0, result.LoadErrors.Count);
+                    Assert.Equal(0, result.SlowSqlWarnings.Count);
 
-                        var orderLines = result.Summary.First(x => x.TableName == "OrderLines");
+                    Assert.Equal(2, result.Summary.Count);
 
-                        Assert.Equal(3, orderLines.Commands.Length); // delete and two inserts
+                    var orderLines = result.Summary.First(x => x.TableName == "OrderLines");
 
-                        var orders = result.Summary.First(x => x.TableName == "Orders");
+                    Assert.Equal(3, orderLines.Commands.Length); // delete and two inserts
 
-                        Assert.Equal(2, orders.Commands.Length); // delete and insert
-                    }
+                    var orders = result.Summary.First(x => x.TableName == "Orders");
 
+                    Assert.Equal(2, orders.Commands.Length); // delete and insert
+
+                    Assert.Equal("test output", result.DebugOutput[0]);
                 }
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task LoadingSingleAttachment()
         {
             using (var store = GetDocumentStore())
@@ -734,7 +731,77 @@ loadToOrders(orderData);
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
+        public async Task Should_error_if_attachment_doesnt_exist()
+        {
+            using (var store = GetDocumentStore())
+            {
+                CreateRdbmsSchema(store, @"
+CREATE TABLE [dbo].[Orders]
+(
+    [Id] [nvarchar](50) NOT NULL,
+    [Name] [nvarchar](255) NULL,
+    [Pic] [varbinary](max) NULL
+)
+");
+
+                var attachmentBytes = new byte[] { 1, 2, 3 };
+
+                using (var session = store.OpenAsyncSession())
+                {
+                    await session.StoreAsync(new Order(), "orders/1-A");
+                    await session.StoreAsync(new Order(), "orders/2-A");
+                    await session.StoreAsync(new Order(), "orders/3-A");
+
+                    await session.SaveChangesAsync();
+                }
+
+                store.Operations.Send(new PutAttachmentOperation("orders/1-A", "abc.jpg", new MemoryStream(attachmentBytes), "image/png"));
+                store.Operations.Send(new PutAttachmentOperation("orders/2-A", "photo.jpg", new MemoryStream(attachmentBytes), "image/png"));
+
+                var etlDone = WaitForEtl(store, (n, statistics) => statistics.LoadSuccesses > 0);
+
+                SetupSqlEtl(store, @"
+var orderData = {
+    Id: id(this),
+    Name: 'photo.jpg',
+    Pic: loadAttachment('photo.jpg')
+};
+
+loadToOrders(orderData);
+");
+
+                etlDone.Wait(TimeSpan.FromMinutes(5));
+
+                using (var con = new SqlConnection())
+                {
+                    con.ConnectionString = GetConnectionString(store);
+                    con.Open();
+
+                    using (var dbCommand = con.CreateCommand())
+                    {
+                        dbCommand.CommandText = " SELECT COUNT(*) FROM Orders";
+                        Assert.Equal(1, dbCommand.ExecuteScalar());
+                    }
+
+                    using (var dbCommand = con.CreateCommand())
+                    {
+                        dbCommand.CommandText = " SELECT Pic FROM Orders WHERE Id = 'orders/2-A'";
+
+                        var sqlDataReader = dbCommand.ExecuteReader();
+
+                        Assert.True(sqlDataReader.Read());
+                        var stream = sqlDataReader.GetStream(0);
+
+                        var bytes = stream.ReadData();
+
+                        Assert.Equal(attachmentBytes, bytes);
+                    }
+                }
+            }
+        }
+
+        [Fact]
         public async Task LoadingMultipleAttachments()
         {
             using (var store = GetDocumentStore())
@@ -763,7 +830,6 @@ CREATE TABLE [dbo].[Attachments]
                 AddEtl(store, new SqlEtlConfiguration()
                 {
                     Name = "LoadingMultipleAttachments",
-                    FactoryName = "System.Data.SqlClient",
                     ConnectionStringName = "test",
                     SqlTables =
                     {
@@ -795,7 +861,8 @@ for (var i = 0; i < attachments.length; i++)
                 }, new SqlConnectionString
                 {
                     Name = "test",
-                    ConnectionString =  GetConnectionString(store)
+                    FactoryName = "System.Data.SqlClient",
+                    ConnectionString = GetConnectionString(store)
                 });
 
                 etlDone.Wait(TimeSpan.FromMinutes(5));
@@ -814,8 +881,8 @@ for (var i = 0; i < attachments.length; i++)
             }
         }
 
-        [NonLinuxFact]
-        public async Task LoadingNonExistingAttachmentWillStoreNull()
+        [Fact]
+        public async Task CanSkipSettingFieldIfAttachmentDoesntExist()
         {
             using (var store = GetDocumentStore())
             {
@@ -836,9 +903,10 @@ CREATE TABLE [dbo].[Orders]
                 var etlDone = WaitForEtl(store, (n, statistics) => statistics.LoadSuccesses > 0);
 
                 SetupSqlEtl(store, @"
+
 var orderData = {
     Id: id(this),
-    Pic: loadAttachment('non-existing')
+    // Pic: loadAttachment('non-existing') // skip loading non existing attachment
 };
 
 loadToOrders(orderData);
@@ -853,11 +921,13 @@ loadToOrders(orderData);
 
                     using (var dbCommand = con.CreateCommand())
                     {
+                        dbCommand.CommandText = " SELECT COUNT(*) FROM Orders";
+                        Assert.Equal(1, dbCommand.ExecuteScalar());
+
                         dbCommand.CommandText = " SELECT Pic FROM Orders WHERE Id = 'orders/1-A'";
 
                         var sqlDataReader = dbCommand.ExecuteReader();
-
-
+                        
                         Assert.True(sqlDataReader.Read());
                         Assert.True(sqlDataReader.IsDBNull(0));
                     }
@@ -865,7 +935,7 @@ loadToOrders(orderData);
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task LoadingFromMultipleCollections()
         {
             using (var store = GetDocumentStore())
@@ -896,7 +966,7 @@ loadToOrders(orderData);
 
                 var etlDone = WaitForEtl(store, (n, statistics) => statistics.LoadSuccesses != 0);
 
-                SetupSqlEtl(store, defaultScript, collections: new List<string> {"Orders", "FavouriteOrders" });
+                SetupSqlEtl(store, defaultScript, collections: new List<string> { "Orders", "FavouriteOrders" });
 
                 etlDone.Wait(TimeSpan.FromMinutes(5));
 
@@ -916,7 +986,7 @@ loadToOrders(orderData);
             }
         }
 
-        [NonLinuxFact]
+        [Fact]
         public async Task CanUseVarcharAndNVarcharFunctions()
         {
             using (var store = GetDocumentStore())
@@ -937,16 +1007,15 @@ CREATE TABLE [dbo].[Users]
                     {
                         Name = "Joe Doń"
                     });
-                    
+
                     await session.SaveChangesAsync();
                 }
-                
+
                 var etlDone = WaitForEtl(store, (n, statistics) => statistics.LoadSuccesses > 0);
 
                 AddEtl(store, new SqlEtlConfiguration()
                 {
                     Name = "CanUserNonVarcharAndNVarcharFunctions",
-                    FactoryName = "System.Data.SqlClient",
                     ConnectionStringName = "test",
                     SqlTables =
                     {
@@ -975,7 +1044,8 @@ loadToUsers(
                 }, new SqlConnectionString
                 {
                     Name = "test",
-                    ConnectionString =  GetConnectionString(store)
+                    FactoryName = "System.Data.SqlClient",
+                    ConnectionString = GetConnectionString(store)
                 });
 
                 etlDone.Wait(TimeSpan.FromMinutes(5));
@@ -1043,7 +1113,6 @@ loadToUsers(
             {
                 Name = connectionStringName,
                 ConnectionStringName = connectionStringName,
-                FactoryName = "System.Data.SqlClient",
                 SqlTables =
                 {
                     new SqlEtlTable {TableName = "Orders", DocumentIdColumn = "Id", InsertOnlyMode = insertOnly},
@@ -1061,7 +1130,8 @@ loadToUsers(
             }, new SqlConnectionString
             {
                 Name = connectionStringName,
-                ConnectionString = GetConnectionString(store)
+                ConnectionString = GetConnectionString(store),
+                FactoryName = "System.Data.SqlClient"
             });
         }
 

@@ -75,7 +75,9 @@ namespace Raven.Server.Documents.Indexes.Static
                 return true;
             }
 
-            var i = (int)indexes[0];
+            if (!(indexes[0] is int i))
+                i = Convert.ToInt32(indexes[0]);
+
             var resultObject = _inner.ElementAt(i);
 
             result = TypeConverter.ToDynamicType(resultObject);
@@ -120,6 +122,61 @@ namespace Raven.Server.Documents.Indexes.Static
         public DynamicArrayIterator GetEnumerator()
         {
             return new DynamicArrayIterator(_inner);
+        }
+
+        public dynamic Any()
+        {
+            return Enumerable.Any(this);
+        }
+
+        public dynamic Any(Func<dynamic, bool> predicate)
+        {
+            return Enumerable.Any(this, predicate);
+        }
+
+        public dynamic All(Func<dynamic, bool> predicate)
+        {
+            return Enumerable.All(this, predicate);
+        }
+
+        public dynamic First()
+        {
+            return Enumerable.First(this);
+        }
+
+        public dynamic First(Func<dynamic, bool> predicate)
+        {
+            return Enumerable.First(this, predicate);
+        }
+
+        public dynamic FirstOrDefault()
+        {
+            return Enumerable.FirstOrDefault(this) ?? DynamicNullObject.Null;
+        }
+
+        public dynamic FirstOrDefault(Func<dynamic, bool> predicate)
+        {
+            return Enumerable.FirstOrDefault(this, predicate) ?? DynamicNullObject.Null;
+        }
+
+        public dynamic Single()
+        {
+            return Enumerable.Single(this);
+        }
+
+        public dynamic Single(Func<dynamic, bool> predicate)
+        {
+            return Enumerable.Single(this, predicate);
+        }
+
+        public dynamic SingleOrDefault()
+        {
+            return Enumerable.SingleOrDefault(this) ?? DynamicNullObject.Null;
+        }
+
+        public dynamic SingleOrDefault(Func<dynamic, bool> predicate)
+        {
+            return Enumerable.SingleOrDefault(this, predicate) ?? DynamicNullObject.Null;
         }
 
         public bool Contains(object item)

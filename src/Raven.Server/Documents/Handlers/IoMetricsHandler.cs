@@ -40,7 +40,7 @@ namespace Raven.Server.Documents.Handlers
                 using (var ms = new MemoryStream())
                 using (var collector = new LiveIOStatsCollector(Database))
                 {
-                    // 1. Send data to webSocket without making UI wait upon openning webSocket
+                    // 1. Send data to webSocket without making UI wait upon opening webSocket
                     await SendDataOrHeartbeatToWebSocket(receive, webSocket, collector, ms, 100);
 
                     // 2. Send data to webSocket when available
@@ -135,8 +135,8 @@ namespace Raven.Server.Documents.Handlers
             {
                 fileMetrics.History.Add(new IOMetricsHistoryStats
                 {
-                    Start = historyMetric.TotalTimeStart.GetDefaultRavenFormat(),
-                    End = historyMetric.TotalTimeEnd.GetDefaultRavenFormat(),
+                    Start = historyMetric.TotalTimeStart.GetDefaultRavenFormat(true),
+                    End = historyMetric.TotalTimeEnd.GetDefaultRavenFormat(true),
                     Size = historyMetric.TotalSize,
                     HumaneSize = Sizes.Humane(historyMetric.TotalSize),
                     FileSize = historyMetric.TotalFileSize,
@@ -160,7 +160,7 @@ namespace Raven.Server.Documents.Handlers
         {
             return new IOMetricsRecentStats
             {
-                Start = recentMetric.Start.GetDefaultRavenFormat(),
+                Start = recentMetric.Start.GetDefaultRavenFormat(true),
                 Size = recentMetric.Size,
                 Acceleration = recentMetric.Acceleration,
                 CompressedSize = recentMetric.CompressedSize,

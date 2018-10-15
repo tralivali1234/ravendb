@@ -6,6 +6,7 @@ import documentMetadata = require("models/database/documents/documentMetadata");
 import collection = require("models/database/documents/collection");
 import saveDocumentCommand = require("commands/database/documents/saveDocumentCommand");
 import getDocumentWithMetadataCommand = require("commands/database/documents/getDocumentWithMetadataCommand");
+import getDocumentPhysicalSizeCommand = require("commands/database/documents/getDocumentPhysicalSizeCommand");
 import getDocumentsFromCollectionCommand = require("commands/database/documents/getDocumentsFromCollectionCommand");
 import getRevisionsBinDocumentMetadataCommand = require("commands/database/documents/getRevisionsBinDocumentMetadataCommand");
 import generateClassCommand = require("commands/database/documents/generateClassCommand");
@@ -39,14 +40,19 @@ class editDocument extends viewModelBase {
     document = ko.observable<document>();
     documentText = ko.observable("");
     metadata: KnockoutComputed<documentMetadata>;
+    
     changeVector: KnockoutComputed<changeVectorItem[]>;
-    lastModifiedAsAgo: KnockoutComputed<string>;
+    changeVectorHtml: KnockoutComputed<string>;
+    
+    lastModifiedAsAgo: KnockoutComputed<string>;    
     latestRevisionUrl: KnockoutComputed<string>;
     attachmentsCount: KnockoutComputed<number>;
+    countersCount: KnockoutComputed<number>;
     rawJsonUrl: KnockoutComputed<string>;
     isDeleteRevision: KnockoutComputed<boolean>;
 
     isCreatingNewDocument = ko.observable(false);
+    isClone = ko.observable(false);
     collectionForNewDocument = ko.observable<string>();
     provideCustomNameForNewDocument = ko.observable(false);
     userIdHasFocus = ko.observable<boolean>(false);   
@@ -76,10 +82,19 @@ class editDocument extends viewModelBase {
     connectedDocuments = new connectedDocuments(this.document, this.activeDatabase, (docId) => this.loadDocument(docId), this.isCreatingNewDocument, this.inReadOnlyMode);
 
     isSaveEnabled: KnockoutComputed<boolean>;
-    documentSize: KnockoutComputed<string>;
+    
+    computedDocumentSize: KnockoutComputed<string>;
+    sizeOnDiskActual = ko.observable<string>();
+    sizeOnDiskAllocated = ko.observable<String>();
+    documentSizeHtml: KnockoutComputed<string>;
+    
     editedDocId: KnockoutComputed<string>;
     displayLastModifiedDate: KnockoutComputed<boolean>;
     collectionTracker = collectionsTracker.default;
+
+    canViewAttachments: KnockoutComputed<boolean>;
+    canViewCounters: KnockoutComputed<boolean>;
+    canViewRelated: KnockoutComputed<boolean>;
     
     constructor() {
         super();
@@ -89,17 +104,18 @@ class editDocument extends viewModelBase {
     }
 
     canActivate(args: any) {
-        super.canActivate(args);
-
-        if (args && args.revisionBinEntry && args.id) {
-            return this.activateByRevisionsBinEntry(args.id);
-        } else if (args && args.id && args.revision) {
-            return this.activateByRevision(args.id, args.revision);
-        } else if (args && args.id) {
-            return this.activateById(args.id);
-        } else {
-            return $.Deferred().resolve({ can: true });
-        }
+        return $.when<any>(super.canActivate(args))
+            .then(() => {
+                if (args && args.revisionBinEntry && args.id) {
+                    return this.activateByRevisionsBinEntry(args.id);
+                } else if (args && args.id && args.revision) {
+                    return this.activateByRevision(args.id, args.revision);
+                } else if (args && args.id) {
+                    return this.activateById(args.id);
+                } else {
+                    return $.Deferred().resolve({ can: true });
+                }
+            });
     }
 
     activate(navigationArgs: { list: string, database: string, item: string, id: string, new: string, index: string, revision: number }) {
@@ -110,6 +126,8 @@ class editDocument extends viewModelBase {
         if (!navigationArgs || !navigationArgs.id) {
             return this.editNewDocument(navigationArgs ? navigationArgs.new : null);
         }
+
+        this.setActiveTab();
     }
 
     // Called when the view is attached to the DOM.
@@ -135,6 +153,8 @@ class editDocument extends viewModelBase {
         this.connectedDocuments.compositionComplete();
 
         this.focusOnEditor();
+       
+        $('#right-options-panel [data-toggle="tooltip"]').tooltip(); 
     }
 
     detached() {
@@ -233,7 +253,21 @@ class editDocument extends viewModelBase {
 
             return doc.__metadata.attachments().length;
         });
-
+       
+        this.countersCount = ko.pureComputed(() => {
+            const doc = this.document();
+            
+            if (doc && doc.__metadata && doc.__metadata.revisionCounters().length) {
+                return doc.__metadata.revisionCounters().length;
+            }
+            
+            if (!doc || !doc.__metadata || !doc.__metadata.counters()) {
+                return 0;
+            }
+            
+            return doc.__metadata.counters().length;
+        });
+        
         this.rawJsonUrl = ko.pureComputed(() => {
             const newDocMode = this.isCreatingNewDocument();
             if (newDocMode) {
@@ -289,13 +323,22 @@ class editDocument extends viewModelBase {
 
             return changeVectorUtils.formatChangeVector(vector, changeVectorUtils.shouldUseLongFormat([vector]));
         });
+        
+        this.changeVectorHtml = ko.pureComputed(() => {
+            let vectorText = "<h4>Change Vector</h4>";
+            if (this.changeVector().length) {
+                vectorText += this.changeVector().map(vectorItem => vectorItem.fullFormat).join('<br/>');
+            }
+            
+            return vectorText;
+        });
 
         this.isConflictDocument = ko.computed(() => {
             const metadata = this.metadata();
             return metadata && ("Raven-Replication-Conflict" in metadata) && !metadata.id.includes("/conflicts/");
         });
 
-        this.documentSize = ko.pureComputed(() => {
+        this.computedDocumentSize = ko.pureComputed(() => {
             try {
                 const textSize: number = genUtils.getSizeInBytesAsUTF8(this.documentText());
                 const metadataAsString = JSON.stringify(this.metadata().toDto());
@@ -307,6 +350,14 @@ class editDocument extends viewModelBase {
             }
         });
 
+        this.documentSizeHtml = ko.computed(() => {
+            if (this.isClone() || this.isCreatingNewDocument() || this.inReadOnlyMode()) {
+                return `Computed Size: ${this.computedDocumentSize()} KB`;
+            }
+            
+            return `<h4>Document Size on Disk</h4> Actual Size: ${this.sizeOnDiskActual()} <br/> Allocated Size: ${this.sizeOnDiskAllocated()}`;            
+        });
+        
         this.metadata.subscribe((meta: documentMetadata) => {
             if (meta && meta.id) {
                 this.userSpecifiedId(meta.id);
@@ -331,6 +382,18 @@ class editDocument extends viewModelBase {
         this.latestRevisionUrl = ko.pureComputed(() => {
             const id = this.document().getId();
             return appUrl.forEditDoc(id, this.activeDatabase());
+        });
+
+        this.canViewAttachments = ko.pureComputed(() => {
+            return !this.connectedDocuments.isArtificialDocument() && !this.connectedDocuments.isHiloDocument() && !this.isCreatingNewDocument() && !this.isDeleteRevision();
+        });
+
+        this.canViewCounters = ko.pureComputed(() => {
+            return !this.connectedDocuments.isArtificialDocument() && !this.connectedDocuments.isHiloDocument() && !this.isCreatingNewDocument() && !this.isDeleteRevision();
+        });
+
+        this.canViewRelated = ko.pureComputed(() => {
+            return !this.isDeleteRevision();
         });
     }
 
@@ -371,7 +434,9 @@ class editDocument extends viewModelBase {
         this.createKeyboardShortcut("alt+shift+r", () => this.refreshDocument(), editDocument.editDocSelector);
         this.createKeyboardShortcut("alt+c", () => this.focusOnEditor(), editDocument.editDocSelector);
         this.createKeyboardShortcut("alt+shift+del", () => this.deleteDocument(), editDocument.editDocSelector);
-        this.createKeyboardShortcut("alt+s", () => this.saveDocument(), editDocument.editDocSelector); // Q. Why do we have to setup ALT+S, when we could just use HTML's accesskey attribute? A. Because the accesskey attribute causes the save button to take focus, thus stealing the focus from the user's editing spot in the doc editor, disrupting his workflow.
+        this.createKeyboardShortcut("alt+s", () => this.saveDocument(), editDocument.editDocSelector); 
+        // Q. Why do we have to setup ALT+S, when we could just use HTML's accesskey attribute?
+        // A. Because the accesskey attribute causes the save button to take focus, thus stealing the focus from the user's editing spot in the doc editor, disrupting his workflow.
     }
 
     private focusOnEditor() {
@@ -422,7 +487,7 @@ class editDocument extends viewModelBase {
 
     toggleNewlineMode() {
         eventsCollector.default.reportEvent("document", "toggle-newline-mode");
-        if (this.isNewLineFriendlyMode() === false && parseInt(this.documentSize().replace(",", "")) > 1024) {
+        if (this.isNewLineFriendlyMode() === false && parseInt(this.computedDocumentSize().replace(",", "")) > 1024) {
             app.showBootstrapMessage("This operation might take long time with big documents, are you sure you want to continue?", "Toggle newline mode", ["Cancel", "Continue"])
                 .then((dialogResult: string) => {
                     if (dialogResult === "Continue") {
@@ -454,6 +519,7 @@ class editDocument extends viewModelBase {
     createClone() {
         // 1. Show current document as a new document..
         this.isCreatingNewDocument(true);
+        this.isClone(true);
 
         this.syncChangeNotification();
         
@@ -474,11 +540,15 @@ class editDocument extends viewModelBase {
         }
 
         // 4. Clear data..
-        this.document().__metadata.attachments([]); 
+        this.document().__metadata.clearFlags();      
+        this.connectedDocuments.revisionsCount(0);
+        
         this.connectedDocuments.gridController().reset(true);
         this.metadata().changeVector(undefined);
 
         this.userSpecifiedId(docId);
+
+        this.setActiveTab();
     }
 
     saveDocument() {
@@ -551,6 +621,8 @@ class editDocument extends viewModelBase {
     }
 
     private onDocumentSaved(saveResult: saveDocumentResponseDto, localDoc: any) {
+        this.isClone(false);
+        
         const savedDocumentDto: changedOnlyMetadataFieldsDto = saveResult.Results[0];
         const currentSelection = this.docEditor.getSelectionRange();
 
@@ -591,6 +663,9 @@ class editDocument extends viewModelBase {
 
         this.isCreatingNewDocument(false);
         this.collectionForNewDocument(null);
+
+        $('#right-options-panel [data-toggle="tooltip"]').tooltip();
+        this.getDocumentPhysicalSize(metadata['@id']);
     }
 
     private attachReservedMetaProperties(id: string, target: documentMetadataDto) {
@@ -621,7 +696,9 @@ class editDocument extends viewModelBase {
                 if (this.autoCollapseMode()) {
                     this.foldAll();
                 }
-
+                
+                this.getDocumentPhysicalSize(id);
+                
                 loadTask.resolve(doc);
             })
             .fail((xhr: JQueryXHR) => {
@@ -641,6 +718,19 @@ class editDocument extends viewModelBase {
         return loadTask;
     }
 
+    private getDocumentPhysicalSize(id: string): JQueryPromise<Raven.Server.Documents.Handlers.DocumentSizeDetails> {
+        return new getDocumentPhysicalSizeCommand(id, this.activeDatabase())
+            .execute()
+            .done((size) => {
+                this.sizeOnDiskActual(size.HumaneActualSize);
+                this.sizeOnDiskAllocated(size.HumaneAllocatedSize);
+            })
+            .fail(() => {
+                this.sizeOnDiskActual("Failed to get size");
+                this.sizeOnDiskAllocated("Failed to get size");
+            }); 
+    }
+    
     private loadRevisionsBinEntry(id: string): JQueryPromise<document> {
         return new getRevisionsBinDocumentMetadataCommand(id, this.activeDatabase())
             .execute()
@@ -705,7 +795,10 @@ class editDocument extends viewModelBase {
         const doc = this.document();
         if (doc) {
             const viewModel = new deleteDocuments([doc.getId()], this.activeDatabase());
-            viewModel.deletionTask.done(() => this.connectedDocuments.onDocumentDeleted());
+            viewModel.deletionTask.done(() => {
+                this.dirtyFlag().reset();
+                this.connectedDocuments.onDocumentDeleted();                
+            });
             app.showBootstrapDialog(viewModel, editDocument.editDocSelector);
         } 
     }
@@ -738,8 +831,20 @@ class editDocument extends viewModelBase {
         const doc: document = this.document();
         const generate = new generateClassCommand(this.activeDatabase(), doc.getId(), "csharp");
         const deferred = generate.execute();
-        deferred.done((code: string) => app.showBootstrapDialog(new showDataDialog("Generated Class", code, "csharp", null)));
+        deferred.done((code: string) => app.showBootstrapDialog(new showDataDialog("The Generated C# Class", code, "csharp", null)));
     }
+    
+    private setActiveTab() {
+        if (this.isDeleteRevision()) {
+            this.connectedDocuments.activateRevisions(true);
+        } else if (!this.canViewAttachments() || !this.canViewCounters()) {
+            this.connectedDocuments.activateRecent();
+        } else if (this.inReadOnlyMode()) { // revision mostly..
+            this.connectedDocuments.activateRevisions(false);
+        } else {
+            this.connectedDocuments.activateAttachments();
+        }
+    }    
 }
 
 export = editDocument;

@@ -46,7 +46,7 @@ namespace Raven.Server.Documents
                 return;
 
             _metadataEnsured = true;
-            DynamicJsonValue mutatedMetadata;
+            DynamicJsonValue mutatedMetadata = null;
             if (Data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata))
             {
                 if (metadata.Modifications == null)
@@ -54,16 +54,15 @@ namespace Raven.Server.Documents
 
                 mutatedMetadata = metadata.Modifications;
             }
-            else
+
+            Data.Modifications = new DynamicJsonValue(Data)
             {
-                Data.Modifications = new DynamicJsonValue(Data)
-                {
-                    [Constants.Documents.Metadata.Key] = mutatedMetadata = new DynamicJsonValue()
-                };
-            }
+                [Constants.Documents.Metadata.Key] = (object)metadata ?? (mutatedMetadata = new DynamicJsonValue())
+            };
+
             mutatedMetadata[Constants.Documents.Metadata.Id] = Id;
             if (ChangeVector != null)
-                mutatedMetadata[Constants.Documents.Metadata.ChangeVector] = ChangeVector;
+                mutatedMetadata[Constants.Documents.Metadata.ChangeVector] = ChangeVector;        
             if (Flags != DocumentFlags.None)
                 mutatedMetadata[Constants.Documents.Metadata.Flags] = Flags.ToString();
             Debug.Assert(LastModified != DateTime.MinValue, $"LastModified cannot be DateTime.MinValue. {Id}");

@@ -78,12 +78,11 @@ namespace Raven.Client.Documents.Session.Operations
                 throw new InvalidOperationException("The index does not exists, failed to stream results");
 
             var state = new JsonParserState();
-            JsonOperationContext.ManagedPinnedBuffer buffer;
 
             using (response.Response)
             using (response.Stream)
             using (var parser = new UnmanagedJsonParser(_session.Context, state, "stream contents"))
-            using (_session.Context.GetManagedBuffer(out buffer))
+            using (_session.Context.GetManagedBuffer(out JsonOperationContext.ManagedPinnedBuffer buffer))
             using (var peepingTomStream = new PeepingTomStream(response.Stream, _session.Context))
             {
                 if (UnmanagedJsonParserHelper.Read(peepingTomStream, parser, state, buffer) == false)
@@ -184,7 +183,9 @@ namespace Raven.Client.Documents.Session.Operations
             private bool _initialized;
             private JsonOperationContext.ReturnBuffer _returnBuffer;
             private readonly bool _isQueryStream;
-            private PeepingTomStream _peepingTomStream;
+            private readonly PeepingTomStream _peepingTomStream;
+            private int _docsCountOnCachedRenewSession;
+            private bool _cachedItemsRenew;
 
             public void Dispose()
             {
@@ -199,6 +200,20 @@ namespace Raven.Client.Documents.Session.Operations
             {
                 if (_initialized == false)
                     await InitializeAsync().ConfigureAwait(false);
+
+                if (_docsCountOnCachedRenewSession <= 16 * 1024)
+                {
+                    if (_cachedItemsRenew)
+                    {
+                        _session.Context.CachedProperties = new CachedProperties(_session.Context);
+                        ++_docsCountOnCachedRenewSession;
+                    }
+                }
+                else
+                {
+                    _session.Context.Renew();
+                    _docsCountOnCachedRenewSession = 0;
+                }
 
                 if (await UnmanagedJsonParserHelper.ReadAsync(_peepingTomStream, _parser, _state, _buffer).ConfigureAwait(false) == false)
                     UnmanagedJsonParserHelper.ThrowInvalidJson(_peepingTomStream);
@@ -216,6 +231,9 @@ namespace Raven.Client.Documents.Session.Operations
 
                 using (var builder = new BlittableJsonDocumentBuilder(_session.Context, BlittableJsonDocumentBuilder.UsageMode.ToDisk, "readArray/singleResult", _parser, _state))
                 {
+                    if (_cachedItemsRenew == false)
+                        _cachedItemsRenew = builder.NeedResetPropertiesCache();
+
                     await UnmanagedJsonParserHelper.ReadObjectAsync(builder, _peepingTomStream, _parser, _buffer).ConfigureAwait(false);
 
                     Current = builder.CreateReader();

@@ -20,7 +20,7 @@ namespace Raven.Server.Smuggler.Documents
 
         public Document Document;
         public List<AttachmentStream> Attachments;
-        public DocumentTombstone Tombstone;
+        public Tombstone Tombstone;
         public DocumentConflict Conflict;
 
         public struct AttachmentStream : IDisposable
@@ -42,6 +42,14 @@ namespace Raven.Server.Smuggler.Documents
                 Stream.Dispose();
                 Data.Dispose();
             }
+        }
+
+        public struct CounterItem
+        {
+            public string Name;
+            public string DocId;
+            public string ChangeVector;
+            public long Value;
         }
     }
 }

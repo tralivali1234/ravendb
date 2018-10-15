@@ -169,27 +169,37 @@ namespace Raven.Server.Documents.Queries
             };
         }
 
-        private class BulkOperationCommand<T> : TransactionOperationsMerger.MergedTransactionCommand where T : TransactionOperationsMerger.MergedTransactionCommand
+        internal class BulkOperationCommand<T> : TransactionOperationsMerger.MergedTransactionCommand where T : TransactionOperationsMerger.MergedTransactionCommand
         {
             private readonly T _command;
-            private readonly bool _retieveDetails;
+            private readonly bool _retrieveDetails;
             private readonly Func<T, IBulkOperationDetails> _getDetails;
 
-            public BulkOperationCommand(T command, bool retieveDetails, Func<T, IBulkOperationDetails> getDetails)
+            public BulkOperationCommand(T command, bool retrieveDetails, Func<T, IBulkOperationDetails> getDetails)
             {
                 _command = command;
-                _retieveDetails = retieveDetails;
+                _retrieveDetails = retrieveDetails;
                 _getDetails = getDetails;
             }
 
-            public override int Execute(DocumentsOperationContext context)
+            public override int Execute(DocumentsOperationContext context, TransactionOperationsMerger.RecordingState recording)
             {
-                var count = _command.Execute(context);
+                var count = _command.Execute(context, recording);
 
-                if (_retieveDetails)
+                if (_retrieveDetails)
                     AfterExecute?.Invoke(_getDetails(_command));
 
                 return count;
+            }
+
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            {
+                throw new NotSupportedException($"ToDto() of {nameof(BulkOperationCommand<T>)} Should not be called");
+            }
+
+            protected override int ExecuteCmd(DocumentsOperationContext context)
+            {
+                throw new NotSupportedException("Should only call Execute() here");
             }
 
             public Action<IBulkOperationDetails> AfterExecute { private get; set; }

@@ -6,6 +6,7 @@ using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Documents.Queries.Results;
+using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
 using Voron;
@@ -49,7 +50,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce
             return MapReduceWorkContext;
         }
 
-        public override unsafe void HandleDelete(DocumentTombstone tombstone, string collection, IndexWriteOperation writer,
+        public override unsafe void HandleDelete(Tombstone tombstone, string collection, IndexWriteOperation writer,
             TransactionOperationContext indexContext, IndexingStatsScope stats)
         {
             using (Slice.External(indexContext.Allocator, tombstone.LowerId.Buffer, tombstone.LowerId.Length, out Slice docKeyAsSlice))
@@ -72,9 +73,9 @@ namespace Raven.Server.Documents.Indexes.MapReduce
 
         }
 
-        public override IQueryResultRetriever GetQueryResultRetriever(IndexQueryServerSide query, DocumentsOperationContext documentsContext, FieldsToFetch fieldsToFetch, IncludeDocumentsCommand includeDocumentsCommand)
+        public override IQueryResultRetriever GetQueryResultRetriever(IndexQueryServerSide query, QueryTimingsScope queryTimings, DocumentsOperationContext documentsContext, FieldsToFetch fieldsToFetch, IncludeDocumentsCommand includeDocumentsCommand)
         {
-            return new MapReduceQueryResultRetriever(DocumentDatabase, query, DocumentDatabase.DocumentsStorage,documentsContext, fieldsToFetch, includeDocumentsCommand);
+            return new MapReduceQueryResultRetriever(DocumentDatabase, query, queryTimings, DocumentDatabase.DocumentsStorage,documentsContext, fieldsToFetch, includeDocumentsCommand);
         }
 
         private static Tree GetMapPhaseTree(Transaction tx)
@@ -97,7 +98,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce
             return tx.CreateTree(ReducePhaseTreeName);
         }
 
-        protected unsafe int PutMapResults(LazyStringValue lowerId, IEnumerable<MapResult> mappedResults, TransactionOperationContext indexContext, IndexingStatsScope stats)
+        protected unsafe int PutMapResults(LazyStringValue lowerId, LazyStringValue id, IEnumerable<MapResult> mappedResults, TransactionOperationContext indexContext, IndexingStatsScope stats)
         {
             EnsureValidStats(stats);
 
@@ -124,7 +125,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce
 
                         var reduceKeyHash = mapResult.ReduceKeyHash;
 
-                        long id = -1;
+                        long mapEntryId = -1;
 
                         if (existingEntries?.Count > 0)
                         {
@@ -141,7 +142,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce
                                     }
                                 }
 
-                                id = existing.Id;
+                                mapEntryId = existing.Id;
                             }
                             else
                             {
@@ -155,20 +156,20 @@ namespace Raven.Server.Documents.Indexes.MapReduce
 
                         using (_stats.PutResult.Start())
                         {
-                            if (id == -1)
+                            if (mapEntryId == -1)
                             {
-                                id = MapReduceWorkContext.NextMapResultId++;
+                                mapEntryId = MapReduceWorkContext.NextMapResultId++;
 
                                 using (Slice.External(indexContext.Allocator, (byte*)&reduceKeyHash, sizeof(ulong), out Slice val))
-                                    MapReduceWorkContext.DocumentMapEntries.Add(id, val);
+                                    MapReduceWorkContext.DocumentMapEntries.Add(mapEntryId, val);
                             }
 
-                            GetResultsStore(reduceKeyHash, indexContext, create: true).Add(id, mapResult.Data);
+                            GetResultsStore(reduceKeyHash, indexContext, create: true).Add(mapEntryId, mapResult.Data);
                         }
                     }
                 }
 
-                HandleIndexOutputsPerDocument(lowerId, resultsCount, stats);
+                HandleIndexOutputsPerDocument(id ?? lowerId, resultsCount, stats);
 
                 DocumentDatabase.Metrics.MapReduceIndexes.MappedPerSec.Mark(resultsCount);
 

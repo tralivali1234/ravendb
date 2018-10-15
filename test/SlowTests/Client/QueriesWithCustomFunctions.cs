@@ -379,7 +379,7 @@ namespace SlowTests.Client
                                     FullName = u.Name + " " + lastName
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u) {
 	var lastName = u.LastName;
 	return { FullName : u.Name+"" ""+lastName };
@@ -417,7 +417,7 @@ from Users as u select output(u)", query.ToString());
                             FullName = u.Name + " " + lastName
                         };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
                         @"declare function output(u) {
 	var lastName = u.LastName;
 	return { FullName : u.Name+"" ""+lastName };
@@ -455,7 +455,7 @@ from Users as u select output(u)", query.ToString());
                                     FullName = format(u)
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
  @"declare function output(u) {
 	var format = function(p){return p.Name+"" ""+p.LastName;};
 	return { FullName : format(u) };
@@ -493,7 +493,7 @@ from Users as u select output(u)", query.ToString());
                             FullName = format(u)
                         };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
                         @"declare function output(u) {
 	var format = function(p){return p.Name+"" ""+p.LastName;};
 	return { FullName : format(u) };
@@ -533,7 +533,7 @@ from Users as u select output(u)", query.ToString());
                                     FullName = format(u)
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u) {
 	var space = "" "";
 	var last = u.LastName;
@@ -575,7 +575,7 @@ from Users as u select output(u)", query.ToString());
                             FullName = format(u)
                         };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
                         @"declare function output(u) {
 	var space = "" "";
 	var last = u.LastName;
@@ -751,7 +751,7 @@ from Users as u select output(u)", query.ToString());
                             Detail = detail.Number
                         };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, detail, friend) {
 	var format = function(user){return user.Name+"" ""+user.LastName;};
 	return { FullName : format(u), Friend : format(friend), Detail : detail.Number };
@@ -798,7 +798,7 @@ from Users as u where u.Name != $p0 load u.DetailId as detail, u.FriendId as fri
                                     Detail = detail.Number
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, detail, friend) {
 	var format = function(user){return user.Name+"" ""+user.LastName;};
 	return { FullName : format(u), Friend : format(friend), Detail : detail.Number };
@@ -842,7 +842,7 @@ from Users as u where u.Name != $p0 load u.DetailId as detail, u.FriendId as fri
                                     DetailNumber = detail.Number
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, detail) {
 	var format = function(user){return user.Name+"" ""+u.LastName;};
 	return { FullName : format(u), DetailNumber : detail.Number };
@@ -889,7 +889,7 @@ from Users as u load u.DetailId as detail select output(u, detail)", query.ToStr
                                     DetailNumber = detail.Number
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, detail) {
 	var format = function(user){return user.Name+"" ""+u.LastName;};
 	return { FullName : format(u), DetailNumber : detail.Number };
@@ -1124,7 +1124,7 @@ from Users as u load u.DetailId as detail select output(u, detail)", query.ToStr
                                     DetailNumber = detail.Number
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, detail) {
 	var last = u.LastName;
 	var format = function(user){return user.Name+"" ""+last;};
@@ -1172,7 +1172,7 @@ from Users as u where (u.Name = $p0) and (u.IsActive = $p1) order by LastName de
                                     DetailNumber = detail.Number
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, detail) {
 	var last = u.LastName;
 	var format = function(user){return user.Name+"" ""+last;};
@@ -1276,7 +1276,7 @@ from Users as u where (u.Name = $p0) and (u.IsActive = $p1) order by LastName de
                                     FullName = format()
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(user) {
 	var first = user.Name;
 	var last = user.LastName;
@@ -1316,7 +1316,7 @@ from Users as user select output(user)", query.ToString());
                             Date = date
                         };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
                         @"declare function output(u) {
 	var date = new Date(1960, 0, 1);
 	return { Bday : new Date(Date.parse(u.Birthday)), Date : date };
@@ -1390,7 +1390,8 @@ from Users as u select output(u)", query.ToString());
                                 {
                                     Days = days
                                 };
-                    Assert.Equal(
+
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u) {
 	var days = Math.ceil((Date.now() - Date.parse(u.Birthday)) / (1000*60*60*24));
 	return { Days : days };
@@ -1467,7 +1468,7 @@ from Users as u select output(u)", query.ToString());
                                     Details = details
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u, _doc_0, _docs_1) {
 	var friend = _doc_0.Name;
 	var details = _docs_1.map(function(x){return x.Number;});
@@ -1600,7 +1601,7 @@ from Users as u load u.FriendId as _doc_0, u.DetailIds as _docs_1[] select outpu
                         };
 
                     Assert.Equal("from Users as u select { FirstName : u.Name, " +
-                                 "LastName : u.LastName!=null?u.LastName:\"Has no last name\" }"
+                                 "LastName : (u.LastName!=null?u.LastName:\"Has no last name\") }"
                         , query.ToString());
 
                     var queryResult = query.ToList();
@@ -1765,7 +1766,7 @@ from Users as u load u.FriendId as _doc_0, u.DetailIds as _docs_1[] select outpu
                                     ToUpper = u.Name.ToUpper(),
                                     ToLower = u.Name.ToLower(),
                                     Contains = u.Name.Contains("e"),
-                                    Format = $"Name: {u.Name}, LastName : {u.LastName}",
+                                    Format = "Name: "+u.Name+", LastName : "+u.LastName,
                                     Split = u.Name.Split('r', StringSplitOptions.None),
                                     SplitLimit = u.Name.Split(new char[] { 'r' }, 3),
                                     SplitArray = u.Name.Split(new char[] { 'r', 'e' }),
@@ -1789,7 +1790,7 @@ from Users as u load u.FriendId as _doc_0, u.DetailIds as _docs_1[] select outpu
                         "ToUpper : u.Name.toUpperCase(), " +
                         "ToLower : u.Name.toLowerCase(), " +
                         "Contains : u.Name.indexOf(\"e\") !== -1, " +
-                        "Format : \"Name: {0}, LastName : {1}\".format(u.Name, u.LastName), " +
+                        "Format : \"Name: \"+u.Name+\", LastName : \"+u.LastName, " +
                         "Split : u.Name.split(new RegExp(\"r\", \"g\")), " +
                         "SplitLimit : u.Name.split(new RegExp(\"r\", \"g\")), " +
                         "SplitArray : u.Name.split(new RegExp(\"r\"+\"|\"+\"e\", \"g\")), " +
@@ -1989,7 +1990,7 @@ from Users as u load u.FriendId as _doc_0, u.DetailIds as _docs_1[] select outpu
 
                     Assert.Equal("from Users as u select { Name : u.Name, " +
                                  "DetailNumbers : u.DetailIds.map(function(detailId){return {detailId:detailId,detail:load(detailId)};})" +
-                                                            ".map(function(h__TransparentIdentifier0){return {Number:h__TransparentIdentifier0.detail.Number};}) }"
+                                                            ".map(function(__rvn0){return {Number:__rvn0.detail.Number};}) }"
                                 ,query.ToString());
 
                     var queryResult = query.ToList();
@@ -2618,7 +2619,7 @@ from Users as u load u.FriendId as _doc_0, u.DetailIds as _docs_1[] select outpu
                             TotalMoneySpent = TotalSpentOnOrder(o)
                         };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(o) {
 	var TotalSpentOnOrder = function(order){return order.Lines.map(function(l){return l.PricePerUnit*l.Quantity-l.Discount;}).reduce(function(a, b) { return a + b; }, 0);};
 	return { Id : id(o), TotalMoneySpent : TotalSpentOnOrder(o) };
@@ -2646,7 +2647,7 @@ from Orders as o select output(o)", complexLinqQuery.ToString());
         }
 
         [Fact]
-        public void Can_project_id_propery_to_any_name()
+        public void Can_project_id_property_to_any_name()
         {
             //http://issues.hibernatingrhinos.com/issue/RavenDB-9260
 
@@ -2680,7 +2681,7 @@ from Orders as o select output(o)", complexLinqQuery.ToString());
                                     EmployeeId2 = employee.Id
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(o, employee) {
 	var employeeId = id(employee);
 	return { OrderId : id(o), EmployeeId1 : employeeId, EmployeeId2 : id(employee) };
@@ -2836,9 +2837,9 @@ from Orders as o load o.Employee as employee select output(o, employee)" , query
                                  "Take : u.Roles.slice(0, 2), " +
                                  "Skip : u.Roles.slice(2, u.Roles.length), " +
                                  "Max : u.Roles.reduce(function(a, b) { return Raven_Max(a, b);}), " +
-                                 "MaxWithSelector : u.Details.map(function(d){return d.Number;}).reduce(function(a, b) { return Raven_Max(a, b);}), " +
+                                 "MaxWithSelector : u.Details.map(function(d){return d.Number;}).reduce(function(a, b) { return Raven_Max(a, b);}, 0), " +
                                  "Min : u.Roles.reduce(function(a, b) { return Raven_Min(a, b);}), " +
-                                 "MinWithSelector : u.Details.map(function(d){return d.Number;}).reduce(function(a, b) { return Raven_Min(a, b);}), " +
+                                 "MinWithSelector : u.Details.map(function(d){return d.Number;}).reduce(function(a, b) { return Raven_Min(a, b);}, 0), " +
                                  "Reverse : u.Roles.slice().reverse(), " +
                                  "IndexOf : u.Roles.indexOf(\"3\"), " +
                                  "Concat : u.Roles.concat($p0), " +
@@ -2896,7 +2897,7 @@ from Orders as o load o.Employee as employee select output(o, employee)" , query
                                     Detail = detail
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(u) {
 	var detail = load((""details/""+u.DetailShortId));
 	return { Name : u.Name, Detail : detail };
@@ -3251,7 +3252,7 @@ from Users as u where u.LastName = $p0 select output(u)", query.ToString());
                                     Manager = manager.FirstName + " " + manager.LastName
                                 };
 
-                    Assert.Equal(
+                    RavenTestHelper.AssertEqualRespectingNewLines(
 @"declare function output(o, company, _docs_1) {
 	var employee = _docs_1[0];
 	var manager = load(employee.ReportsTo);

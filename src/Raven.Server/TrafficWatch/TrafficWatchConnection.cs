@@ -16,7 +16,7 @@ namespace Raven.Server.TrafficWatch
 {
     internal class TrafficWatchConnection : IDisposable
     {
-        private static readonly Logger _logger = LoggingSource.Instance.GetLogger<TrafficWatchConnection>("Raven/Server");
+        private static readonly Logger _logger = LoggingSource.Instance.GetLogger<TrafficWatchConnection>("Server");
 
         readonly JsonContextPool _jsonContextPool = new JsonContextPool();
 
@@ -77,7 +77,7 @@ namespace Raven.Server.TrafficWatch
                 TrafficWatchManager.Disconnect(this);
                 try
                 {
-                    await _websocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "NORNAL_CLOSE", _cancellationTokenSource?.Token ?? CancellationToken.None);
+                    await _websocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "NORMAL_CLOSE", _cancellationTokenSource?.Token ?? CancellationToken.None);
                 }
                 catch
                 {
@@ -99,6 +99,7 @@ namespace Raven.Server.TrafficWatch
                 [nameof(change.AbsoluteUri)] = change.AbsoluteUri,
                 [nameof(change.DatabaseName)] = change.DatabaseName,
                 [nameof(change.CustomInfo)] = change.CustomInfo,
+                [nameof(change.Type)] = change.Type,
                 [nameof(change.InnerRequestsCount)] = change.InnerRequestsCount
                 //[nameof(change.QueryTimings)] = notification.QueryTimings
             };
@@ -120,7 +121,7 @@ namespace Raven.Server.TrafficWatch
             await _websocket.SendAsync(message, WebSocketMessageType.Text, true, _cancellationTokenSource.Token);
         }
 
-        public void EnqueMsg(TrafficWatchChange msg)
+        public void EnqueueMsg(TrafficWatchChange msg)
         {
             _msgs.Enqueue(msg);
             _manualResetEvent.Set();

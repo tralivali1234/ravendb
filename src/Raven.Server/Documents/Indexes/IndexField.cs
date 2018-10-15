@@ -164,6 +164,9 @@ namespace Raven.Server.Documents.Indexes
             if (options.Spatial != null)
                 field.Spatial = new AutoSpatialOptions(options.Spatial);
 
+            field.Aggregation = options.Aggregation;
+            field.GroupByArrayBehavior = options.GroupByArrayBehavior;
+
             return field;
         }
 
@@ -200,14 +203,17 @@ namespace Raven.Server.Documents.Indexes
             if (Indexing == AutoFieldIndexing.Default)
                 return fields;
 
-            if (Indexing.HasFlag(AutoFieldIndexing.Search))
+            var hasHighlighting = Indexing.HasFlag(AutoFieldIndexing.Highlighting);
+
+            if (Indexing.HasFlag(AutoFieldIndexing.Search) || hasHighlighting)
             {
                 fields.Add(new IndexField
                 {
                     Indexing = FieldIndexing.Search,
                     Name = GetSearchAutoIndexFieldName(Name),
                     OriginalName = originalName,
-                    Storage = Storage,
+                    Storage = hasHighlighting ? FieldStorage.Yes : Storage,
+                    TermVector = hasHighlighting ? FieldTermVector.WithPositionsAndOffsets : FieldTermVector.No
                 });
             }
 
@@ -271,6 +277,16 @@ namespace Raven.Server.Documents.Indexes
         public static string GetExactAutoIndexFieldName(string name)
         {
             return $"exact({name})";
+        }
+
+        public static string GetHighlightingAutoIndexFieldName(string name)
+        {
+            return $"highlight({name})";
+        }
+
+        public static string GetGroupByArrayContentAutoIndexFieldName(string name)
+        {
+            return $"array({name})";
         }
     }
 }

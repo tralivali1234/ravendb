@@ -3,7 +3,6 @@ import database = require("models/resources/database");
 import databaseDisconnectedEventArgs = require("viewmodels/resources/databaseDisconnectedEventArgs");
 import router = require("plugins/router");
 import messagePublisher = require("common/messagePublisher");
-import appUrl = require("common/appUrl");
 import databaseSettings = require("common/settings/databaseSettings");
 import studioSettings = require("common/settings/studioSettings");
 
@@ -29,6 +28,9 @@ class activeDatabaseTracker {
                     router.navigate("#databases"); // don't use appUrl since it will create dependecy cycle
                 } else if (e.cause === "DatabaseDisabled") {
                     messagePublisher.reportWarning(e.database.fullTypeName + " " + e.database.name + " was disabled");
+                    router.navigate("#databases"); // don't use appUrl since it will create dependecy cycle
+                } else if (e.cause === "DatabaseIsNotRelevant") {
+                    messagePublisher.reportWarning(e.database.fullTypeName + " " + e.database.name + " is not longer relevant on this node");
                     router.navigate("#databases"); // don't use appUrl since it will create dependecy cycle
                 }
             }

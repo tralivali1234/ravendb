@@ -8,6 +8,7 @@ using Raven.Server.Config;
 using Raven.Server.Documents.Indexes.Configuration;
 using Raven.Server.Documents.Indexes.Persistence.Lucene;
 using Raven.Server.Documents.Indexes.Workers;
+using Raven.Server.Documents.Queries;
 using Raven.Server.ServerWide.Context;
 using Voron;
 
@@ -72,7 +73,7 @@ namespace Raven.Server.Documents.Indexes.Static
             return workers.ToArray();
         }
 
-        public override void HandleDelete(DocumentTombstone tombstone, string collection, IndexWriteOperation writer, TransactionOperationContext indexContext, IndexingStatsScope stats)
+        public override void HandleDelete(Tombstone tombstone, string collection, IndexWriteOperation writer, TransactionOperationContext indexContext, IndexingStatsScope stats)
         {
             if (_referencedCollections.Count > 0)
                 _handleReferences.HandleDelete(tombstone, collection, writer, indexContext, stats);
@@ -80,13 +81,13 @@ namespace Raven.Server.Documents.Indexes.Static
             base.HandleDelete(tombstone, collection, writer, indexContext, stats);
         }
 
-        protected override bool IsStale(DocumentsOperationContext databaseContext, TransactionOperationContext indexContext, long? cutoff = null, List<string> stalenessReasons = null)
+        protected override bool IsStale(DocumentsOperationContext databaseContext, TransactionOperationContext indexContext, long? cutoff = null, long? referenceCutoff = null, List<string> stalenessReasons = null)
         {
-            var isStale = base.IsStale(databaseContext, indexContext, cutoff, stalenessReasons);
+            var isStale = base.IsStale(databaseContext, indexContext, cutoff, referenceCutoff, stalenessReasons);
             if (isStale && stalenessReasons == null || _referencedCollections.Count == 0)
                 return isStale;
 
-            return StaticIndexHelper.IsStale(this, databaseContext, indexContext, cutoff, stalenessReasons) || isStale;
+            return StaticIndexHelper.IsStaleDueToReferences(this, databaseContext, indexContext, referenceCutoff, stalenessReasons) || isStale;
         }
 
         protected override void HandleDocumentChange(DocumentChange change)
@@ -98,10 +99,11 @@ namespace Raven.Server.Documents.Indexes.Static
             _mre.Set();
         }
 
-        protected override unsafe long CalculateIndexEtag(bool isStale, DocumentsOperationContext documentsContext, TransactionOperationContext indexContext)
+        protected override unsafe long CalculateIndexEtag(DocumentsOperationContext documentsContext, TransactionOperationContext indexContext,
+            QueryMetadata query, bool isStale)
         {
             if (_referencedCollections.Count == 0)
-                return base.CalculateIndexEtag(isStale, documentsContext, indexContext);
+                return base.CalculateIndexEtag(documentsContext, indexContext, query, isStale);
 
             var minLength = MinimumSizeForCalculateIndexEtagLength();
             var length = minLength +
@@ -109,7 +111,8 @@ namespace Raven.Server.Documents.Indexes.Static
 
             var indexEtagBytes = stackalloc byte[length];
 
-            CalculateIndexEtagInternal(indexEtagBytes, isStale, documentsContext, indexContext);
+            CalculateIndexEtagInternal(indexEtagBytes, isStale, State, documentsContext, indexContext);
+            UseAllDocumentsEtag(documentsContext, query, length, indexEtagBytes);
 
             var writePos = indexEtagBytes + minLength;
 
@@ -130,7 +133,7 @@ namespace Raven.Server.Documents.Indexes.Static
                 using (indexContext.OpenReadTransaction())
                 using (databaseContext.OpenReadTransaction())
                 {
-                    var canReplace = StaticIndexHelper.CanReplace(this, IsStale(databaseContext, indexContext), DocumentDatabase, databaseContext, indexContext);
+                    var canReplace = IsStale(databaseContext, indexContext) == false;
                     if (canReplace)
                         _isSideBySide = null;
 
@@ -144,12 +147,12 @@ namespace Raven.Server.Documents.Indexes.Static
             return _compiled.ReferencedCollections;
         }
 
-        public override IIndexedDocumentsEnumerator GetMapEnumerator(IEnumerable<Document> documents, string collection, TransactionOperationContext indexContext, IndexingStatsScope stats)
+        public override IIndexedDocumentsEnumerator GetMapEnumerator(IEnumerable<Document> documents, string collection, TransactionOperationContext indexContext, IndexingStatsScope stats, IndexType type)
         {
-            return new StaticIndexDocsEnumerator(documents, _compiled.Maps[collection], collection, stats);
+            return new StaticIndexDocsEnumerator(documents, _compiled.Maps[collection], collection, stats, type);
         }
 
-        public override Dictionary<string, long> GetLastProcessedDocumentTombstonesPerCollection()
+        public override Dictionary<string, long> GetLastProcessedTombstonesPerCollection()
         {
             using (CurrentlyInUse())
             {

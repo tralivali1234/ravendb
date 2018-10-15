@@ -2,7 +2,12 @@
 
 import generalUtils = require("common/generalUtils");
 
-type knownDocumentFlags = "HasRevisions" | "Revision" | "HasAttachments" | "DeleteRevision";
+type knownDocumentFlags = "HasRevisions" | "Revision" | "HasAttachments" | "DeleteRevision" | "HasCounters" | "Artificial";
+
+interface revisionCounter {
+    name: string;
+    value: number;
+}
 
 class documentMetadata {
     collection: string;
@@ -18,6 +23,9 @@ class documentMetadata {
     lastModifiedInterval: KnockoutComputed<string>;
 
     attachments = ko.observableArray<documentAttachmentDto>();
+    counters = ko.observableArray<string>();
+    revisionCounters = ko.observableArray<revisionCounter>();
+    
     changeVector = ko.observable<string>();
 
     constructor(dto?: documentMetadataDto) {
@@ -50,9 +58,14 @@ class documentMetadata {
             this.lastModified(dto['@last-modified']);
 
             this.attachments(dto['@attachments']);
+            
+            this.counters(dto['@counters']);
+            
+            const revisionCounter = dto['@counters-snapshot'];
+            this.revisionCounters(revisionCounter ? _.map(revisionCounter, (v, k) => ({ name: k, value: v })): []);
 
             this.changeVector(dto['@change-vector']);
-            
+
             for (let property in dto) {
                 if (property.toUpperCase() !== '@collection'.toUpperCase() &&
                     property.toUpperCase() !== '@flags'.toUpperCase() &&
@@ -62,8 +75,10 @@ class documentMetadata {
                     property.toUpperCase() !== 'Temp-Index-Score'.toUpperCase() &&
                     property.toUpperCase() !== '@last-modified'.toUpperCase() &&
                     property.toUpperCase() !== '@attachments'.toUpperCase() &&
+                    property.toUpperCase() !== '@counters'.toUpperCase() &&
+                    property.toUpperCase() !== '@counters-snapshot'.toUpperCase() &&
                     property.toUpperCase() !== 'toDto'.toUpperCase() &&
-                    property.toUpperCase() !=='@change-vector'.toUpperCase()) {
+                    property.toUpperCase() !== '@change-vector'.toUpperCase()) {
                     this.nonStandardProps = this.nonStandardProps || [];
                     (<any>this)[property] = (<any>dto)[property];
                     this.nonStandardProps.push(property as any);
@@ -73,7 +88,7 @@ class documentMetadata {
     }
 
     hasFlag(flag: knownDocumentFlags) {
-        return _.includes(this.flags, flag);
+        return this.flags ? _.includes(this.flags.split(", "), flag) : false;
     }
 
     toDto(): documentMetadataDto {
@@ -86,8 +101,9 @@ class documentMetadata {
             'Temp-Index-Score': this.tempIndexScore,
             '@last-modified': this.lastModified(),
             '@attachments': this.attachments(),
+            '@counters': this.counters(),
             '@change-vector': this.changeVector()
-    };
+        };
 
         if (this.nonStandardProps) {
             this.nonStandardProps.forEach(p => dto[p] = (<any>this)[p]);
@@ -99,7 +115,7 @@ class documentMetadata {
     static filterMetadata(metaDto: documentMetadataDto, removedProps: any[] = null, isClonedDocument: boolean = false) {
         // We don't want to show certain reserved properties in the metadata text area.
         // Remove them from the DTO, restore them on save.
-        const metaPropsToRemove = ["@id", "@change-vector", "@last-modified", "@attachments"];
+        const metaPropsToRemove = ["@id", "@change-vector", "@last-modified", "@attachments", "@counters"];
 
         if (isClonedDocument) {
             metaPropsToRemove.push("@flags");
@@ -114,6 +130,12 @@ class documentMetadata {
             }
         }
         return metaDto;
+    }
+    
+    clearFlags() {
+        this.flags = "";
+        this.counters([]);
+        this.attachments([]);
     }
 }
 

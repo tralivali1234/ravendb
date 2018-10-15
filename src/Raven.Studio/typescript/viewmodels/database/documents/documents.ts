@@ -7,6 +7,7 @@ import deleteDocuments = require("viewmodels/common/deleteDocuments");
 import deleteCollection = require("viewmodels/database/documents/deleteCollection");
 import messagePublisher = require("common/messagePublisher");
 import collectionsTracker = require("common/helpers/database/collectionsTracker");
+import changeVectorUtils = require("common/changeVectorUtils");
 import documentPropertyProvider = require("common/helpers/database/documentPropertyProvider");
 
 import notificationCenter = require("common/notifications/notificationCenter");
@@ -22,6 +23,7 @@ import virtualGridController = require("widgets/virtualGrid/virtualGridControlle
 import hyperlinkColumn = require("widgets/virtualGrid/columns/hyperlinkColumn");
 import textColumn = require("widgets/virtualGrid/columns/textColumn");
 import checkedColumn = require("widgets/virtualGrid/columns/checkedColumn");
+import flagsColumn = require("widgets/virtualGrid/columns/flagsColumn");
 import columnPreviewPlugin = require("widgets/virtualGrid/columnPreviewPlugin");
 import columnsSelector = require("viewmodels/partial/columnsSelector");
 import showDataDialog = require("viewmodels/common/showDataDialog");
@@ -152,7 +154,7 @@ class documents extends viewModelBase {
 
         this.registerDisposable(this.tracker.registerOnGlobalChangeVectorUpdatedHandler((changeVector: string) => {
             if (this.currentCollection().isAllDocuments) {
-                if (this.gridController().resultEtag() !== changeVector) {
+                if (changeVector && this.gridController().resultEtag() !== changeVector) {
                     this.dirtyCurrentCollection(true);
                 }
             }
@@ -186,16 +188,17 @@ class documents extends viewModelBase {
         grid.headerVisible(true);
 
         const documentsProvider = new documentBasedColumnsProvider(this.activeDatabase(), grid, 
-            { showRowSelectionCheckbox: true, enableInlinePreview: false, showSelectAllCheckbox: true });
+            { showRowSelectionCheckbox: true, enableInlinePreview: false, showSelectAllCheckbox: true, showFlags: true });
 
         this.columnsSelector.init(grid, (s, t, previewCols, fullCols) => this.fetchDocs(s, t, previewCols, fullCols), (w, r) => {
             if (this.currentCollection().isAllDocuments) {
                 return [
                     new checkedColumn(true),
                     new hyperlinkColumn<document>(grid, x => x.getId(), x => appUrl.forEditDoc(x.getId(), this.activeDatabase()), "Id", "300px"),
-                    new textColumn<document>(grid, x => x.__metadata.changeVector(), "Change Vector", "200px"),
+                    new textColumn<document>(grid, x => changeVectorUtils.formatChangeVectorAsShortString(x.__metadata.changeVector()), "Change Vector", "200px"),
                     new textColumn<document>(grid, x => generalUtils.formatUtcDateAsLocal(x.__metadata.lastModified()), "Last Modified", "300px"),
-                    new hyperlinkColumn<document>(grid, x => x.getCollection(), x => appUrl.forDocuments(x.getCollection(), this.activeDatabase()), "Collection", "200px")
+                    new hyperlinkColumn<document>(grid, x => x.getCollection(), x => appUrl.forDocuments(x.getCollection(), this.activeDatabase()), "Collection", "200px"),
+                    new flagsColumn(grid)
                 ];
             } else {
                 return documentsProvider.findColumns(w, r);
@@ -213,6 +216,8 @@ class documents extends viewModelBase {
             if (column instanceof textColumn) {
                 if (this.currentCollection().isAllDocuments && column.header === "Last Modified") {
                     onValue(moment.utc(doc.__metadata.lastModified()), doc.__metadata.lastModified());
+                } else if (this.currentCollection().isAllDocuments && column.header === "Change Vector") {
+                    onValue(doc.__metadata.changeVector());
                 } else {
                     fullDocumentsProvider.resolvePropertyValue(doc, column, (v: any) => {
                         if (!_.isUndefined(v)) {

@@ -18,6 +18,7 @@ using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Linq;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Documents.Queries.MoreLikeThis;
+using Raven.Client.Documents.Session.Loaders;
 using Raven.Client.Documents.Session.Operations;
 using Raven.Client.Documents.Session.Tokens;
 using Raven.Client.Extensions;
@@ -108,7 +109,7 @@ namespace Raven.Client.Documents.Session
         /// <summary>
         /// The paths to include when loading the query
         /// </summary>
-        protected HashSet<string> Includes = new HashSet<string>();
+        protected HashSet<string> DocumentIncludes = new HashSet<string>();
 
         /// <summary>
         /// Holds the query stats
@@ -124,20 +125,6 @@ namespace Raven.Client.Documents.Session
         /// Determine if query results should be cached.
         /// </summary>
         protected bool DisableCaching;
-
-#if FEATURE_SHOW_TIMINGS
-        /// <summary>
-        /// Indicates if detailed timings should be calculated for various query parts (Lucene search, loading documents, transforming results). Default: false
-        /// </summary>
-        protected bool ShowQueryTimings;
-#endif
-
-#if FEATURE_EXPLAIN_SCORES
-        /// <summary>
-        /// Determine if scores of query results should be explained
-        /// </summary>
-        protected bool ShouldExplainScores;
-#endif
 
         public bool IsDistinct => SelectTokens.First?.Value is DistinctToken;
 
@@ -155,6 +142,8 @@ namespace Raven.Client.Documents.Session
         public bool IsDynamicMapReduce => GroupByTokens.Count > 0;
 
         private bool _isInMoreLikeThis;
+
+        private string _includesAlias;
 
         private static TimeSpan DefaultTimeout
         {
@@ -189,7 +178,7 @@ namespace Raven.Client.Documents.Session
             LoadTokens = loadTokens;
 
             TheSession = session;
-            AfterQueryExecuted(UpdateStatsAndHighlightings);
+            AfterQueryExecuted(UpdateStatsHighlightingsAndExplanations);
 
             _conventions = session == null ? new DocumentConventions() : session.Conventions;
             _linqPathProvider = new LinqPathProvider(_conventions);
@@ -251,6 +240,8 @@ namespace Raven.Client.Documents.Session
         public void RandomOrdering()
         {
             AssertNoRawQuery();
+
+            NoCaching();
             OrderByTokens.AddLast(OrderByToken.Random);
         }
 
@@ -261,11 +252,14 @@ namespace Raven.Client.Documents.Session
         public void RandomOrdering(string seed)
         {
             AssertNoRawQuery();
+
             if (string.IsNullOrWhiteSpace(seed))
             {
                 RandomOrdering();
                 return;
             }
+
+            NoCaching();
             OrderByTokens.AddLast(OrderByToken.CreateRandom(seed));
         }
 
@@ -402,7 +396,7 @@ namespace Raven.Client.Documents.Session
         /// <param name = "path">The path.</param>
         public void Include(string path)
         {
-            Includes.Add(path);
+            DocumentIncludes.Add(path);
         }
 
         /// <summary>
@@ -501,6 +495,22 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             Include(path.ToPropertyPath());
         }
 
+        public void Include(IncludeBuilder includes)
+        {
+            if (includes == null)
+                return;
+
+            if (includes.DocumentsToInclude != null)
+            {
+                foreach (var doc in includes.DocumentsToInclude)
+                {
+                    DocumentIncludes.Add(doc);
+                }
+            }
+
+            IncludeCounters(includes.Alias, includes.CountersToIncludeBySourcePath);
+        }
+
         /// <summary>
         ///   Takes the specified count.
         /// </summary>
@@ -524,7 +534,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         /// <summary>
         ///   Filter the results from the index using the specified where clause.
         /// </summary>
-        public void WhereLucene(string fieldName, string whereClause)
+        public void WhereLucene(string fieldName, string whereClause, bool exact)
         {
             fieldName = EnsureValidFieldName(fieldName, isNestedPath: false);
 
@@ -532,7 +542,9 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
 
             AppendOperatorIfNeeded(tokens);
             NegateIfNeeded(tokens, fieldName);
-            var whereToken = WhereToken.Create(WhereOperator.Lucene, fieldName, AddQueryParameter(whereClause));
+
+            var options = exact ? new WhereToken.WhereOptions(exact) : null;
+            var whereToken = WhereToken.Create(WhereOperator.Lucene, fieldName, AddQueryParameter(whereClause), options);
             tokens.AddLast(whereToken);
         }
 
@@ -594,16 +606,16 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
 
             whereParams.FieldName = EnsureValidFieldName(whereParams.FieldName, whereParams.IsNestedPath);
-            
+
             var tokens = GetCurrentWhereTokens();
             AppendOperatorIfNeeded(tokens);
-            
-            if (IfValueIsMethod(WhereOperator.Equals, whereParams, tokens)) 
+
+            if (IfValueIsMethod(WhereOperator.Equals, whereParams, tokens))
                 return;
-            
+
             var transformToEqualValue = TransformValue(whereParams);
             var addQueryParameter = AddQueryParameter(transformToEqualValue);
-            var whereToken = WhereToken.Create(WhereOperator.Equals, whereParams.FieldName, addQueryParameter, 
+            var whereToken = WhereToken.Create(WhereOperator.Equals, whereParams.FieldName, addQueryParameter,
                 new WhereToken.WhereOptions(whereParams.Exact));
             tokens.AddLast(whereToken);
         }
@@ -629,7 +641,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 {
                     throw new ArgumentException($"Unknown method {type}");
                 }
-                
+
                 tokens.AddLast(token);
                 return true;
             }
@@ -672,10 +684,10 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             AppendOperatorIfNeeded(tokens);
 
             whereParams.FieldName = EnsureValidFieldName(whereParams.FieldName, whereParams.IsNestedPath);
-            
-            if (IfValueIsMethod(WhereOperator.NotEquals, whereParams, tokens)) 
+
+            if (IfValueIsMethod(WhereOperator.NotEquals, whereParams, tokens))
                 return;
-            
+
             var whereToken = WhereToken.Create(WhereOperator.NotEquals, whereParams.FieldName, AddQueryParameter(transformToEqualValue),
                 new WhereToken.WhereOptions(whereParams.Exact));
             tokens.AddLast(whereToken);
@@ -756,7 +768,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         }
 
         /// <summary>
-        ///   Matches fields where the value is between the specified start and end, exclusive
+        ///   Matches fields where the value is between the specified start and end, inclusive
         /// </summary>
         /// <param name = "fieldName">Name of the field.</param>
         /// <param name = "start">The start.</param>
@@ -957,20 +969,19 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             var tokens = GetCurrentWhereTokens();
             var whereToken = tokens.Last?.Value as WhereToken;
             if (whereToken == null)
-            {
-                throw new InvalidOperationException("Missing where clause");
-            }
+                throw new InvalidOperationException("Fuzzy can only be used right after Where clause");
+
+            if (whereToken.WhereOperator != WhereOperator.Equals)
+                throw new InvalidOperationException("Fuzzy can only be used right after Where clause with equals operator");
 
             if (fuzzy < 0m || fuzzy > 1m)
-            {
                 throw new ArgumentOutOfRangeException(nameof(fuzzy), "Fuzzy distance must be between 0.0 and 1.0");
-            }
 
             whereToken.Options.Fuzzy = fuzzy;
         }
 
         /// <summary>
-        ///   Specifies a proximity distance for the phrase in the last where clause
+        ///   Specifies a proximity distance for the phrase in the last search clause
         /// </summary>
         /// <param name = "proximity">number of words within</param>
         /// <returns></returns>
@@ -981,15 +992,11 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         {
             var tokens = GetCurrentWhereTokens();
             var whereToken = tokens.Last?.Value as WhereToken;
-            if (whereToken == null)
-            {
-                throw new InvalidOperationException("Missing where clause");
-            }
+            if (whereToken == null || whereToken.WhereOperator != WhereOperator.Search)
+                throw new InvalidOperationException("Proximity can only be used right after Search clause");
 
             if (proximity < 1)
-            {
                 throw new ArgumentOutOfRangeException(nameof(proximity), "Proximity distance must be a positive number");
-            }
 
             whereToken.Options.Proximity = proximity;
         }
@@ -1071,13 +1078,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 WaitForNonStaleResults = TheWaitForNonStaleResults,
                 WaitForNonStaleResultsTimeout = Timeout,
                 QueryParameters = QueryParameters,
-                DisableCaching = DisableCaching,
-#if FEATURE_SHOW_TIMINGS
-                ShowTimings = ShowQueryTimings,
-#endif
-#if FEATURE_EXPLAIN_SCORES
-                ExplainScores = ShouldExplainScores
-#endif
+                DisableCaching = DisableCaching
             };
 
             if (PageSize != null)
@@ -1126,12 +1127,16 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
 
         private void BuildInclude(StringBuilder queryText)
         {
-            if (Includes == null || Includes.Count == 0)
+            if (DocumentIncludes.Count == 0 &&
+                HighlightingTokens.Count == 0 &&
+                ExplanationToken == null &&
+                QueryTimings == null &&
+                CounterIncludesTokens == null)
                 return;
 
             queryText.Append(" include ");
-            bool first = true;
-            foreach (var include in Includes)
+            var first = true;
+            foreach (var include in DocumentIncludes)
             {
                 if (first == false)
                     queryText.Append(",");
@@ -1154,6 +1159,45 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 {
                     queryText.Append(include);
                 }
+            }
+
+            if (CounterIncludesTokens != null)
+            {
+                foreach (var counterIncludesToken in CounterIncludesTokens)
+                {
+                    if (first == false)
+                        queryText.Append(",");
+                    first = false;
+
+                    counterIncludesToken.WriteTo(queryText);
+                }
+            }
+
+            foreach (var token in HighlightingTokens)
+            {
+                if (first == false)
+                    queryText.Append(",");
+                first = false;
+
+                token.WriteTo(queryText);
+            }
+
+            if (ExplanationToken != null)
+            {
+                if (first == false)
+                    queryText.Append(",");
+                first = false;
+
+                ExplanationToken.WriteTo(queryText);
+            }
+
+            if (QueryTimings != null)
+            {
+                if (first == false)
+                    queryText.Append(",");
+                first = false;
+
+                TimingsToken.Instance.WriteTo(queryText);
             }
         }
 
@@ -1194,7 +1238,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 .ToArray();
 
             var whereToken = WhereToken.Create(WhereOperator.In, fieldName, AddQueryParameter(array), new WhereToken.WhereOptions(false));
-            
+
             tokens.AddLast(whereToken);
         }
 
@@ -1216,7 +1260,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
 
             var whereToken = WhereToken.Create(WhereOperator.AllIn, fieldName, AddQueryParameter(array));
-            
+
             tokens.AddLast(whereToken);
         }
 
@@ -1253,12 +1297,12 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             SelectTokens.AddFirst(DistinctToken.Instance);
         }
 
-        private void UpdateStatsAndHighlightings(QueryResult queryResult)
+        private void UpdateStatsHighlightingsAndExplanations(QueryResult queryResult)
         {
             QueryStats.UpdateQueryStats(queryResult);
-#if FEATURE_HIGHLIGHTING
-            Highlightings.Update(queryResult);
-#endif
+            QueryHighlightings.Update(queryResult);
+            Explanations?.Update(queryResult);
+            QueryTimings?.Update(queryResult);
         }
 
         private void BuildSelect(StringBuilder writer)
@@ -1536,8 +1580,8 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
 
             var type = whereParams.Value.GetType().GetNonNullableType();
 
-            if (_conventions.TryConvertValueForQuery(whereParams.FieldName, whereParams.Value, forRange, out var strVal))
-                return strVal;
+            if (_conventions.TryConvertValueToObjectForQuery(whereParams.FieldName, whereParams.Value, forRange, out var objValue))
+                return objValue;
 
             if (type == typeof(DateTime) || type == typeof(DateTimeOffset))
                 return whereParams.Value;
@@ -1644,11 +1688,60 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 throw new InvalidOperationException("Alias cannot be null or empty");
 
             var tokens = GetCurrentWhereTokens();
-            foreach (var token in tokens)
+            var current = tokens.First;
+            while(current != null)
             {
-                var whereToken = token as WhereToken;
-                whereToken?.AddAlias(fromAlias);
+                if (current.Value is WhereToken w)
+                    current.Value = w.AddAlias(fromAlias);
+                current = current.Next;
             }
+        }
+
+        public string AddAliasToCounterIncludesTokens(string fromAlias)
+        {
+            if (_includesAlias == null)
+                return fromAlias;
+
+            if (fromAlias == null)
+            {
+                fromAlias = _includesAlias;
+                AddFromAliasToWhereTokens(fromAlias);
+            }
+
+            foreach (var counterIncludesToken in CounterIncludesTokens)
+            {
+                counterIncludesToken.AddAliasToPath(fromAlias);
+            }
+
+            return fromAlias;
+        }
+
+        protected static void GetSourceAliasIfExists(QueryData queryData, string[] fields, out string sourceAlias)
+        {
+            sourceAlias = null;
+
+            if (fields.Length != 1)
+                return;
+
+            var indexOf = fields[0].IndexOf(".", StringComparison.Ordinal);
+            if (indexOf == -1)
+                return;
+
+            var possibleAlias = fields[0].Substring(0, indexOf);
+            if (queryData.FromAlias != null &&
+                queryData.FromAlias == possibleAlias)
+            {
+                sourceAlias = possibleAlias;
+                return;
+            }
+
+            if (queryData.LoadTokens == null ||
+                queryData.LoadTokens.Count == 0)
+                return;
+            if (queryData.LoadTokens.Any(lt => lt.Alias == possibleAlias) == false)
+                return;
+
+            sourceAlias = possibleAlias;
         }
 
         public string ProjectionParameter(object id)

@@ -91,8 +91,9 @@ namespace Raven.Client.Documents.Queries.Facets
             }
 
             var operation = (BinaryExpression)expr.Body;
+            var leftExpression = SkipConvertExpressions(operation.Left);
 
-            if (operation.Left is MemberExpression me)
+            if (leftExpression is MemberExpression me)
             {
                 var fieldName = GetFieldName(prefix, me);
                 var subExpressionValue = ParseSubExpression(operation);
@@ -100,13 +101,18 @@ namespace Raven.Client.Documents.Queries.Facets
                 return expression;
             }
 
-            if (!(operation.Left is BinaryExpression left) || 
-                !(operation.Right is BinaryExpression right) || 
+            var rightExpression = SkipConvertExpressions(operation.Right);
+
+            if (!(leftExpression is BinaryExpression left) || 
+                !(rightExpression is BinaryExpression right) || 
                 operation.NodeType != ExpressionType.AndAlso)
                 throw new InvalidOperationException($"Range can be only specified using: '&&'. Cannot use: '{operation.NodeType}'");
 
-            if (!(left.Left is MemberExpression leftMember) || 
-                !(right.Left is MemberExpression rightMember))
+            leftExpression = SkipConvertExpressions(left.Left);
+            rightExpression = SkipConvertExpressions(right.Left);
+
+            if (!(leftExpression is MemberExpression leftMember) || 
+                !(rightExpression is MemberExpression rightMember))
             {
                 throw new InvalidOperationException("Expressions on both sides of '&&' must point to range field. E.g. x => x.Age > 18 && x.Age < 99");
             }
@@ -216,6 +222,18 @@ namespace Raven.Client.Documents.Queries.Facets
 
         }
 
+        private static Expression SkipConvertExpressions(Expression expression)
+        {
+            switch (expression.NodeType)
+            {
+                case ExpressionType.ConvertChecked:
+                case ExpressionType.Convert:
+                    return SkipConvertExpressions(((UnaryExpression)expression).Operand);
+                default:
+                    return expression;
+            }
+        }
+
         private static object ParseUnaryExpression(UnaryExpression expression)
         {
             if (expression.NodeType == ExpressionType.Convert)
@@ -296,9 +314,9 @@ namespace Raven.Client.Documents.Queries.Facets
                 case null:
                     return "null";
                 case DateTime dt:
-                    return "'" + dt.GetDefaultRavenFormat() + "'";
+                    return "'" + dt.GetDefaultRavenFormat(isUtc: dt.Kind == DateTimeKind.Utc) + "'";
                 case DateTimeOffset dto:
-                    return "'" + dto.UtcDateTime.GetDefaultRavenFormat() + "'";
+                    return "'" + dto.UtcDateTime.GetDefaultRavenFormat(true) + "'";
                 case string s:
                     return "'" + EscapeString(s) + "'";
                 case int i:

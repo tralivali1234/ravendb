@@ -37,6 +37,8 @@ namespace Sparrow.Json
                 }
                 catch (ObjectDisposedException)
                 {
+                    // This is expected, we might be calling the finalizer on an object that
+                    // was already disposed, we don't want to error here because of this
                 }
             }
 
@@ -50,7 +52,7 @@ namespace Sparrow.Json
 
             private void DisposeOfContexts()
             {
-                var current = Head;
+                var current = Interlocked.Exchange(ref Head, HeaderDisposed);
                 while (current != null)
                 {
                     var ctx = current.Value;
@@ -92,9 +94,16 @@ namespace Sparrow.Json
                 return; // the context pool was already disposed
             }
 
-            while(current != null)
+            while (current != null)
             {
-                current.Value?.Dispose();
+                var value = current.Value;
+
+                if (value != null)
+                {
+                    if (value.InUse.Raise()) // it could be stolen by another thread - RavenDB-11409
+                        value.Dispose();
+                }
+
                 current = current.Next;
             }
         }
@@ -209,6 +218,11 @@ namespace Sparrow.Json
             while (true)
             {
                 var current = threadHeader.Head;
+                if(current == ContextStack.HeaderDisposed)
+                {
+                    context.Dispose();
+                    return;
+                }
                 var newHead = new StackNode<T> { Value = context, Next = current };
                 if (Interlocked.CompareExchange(ref threadHeader.Head, newHead, current) == current)
                     return;

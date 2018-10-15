@@ -30,7 +30,7 @@ namespace Raven.Server.Documents.Indexes.Auto
             return instance;
         }
 
-        public override IIndexedDocumentsEnumerator GetMapEnumerator(IEnumerable<Document> documents, string collection, TransactionOperationContext indexContext, IndexingStatsScope stats)
+        public override IIndexedDocumentsEnumerator GetMapEnumerator(IEnumerable<Document> documents, string collection, TransactionOperationContext indexContext, IndexingStatsScope stats, IndexType type)
         {
             return new AutoIndexDocsEnumerator(documents, stats);
         }
@@ -39,6 +39,18 @@ namespace Raven.Server.Documents.Indexes.Auto
         {
             SetLock(definition.LockMode);
             SetPriority(definition.Priority);
+        }
+
+        public override void SetState(IndexState state)
+        {
+            base.SetState(state);
+            Definition.State = state;
+        }
+
+        protected override void LoadValues()
+        {
+            base.LoadValues();
+            Definition.State = State;
         }
     }
 }

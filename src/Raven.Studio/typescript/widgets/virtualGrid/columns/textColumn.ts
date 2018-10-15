@@ -6,7 +6,8 @@ import utils = require("widgets/virtualGrid/virtualGridUtils");
 
 type textColumnOpts<T> = {
     extraClass?: (item: T) => string;
-    useRawValue?: (item: T) => boolean
+    useRawValue?: (item: T) => boolean;
+    title?: (item:T) => string;
 }
 
 type preparedValue = {
@@ -27,6 +28,10 @@ class textColumn<T> implements virtualColumn {
         return this.header;
     }
 
+    get headerAsText() {
+        return this.header;
+    }
+
     getCellValue(item: T) {
         return _.isFunction(this.valueAccessor)
             ? this.valueAccessor.bind(item)(item) // item is available as this, as well as first argument
@@ -34,10 +39,11 @@ class textColumn<T> implements virtualColumn {
     }
 
     renderCell(item: T, isSelected: boolean): string {
+        const extraHtml = this.opts.title ? ` title="${utils.escape(this.opts.title(item))}" ` : '';
         const extraCssClasses = this.opts.extraClass ? this.opts.extraClass(item) : '';
         try {
             const preparedValue = this.prepareValue(item);
-            return `<div class="cell text-cell ${preparedValue.typeCssClass} ${extraCssClasses}" style="width: ${this.width}">${preparedValue.rawText}</div>`;
+            return `<div  ${extraHtml} class="cell text-cell ${preparedValue.typeCssClass} ${extraCssClasses}" style="width: ${this.width}">${preparedValue.rawText}</div>`;
         } catch (error) {
             //TODO: work on L&F of errors!
             return `<div class="cell text-cell eval-error ${extraCssClasses}" style="width: ${this.width}">Error!</div>`;

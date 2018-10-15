@@ -25,27 +25,20 @@ namespace Raven.Client.Documents.Queries
         /// </summary>
         public int SkippedResults { get; set; }
 
-#if FEATURE_HIGHLIGHTING
         /// <summary>
         /// Highlighter results (if requested).
         /// </summary>
         public Dictionary<string, Dictionary<string, string[]>> Highlightings { get; set; }
-#endif
+
+        /// <summary>
+        /// Explanations (if requested).
+        /// </summary>
+        public Dictionary<string, string[]> Explanations { get; set; }
 
         /// <summary>
         /// The duration of actually executing the query server side
         /// </summary>
         public long DurationInMs { get; set; }
-
-        /// <summary>
-        /// Explanations of document scores (if requested).
-        /// </summary>
-        public Dictionary<string, string> ScoreExplanations { get; set; }
-
-        /// <summary>
-        /// Detailed timings for various parts of a query (Lucene search, loading documents, transforming results) - if requested.
-        /// </summary>
-        public Dictionary<string, double> TimingsInMs { get; set; }
 
         /// <summary>
         /// The size of the request which were sent from the server.
@@ -74,14 +67,15 @@ namespace Raven.Client.Documents.Queries
                 IsStale = IsStale,
                 SkippedResults = SkippedResults,
                 TotalResults = TotalResults,
-#if FEATURE_HIGHLIGHTING
                 Highlightings = Highlightings?.ToDictionary(pair => pair.Key, x => new Dictionary<string, string[]>(x.Value)),
-#endif
-                ScoreExplanations = ScoreExplanations?.ToDictionary(x => x.Key, x => x.Value),
-                TimingsInMs = TimingsInMs?.ToDictionary(x => x.Key, x => x.Value),
+                Explanations = Explanations?.ToDictionary(x => x.Key, x => x.Value),
+                Timings = Timings?.Clone(),
                 LastQueryTime = LastQueryTime,
                 DurationInMs = DurationInMs,
-                ResultEtag = ResultEtag
+                ResultEtag = ResultEtag,
+                NodeTag = NodeTag,
+                CounterIncludes = CounterIncludes,
+                IncludedCounterNames = IncludedCounterNames
             };
         }
     }

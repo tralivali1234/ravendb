@@ -13,6 +13,7 @@ using System.Threading.Tasks;
 using Raven.Client.Exceptions.Documents.Subscriptions;
 using Raven.Client.Json.Converters;
 using Raven.Client.ServerWide;
+using Raven.Client.ServerWide.Commands;
 using Raven.Server.Rachis;
 using Raven.Server.Utils;
 
@@ -24,6 +25,7 @@ namespace Raven.Server.Documents.Subscriptions
         private readonly DocumentDatabase _db;
         private readonly ServerStore _serverStore;
         public static TimeSpan TwoMinutesTimespan = TimeSpan.FromMinutes(2);
+        public bool HasHighlyAvailableTasks;
         private readonly ConcurrentDictionary<long, SubscriptionConnectionState> _subscriptionConnectionStates = new ConcurrentDictionary<long, SubscriptionConnectionState>();
         private readonly Logger _logger;
         private readonly SemaphoreSlim _concurrentConnectionsSemiSemaphore;
@@ -69,6 +71,7 @@ namespace Raven.Server.Documents.Subscriptions
                 _logger.Info($"New Subscription with index {etag} was created");
 
             await _db.RachisLogIndexNotifications.WaitForIndexNotification(etag, _serverStore.Engine.OperationTimeout);
+
             return etag;
         }
 
@@ -79,8 +82,8 @@ namespace Raven.Server.Documents.Subscriptions
             return subscriptionState;
         }
 
-		public async Task AcknowledgeBatchProcessed(long id, string name, string changeVector, string previousChangeVector)
-        {           
+        public async Task AcknowledgeBatchProcessed(long id, string name, string changeVector, string previousChangeVector)
+        {
             var command = new AcknowledgeSubscriptionBatchCommand(_db.Name)
             {
                 ChangeVector = changeVector,
@@ -120,6 +123,13 @@ namespace Raven.Server.Documents.Subscriptions
             }
         }
 
+        public string GetResponsibleNode(TransactionOperationContext serverContext, string name)
+        {
+            var subscription = GetSubscriptionFromServerStore(serverContext, name);
+            var databaseRecord = _serverStore.Cluster.ReadDatabase(serverContext, _db.Name, out _);
+            return _db.WhoseTaskIsIt(databaseRecord.Topology, subscription, subscription);
+        }
+
         public async Task<SubscriptionState> AssertSubscriptionConnectionDetails(long id, string name)
         {
             await _serverStore.WaitForCommitIndexChange(RachisConsensus.CommitIndexModification.GreaterOrEqual, id);
@@ -132,7 +142,7 @@ namespace Raven.Server.Documents.Subscriptions
                 var whoseTaskIsIt = _db.WhoseTaskIsIt(databaseRecord.Topology, subscription, subscription);
                 if (whoseTaskIsIt != _serverStore.NodeTag)
                 {
-                    throw new SubscriptionDoesNotBelongToNodeException($"Subscripition with id {id} can't be proccessed on current node ({_serverStore.NodeTag}), because it belongs to {whoseTaskIsIt}")
+                    throw new SubscriptionDoesNotBelongToNodeException($"Subscription with id {id} can't be processed on current node ({_serverStore.NodeTag}), because it belongs to {whoseTaskIsIt}")
                     {
                         AppropriateNode = whoseTaskIsIt
                     };
@@ -216,7 +226,7 @@ namespace Raven.Server.Documents.Subscriptions
 
                 if (take-- <= 0)
                     yield break;
-                
+
                 var subscriptionData = GetSubscriptionFromServerStore(context, subscriptionStateConnection.Options.SubscriptionName);
                 GetRunningSubscriptionInternal(history, subscriptionData, subscriptionState);
                 yield return subscriptionData;
@@ -239,7 +249,7 @@ namespace Raven.Server.Documents.Subscriptions
             {
                 throw new ArgumentNullException("Must receive either subscription id or subscription name in order to provide subscription data");
             }
-            
+
 
             GetSubscriptionInternal(subscription, history);
 
@@ -251,7 +261,7 @@ namespace Raven.Server.Documents.Subscriptions
             var subscriptionBlittable = _serverStore.Cluster.Read(context, SubscriptionState.GenerateSubscriptionItemKeyName(_db.Name, name));
 
             if (subscriptionBlittable == null)
-                throw new SubscriptionDoesNotExistException($"Subscripiton with name {name} was not found in server store");
+                throw new SubscriptionDoesNotExistException($"Subscription with name {name} was not found in server store");
 
             var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
             var subscriptionJsonValue = new SubscriptionGeneralDataAndStats(subscriptionState);
@@ -279,7 +289,7 @@ namespace Raven.Server.Documents.Subscriptions
 
             if (subscriptionConnectionState.Connection == null)
                 return null;
-            
+
             GetRunningSubscriptionInternal(history, subscription, subscriptionConnectionState);
             return subscription;
         }
@@ -306,11 +316,11 @@ namespace Raven.Server.Documents.Subscriptions
             if (subscriptionBlittable == null)
                 return null;
 
-                var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
+            var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
 
             if (_subscriptionConnectionStates.TryGetValue(subscriptionState.SubscriptionId, out SubscriptionConnectionState subscriptionConnection) == false)
                 return null;
-            
+
             return subscriptionConnection;
         }
 

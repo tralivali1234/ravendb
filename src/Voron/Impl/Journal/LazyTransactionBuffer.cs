@@ -2,6 +2,7 @@
 using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using Sparrow;
+using Sparrow.Binary;
 using Sparrow.Logging;
 using Voron.Global;
 using Voron.Impl.Paging;
@@ -15,23 +16,40 @@ namespace Voron.Impl.Journal
         private LowLevelTransaction _readTransaction;
         private long? _firstPositionInJournalFile;
         private int _lastUsed4Kbs;
-        private readonly AbstractPager _lazyTransactionPager;
+        private AbstractPager _lazyTransactionPager;
         private readonly TransactionPersistentContext _transactionPersistentContext;
         public int NumberOfPages { get; set; }
         private readonly Logger _log;
         private readonly StorageEnvironmentOptions _options;
+        private long _lazyPagerCounter;
 
         public LazyTransactionBuffer(StorageEnvironmentOptions options)
         {
-            _lazyTransactionPager = options.CreateTemporaryBufferPager("lazy-transactions.buffers", options.InitialFileSize ?? options.InitialLogFileSize);
+            _options = options;
+            _lazyTransactionPager = CreateBufferPager();
             _transactionPersistentContext = new TransactionPersistentContext(true);
             _log = LoggingSource.Instance.GetLogger<LazyTransactionBuffer>(options.BasePath.FullPath);
-            _options = options;
+        }
+
+        private AbstractPager CreateBufferPager()
+        {
+            return _options.CreateTemporaryBufferPager($"lazy-transactions.{_lazyPagerCounter++:D10}.buffers", _options.InitialFileSize ?? _options.InitialLogFileSize);
         }
 
         public void EnsureSize(int sizeInPages)
         {
-            _lazyTransactionPager.EnsureContinuous(0, sizeInPages);
+            try
+            {
+                _lazyTransactionPager.EnsureContinuous(0, sizeInPages);
+            }
+            catch (InsufficientMemoryException)
+            {
+                // RavenDB-10830: failed to lock memory of temp buffers in encrypted db, let's create new file with initial size
+
+                _lazyTransactionPager.Dispose();
+                _lazyTransactionPager = CreateBufferPager();
+                throw;
+            }
         }
 
         public void AddToBuffer(long position, CompressedPagesResult pages)
@@ -75,7 +93,7 @@ namespace Voron.Impl.Journal
                     _lazyTransactionPager.EnsureMapped(tempTx, 0, numberOfPages);
                     var src = _lazyTransactionPager.AcquirePagePointer(tempTx, 0);
                     var sp = Stopwatch.StartNew();
-                    journalFile.JournalWriter.Write(_firstPositionInJournalFile.Value, src, _lastUsed4Kbs);
+                    journalFile.Write(_firstPositionInJournalFile.Value, src, _lastUsed4Kbs);
                     if (_log.IsInfoEnabled)
                     {
                         _log.Info($"Writing lazy transaction buffer with {_lastUsed4Kbs / 4:#,#0} kb took {sp.Elapsed}");

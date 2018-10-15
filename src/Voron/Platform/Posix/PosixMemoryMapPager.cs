@@ -21,7 +21,7 @@ namespace Voron.Platform.Posix
         private readonly bool _copyOnWriteMode;
         public override long TotalAllocationSize => _totalAllocationSize;
         public PosixMemoryMapPager(StorageEnvironmentOptions options, VoronPathSetting file, long? initialFileSize = null,
-            bool usePageProtection = false) : base(options, usePageProtection)
+            bool usePageProtection = false) : base(options, canPrefetchAhead: true, usePageProtection: usePageProtection)
         {
             _options = options;
             FileName = file;
@@ -71,7 +71,6 @@ namespace Voron.Platform.Posix
             SetPagerState(CreatePagerState());
         }
 
-
         private long NearestSizeToPageSize(long size)
         {
             if (size == 0)
@@ -110,7 +109,7 @@ namespace Voron.Platform.Posix
 
             PosixHelper.AllocateFileSpace(_options, _fd, _totalAllocationSize + allocationSize, FileName.FullPath);
 
-            if (_isSyncDirAllowed && Syscall.SyncDirectory(FileName.FullPath) == -1)
+            if (DeleteOnClose == false && _isSyncDirAllowed && Syscall.SyncDirectory(FileName.FullPath) == -1)
             {
                 var err = Marshal.GetLastWin32Error();
                 Syscall.ThrowLastError(err);
@@ -128,6 +127,7 @@ namespace Voron.Platform.Posix
 
             newPagerState.DebugVerify(newLengthAfterAdjustment);
 
+            newPagerState.CopyPrefetchState(this._pagerState);
             SetPagerState(newPagerState);
 
             _totalAllocationSize += allocationSize;
@@ -152,7 +152,7 @@ namespace Voron.Platform.Posix
                 Syscall.ThrowLastError(err, "mmap on " + FileName);
             }
 
-            NativeMemory.RegisterFileMapping(FileName.FullPath, startingBaseAddressPtr, fileSize);
+            NativeMemory.RegisterFileMapping(FileName.FullPath, startingBaseAddressPtr, fileSize, GetAllocatedInBytes);
 
             var allocationInfo = new PagerState.AllocationInfo
             {
@@ -161,14 +161,7 @@ namespace Voron.Platform.Posix
                 MappedFile = null
             };
 
-            var newPager = new PagerState(this)
-            {
-                Files = null, // unused
-                MapBase = allocationInfo.BaseAddress,
-                AllocationInfos = new[] { allocationInfo }
-            };
-
-            return newPager;
+            return new PagerState(this, Options.PrefetchSegmentSize, Options.PrefetchResetThreshold, allocationInfo);
         }
 
         public override void Sync(long totalUnsynced)

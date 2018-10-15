@@ -12,6 +12,8 @@
         Exists,
         Exact,
         Intersect,
+        Fuzzy,
+        Proximity,
 
         Count,
         Sum,
@@ -32,6 +34,14 @@
         MoreLikeThis,
 
         Array,
+
+        Highlight,
+
+        Explanation,
+
+        Timings,
+
+        Counters,
 
         Unknown,
     }

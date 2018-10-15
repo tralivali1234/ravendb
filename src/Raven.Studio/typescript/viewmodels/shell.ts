@@ -7,6 +7,7 @@ import menu = require("common/shell/menu");
 import generateMenuItems = require("common/shell/menu/generateMenuItems");
 import activeDatabaseTracker = require("common/shell/activeDatabaseTracker");
 import databaseSwitcher = require("common/shell/databaseSwitcher");
+import accessManager = require("common/shell/accessManager");
 import clusterTopologyManager = require("common/shell/clusterTopologyManager");
 import favNodeBadge = require("common/shell/favNodeBadge");
 import searchBox = require("common/shell/searchBox");
@@ -29,23 +30,27 @@ import notificationCenter = require("common/notifications/notificationCenter");
 
 import getClientBuildVersionCommand = require("commands/database/studio/getClientBuildVersionCommand");
 import getServerBuildVersionCommand = require("commands/resources/getServerBuildVersionCommand");
+import getGlobalStudioConfigurationCommand = require("commands/resources/getGlobalStudioConfigurationCommand");
+import getStudioConfigurationCommand = require("commands/resources/getStudioConfigurationCommand");
 import viewModelBase = require("viewmodels/viewModelBase");
-import accessHelper = require("viewmodels/shell/accessHelper");
 import eventsCollector = require("common/eventsCollector");
 import collectionsTracker = require("common/helpers/database/collectionsTracker");
 import footer = require("common/shell/footer");
 import feedback = require("viewmodels/shell/feedback");
 import continueTest = require("common/shell/continueTest");
+import globalSettings = require("common/settings/globalSettings");
 
 import protractedCommandsDetector = require("common/notifications/protractedCommandsDetector");
 import requestExecution = require("common/notifications/requestExecution");
 import studioSettings = require("common/settings/studioSettings");
+import simpleStudioSetting = require("common/settings/simpleStudioSetting");
 import clientCertificateModel = require("models/auth/clientCertificateModel");
 import certificateModel = require("models/auth/certificateModel");
 import serverTime = require("common/helpers/database/serverTime");
+import saveGlobalStudioConfigurationCommand = require("commands/resources/saveGlobalStudioConfigurationCommand");
+import saveStudioConfigurationCommand = require("commands/resources/saveStudioConfigurationCommand");
+import studioSetting = require("common/settings/studioSetting");
 
-//TODO: extract cluster related logic to separate class
-//TODO: extract api key related logic to separate class 
 class shell extends viewModelBase {
 
     private router = router;
@@ -55,15 +60,17 @@ class shell extends viewModelBase {
     collectionsTracker = collectionsTracker.default;
     footer = footer.default;
     clusterManager = clusterTopologyManager.default;
+    accessManager = accessManager.default;
     continueTest = continueTest.default;
     static buildInfo = buildInfo;
 
     clientBuildVersion = ko.observable<clientBuildVersionDto>();
 
-    windowHeightObservable: KnockoutObservable<number>; //TODO: delete?
     currentRawUrl = ko.observable<string>("");
     rawUrlIsVisible = ko.computed(() => this.currentRawUrl().length > 0);
     showSplash = viewModelBase.showSplash;
+    browserAlert = ko.observable<boolean>(false);
+    dontShowBrowserAlertAgain = ko.observable<boolean>(false);
 
     licenseStatus = license.licenseCssClass;
     supportStatus = license.supportCssClass;
@@ -82,6 +89,9 @@ class shell extends viewModelBase {
     trackingTask = $.Deferred<boolean>();
 
     studioLoadingFakeRequest: requestExecution;
+    
+    serverEnvironment = ko.observable<Raven.Client.Documents.Operations.Configuration.StudioConfiguration.StudioEnvironment>();
+    serverEnvironmentClass = database.createEnvironmentColorComputed("text", this.serverEnvironment);
 
     private onBootstrapFinishedTask = $.Deferred<void>();
     
@@ -116,8 +126,16 @@ class shell extends viewModelBase {
         });
 
         activeDatabaseTracker.default.database.subscribe(newDatabase => footer.default.forDatabase(newDatabase));
-    }
 
+        studioSettings.default.configureLoaders(() => new getGlobalStudioConfigurationCommand().execute(),
+            (db) => new getStudioConfigurationCommand(db).execute(),
+            settings => new saveGlobalStudioConfigurationCommand(settings).execute(),
+            (settings, db) => new saveStudioConfigurationCommand(settings, db).execute()
+        );
+        
+        this.detectBrowser();
+    }
+    
     // Override canActivate: we can always load this page, regardless of any system db prompt.
     canActivate(args: any): any {
         return true;
@@ -138,14 +156,26 @@ class shell extends viewModelBase {
                 license.fetchSupportCoverage();
             }
         });
-
+        
         $.when<any>(licenseTask, topologyTask, clientCertifiateTask)
-            .done(() => {
+            .done(([license]: [Raven.Server.Commercial.LicenseStatus], 
+                   [topology]: [Raven.Server.NotificationCenter.Notifications.Server.ClusterTopologyChanged],
+                   [certificate]: [Raven.Client.ServerWide.Operations.Certificates.CertificateDefinition]) => {
+            
                 changesContext.default
                     .connectServerWideNotificationCenter();
 
                 // load global settings
-                studioSettings.default.globalSettings();
+                studioSettings.default.globalSettings()
+                    .done((settings: globalSettings) => this.onGlobalConfiguration(settings));
+                studioSettings.default.registerOnSettingChangedHandler(name => true, (name: string, setting: studioSetting<any>) => {
+                    // if any remote configuration was changed, then force reload
+                    if (setting.saveLocation === "remote") {
+                        studioSettings.default.globalSettings()
+                            .done(settings => this.onGlobalConfiguration(settings));
+                        
+                    }
+                });
 
                 // bind event handles before we connect to server wide notification center 
                 // (connection will be started after executing this method) - it was just scheduled 2 lines above
@@ -154,14 +184,43 @@ class shell extends viewModelBase {
                 this.databasesManager.setupGlobalNotifications();
                 this.clusterManager.setupGlobalNotifications();
                 this.notificationCenter.setupGlobalNotifications(changesContext.default.serverNotifications());
+                
+                const serverWideClient = changesContext.default.serverNotifications();
+                serverWideClient.watchReconnect(() => studioSettings.default.globalSettings(true));
 
                 this.connectToRavenServer();
+                
+                // "http"
+                if (location.protocol === "http:") {
+                    this.accessManager.securityClearance("ClusterAdmin");
+                } else {
+                    // "https"
+                    if (certificate) {
+                        this.accessManager.securityClearance(certificate.SecurityClearance);
+                    } else {
+                        this.accessManager.securityClearance("ValidUser");
+                    }
+                }
             })
             .then(() => this.onBootstrapFinishedTask.resolve(), () => this.onBootstrapFinishedTask.reject());
 
         this.setupRouting();
+        
+        // we await here only for certificate task, as downloading license can take longer
+        return clientCertifiateTask;
     }
-
+    
+    private onGlobalConfiguration(settings: globalSettings) {
+        if (!settings.disabled.getValue()) {
+            const envValue = settings.environment.getValue();
+            if (envValue && envValue !== "None") {
+                this.serverEnvironment(envValue);
+            } else {
+                this.serverEnvironment(null);
+            }
+        }
+    }
+    
     private setupRouting() {
         const routes = allRoutes.get(this.appUrls);
         routes.push(...routes);
@@ -198,7 +257,7 @@ class shell extends viewModelBase {
         
         sys.error = (e: any) => {
             console.error(e);
-            messagePublisher.reportError("Failed to load routed module!", e);
+            messagePublisher.reportWarning("Failed to load routed module!", e);
         };
     }
 
@@ -256,21 +315,6 @@ class shell extends viewModelBase {
         return appUrl.forCertificates();
     }
 
-    /*
-    static fetchStudioConfig() {
-        new getDocumentWithMetadataCommand(shell.studioConfigDocumentId, appUrl.getSystemDatabase(), true)
-            .execute()
-            .done((doc: documentClass) => {
-
-            var envColor = doc && doc["EnvironmentColor"];
-            if (envColor != null) {
-                var color = new environmentColor(envColor.Name, envColor.BackgroundColor);
-                shell.selectedEnvironmentColorStatic(color);
-                shell.originalEnvironmentColor(color);
-            }
-        });
-    }*/
-
     private getIndexingDisbaledValue(indexingDisabledString: string) {
         if (indexingDisabledString === undefined || indexingDisabledString == null)
             return false;
@@ -281,31 +325,8 @@ class shell extends viewModelBase {
         return false;
     }
 
-    loadServerConfig(): JQueryPromise<void> {
-        const deferred = $.Deferred<void>().resolve();
-
-        //TODO: it is temporary fix:
-        
-        accessHelper.isGlobalAdmin(true);
-        accessHelper.canReadWriteSettings(true);
-        accessHelper.canReadSettings(true);
-        
-        return deferred;
-    }
-
     connectToRavenServer() {
-        const serverConfigsLoadTask: JQueryPromise<void> = this.loadServerConfig();
-        const managerTask = this.databasesManager.init();
-        return $.when<any>(serverConfigsLoadTask, managerTask);
-    }
-
-    private handleRavenConnectionFailure(result: any) {
-        sys.log("Unable to connect to Raven.", result);
-        const tryAgain = "Try again";
-        this.confirmationMessage(':-(', "Couldn't connect to Raven. Details in the browser console.", [tryAgain])
-            .done(() => {
-                this.connectToRavenServer();
-            });
+        return this.databasesManager.init();
     }
 
     fetchServerBuildVersion() {
@@ -344,21 +365,21 @@ class shell extends viewModelBase {
                 .done(settings => {
                     const shouldTraceUsageMetrics = settings.sendUsageStats.getValue();
                     if (_.isUndefined(shouldTraceUsageMetrics)) {
-                    // ask user about GA
-                    this.displayUsageStatsInfo(true);
-    
-                    this.trackingTask.done((accepted: boolean) => {
-                        this.displayUsageStatsInfo(false);
-    
-                        if (accepted) {
-                            this.configureAnalytics(true, buildVersionResult);
-                        }
-                        
-                        settings.sendUsageStats.setValue(accepted);
-                    });
-                } else {
-                    this.configureAnalytics(shouldTraceUsageMetrics, buildVersionResult);
-                }
+                        // ask user about GA
+                        this.displayUsageStatsInfo(true);
+        
+                        this.trackingTask.done((accepted: boolean) => {
+                            this.displayUsageStatsInfo(false);
+        
+                            if (accepted) {
+                                this.configureAnalytics(true, buildVersionResult);
+                            }
+                            
+                            settings.sendUsageStats.setValue(accepted);
+                        });
+                    } else {
+                        this.configureAnalytics(shouldTraceUsageMetrics, buildVersionResult);
+                    }
             });
         } else {
             // user has uBlock etc?
@@ -386,6 +407,10 @@ class shell extends viewModelBase {
         const version = buildVersionResult.FullVersion;
         eventsCollector.default.initialize(
             buildInfo.serverMainVersion() + "." + buildInfo.serverMinorVersion(), currentBuildVersion, env, version, shouldTrack);
+        
+        studioSettings.default.registerOnSettingChangedHandler(
+            name => name === "sendUsageStats",
+            (name, track: simpleStudioSetting<boolean>) => eventsCollector.default.enabled = track.getValue() && eventsCollector.gaDefined());
     }
 
     static openFeedbackForm() {
@@ -395,6 +420,35 @@ class shell extends viewModelBase {
     
     ignoreWebSocketError() {
         changesContext.default.serverNotifications().ignoreWebSocketConnectionError(true);
+    }
+    
+    detectBrowser() {
+        const isChrome = !!(window as any).chrome && !!(window as any).chrome.webstore;
+        const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
+
+        if (!isChrome && !isFirefox) {
+            // it isn't supported browser, check if user already said: Don't show this again
+
+            studioSettings.default.globalSettings()
+                .done(settings => {
+                    if (settings.dontShowAgain.shouldShow("UnsupportedBrowser")) {
+                        this.browserAlert(true);
+                    }
+                });
+        }
+    }
+
+    browserAlertContinue() {
+        const dontShowAgain = this.dontShowBrowserAlertAgain();
+        
+        if (dontShowAgain) {
+            studioSettings.default.globalSettings()
+                .done(settings => {
+                    settings.dontShowAgain.ignore("UnsupportedBrowser");
+                });
+        }
+        
+        this.browserAlert(false);
     }
 }
 

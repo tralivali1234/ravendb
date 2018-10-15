@@ -20,8 +20,7 @@ class documentHelpers {
                 if (!results.find(x => x === curField.toString())) {
                     results.push(curField.toString());
                 }
-            }
-            else if (typeof curField == "object" && !!curField) {
+            } else if (typeof curField == "object" && !!curField) {
                 for (let curInnerField in curField) {
                     var item = curField[curInnerField];
                     documentNodesFlattenedList.push(item);
@@ -59,8 +58,7 @@ class documentHelpers {
                     lastTextSectionPosEnd = { row: iterator.getCurrentTokenRow(), column: iterator.getCurrentTokenColumn() + 1 };
                     curToken = iterator.stepBackward();
                 }
-            }
-            else {
+            } else {
                 if (lastTextSectionPosEnd != null) {
                     curToken = iterator.stepForward();
                     var lastTextSectionPosStart = { row: iterator.getCurrentTokenRow(), column: iterator.getCurrentTokenColumn() + 1 };
@@ -197,6 +195,7 @@ class documentHelpers {
     }
 
     private static findSchemaDefaultValue(documents: Array<any>, property: string): any {
+        documents = documents.filter(x => x);
         for (let i = 0; i < documents.length; i++) {
             if (!(property in documents[i])) {
                 return undefined;

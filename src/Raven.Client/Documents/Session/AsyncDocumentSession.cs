@@ -13,7 +13,6 @@ using Raven.Client.Documents.Linq;
 using Raven.Client.Documents.Session.Operations;
 using Raven.Client.Documents.Session.Operations.Lazy;
 using Raven.Client.Extensions;
-using Raven.Client.Http;
 
 namespace Raven.Client.Documents.Session
 {
@@ -27,24 +26,25 @@ namespace Raven.Client.Documents.Session
         /// <summary>
         /// Initializes a new instance of the <see cref="AsyncDocumentSession"/> class.
         /// </summary>
-        public AsyncDocumentSession(string dbName, DocumentStore documentStore, RequestExecutor requestExecutor, Guid id)
-            : base(dbName, documentStore, requestExecutor, id)
+        public AsyncDocumentSession(DocumentStore documentStore, Guid id, SessionOptions options)
+            : base(documentStore, id, options)
         {
             GenerateDocumentIdsOnStore = false;
-            Attachments = new DocumentSessionAttachmentsAsync(this);
-            Revisions = new DocumentSessionRevisionsAsync(this);
         }
-
-        public async Task<bool> ExistsAsync(string id)
+    
+        public async Task<bool> ExistsAsync(string id, CancellationToken token = default)
         {
             if (id == null)
                 throw new ArgumentNullException(nameof(id));
+
+            if (_knownMissingIds.Contains(id))
+                return false;
 
             if (DocumentsById.TryGetValue(id, out _))
                 return true;
 
             var command = new HeadDocumentCommand(id, null);
-            await RequestExecutor.ExecuteAsync(command, Context, sessionInfo: SessionInfo).ConfigureAwait(false);
+            await RequestExecutor.ExecuteAsync(command, Context, sessionInfo: SessionInfo, token: token).ConfigureAwait(false);
 
             return command.Result != null;
         }
@@ -98,9 +98,19 @@ namespace Raven.Client.Documents.Session
 
         public IAsyncLazySessionOperations Lazily => this;
 
-        public IAttachmentsSessionOperationsAsync Attachments { get; }
+        public IAttachmentsSessionOperationsAsync Attachments => _attachments ?? (_attachments = new DocumentSessionAttachmentsAsync(this));
+        private IAttachmentsSessionOperationsAsync _attachments;
 
-        public IRevisionsSessionOperationsAsync Revisions { get; }
+        public IRevisionsSessionOperationsAsync Revisions => _revisions ?? (_revisions = new DocumentSessionRevisionsAsync(this));
+        private IRevisionsSessionOperationsAsync _revisions;
+
+        public IClusterTransactionOperationsAsync ClusterTransaction => _clusterTransaction ?? (_clusterTransaction = new ClusterTransactionOperationsAsync(this));
+        private IClusterTransactionOperationsAsync _clusterTransaction;
+
+        protected override ClusterTransactionOperationsBase GetClusterSession()
+        {
+            return (ClusterTransactionOperationsBase)_clusterTransaction;
+        }
 
         /// <summary>
         /// Begins the async save changes operation
@@ -120,7 +130,11 @@ namespace Raven.Client.Documents.Session
                 if (command == null)
                     return;
 
+                if (NoTracking)
+                    throw new InvalidOperationException($"Cannot execute '{nameof(SaveChangesAsync)}' when entity tracking is disabled in session.");
+
                 await RequestExecutor.ExecuteAsync(command, Context, SessionInfo, token).ConfigureAwait(false);
+                UpdateSessionAfterSaveChanges(command.Result);
                 saveChangesOperation.SetResult(command.Result);
             }
         }

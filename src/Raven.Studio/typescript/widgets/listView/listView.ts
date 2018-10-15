@@ -108,7 +108,9 @@ class listView<T> {
     
     private scrollDown() {
         const viewPort = this.$viewportElement[0];
-        viewPort.scrollTop = viewPort.scrollHeight;
+        if (viewPort) {
+            viewPort.scrollTop = viewPort.scrollHeight;    
+        }
     }
     
     private getItemHeight(idx: number) {
@@ -349,7 +351,7 @@ class listView<T> {
         <div class="viewport-scroller" data-bind="style: { height: virtualHeight() + 'px'}, template: { afterRender: afterRender.bind($data) }">
         </div>
     </div>
-    <div class="absolute-center" data-bind="visible: emptyTemplate && emptyResult(), if: emptyTemplate">
+    <div class="absolute-center" data-bind="visible: !isLoading() && emptyTemplate && emptyResult(), if: emptyTemplate">
         <div data-bind="template: emptyTemplate"></div>
     </div>
 </div>

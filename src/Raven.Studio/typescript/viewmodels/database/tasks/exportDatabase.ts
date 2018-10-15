@@ -15,7 +15,6 @@ import getNextOperationId = require("commands/database/studio/getNextOperationId
 import eventsCollector = require("common/eventsCollector");
 import popoverUtils = require("common/popoverUtils");
 import collectionsTracker = require("common/helpers/database/collectionsTracker");
-import generalUtils = require("common/generalUtils");
 import defaultAceCompleter = require("common/defaultAceCompleter");
 
 class exportDatabase extends viewModelBase {
@@ -142,7 +141,8 @@ class exportDatabase extends viewModelBase {
 
     attached() {
         super.attached();
-         popoverUtils.longWithHover($(".scriptPopover"),
+        
+        popoverUtils.longWithHover($("#scriptPopover"),
             {
                 content:
                 "<div class=\"text-center\">Transform scripts are written in JavaScript </div>" +
@@ -151,6 +151,13 @@ class exportDatabase extends viewModelBase {
                 "<span class=\"token keyword\">throw </span><span class=\"token string\">'skip'</span>; <span class=\"token comment\">// filter-out</span><br /><br />" +
                 "<span class=\"token keyword\">this</span>.Freight = <span class=\"token number\">15.3</span>;<br />" +
                 "</pre>" 
+            });
+        
+        popoverUtils.longWithHover($("#configurationPopover"),
+            {
+                content:
+                    "<div>The following configuration settings will be exported:</div>" +
+                    "<strong>Revisions, Expiration & Client Configuration</strong>"
             });
     }
 

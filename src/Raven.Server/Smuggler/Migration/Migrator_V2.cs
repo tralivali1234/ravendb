@@ -56,10 +56,15 @@ namespace Raven.Server.Smuggler.Migration
 
         private async Task MigrateDocuments(string lastEtag)
         {
-            var url = $"{ServerUrl}/databases/{DatabaseName}/streams/docs?etag={lastEtag}";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
+            var response = await RunWithAuthRetry(async () =>
+            {
+                var url = $"{ServerUrl}/databases/{DatabaseName}/streams/docs?etag={lastEtag}";
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
 
-            var response = await HttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, CancelToken.Token);
+                var responseMessage = await HttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, CancelToken.Token);
+                return responseMessage;
+            });
+            
             if (response.IsSuccessStatusCode == false)
             {
                 var responseString = await response.Content.ReadAsStringAsync();
@@ -98,8 +103,8 @@ namespace Raven.Server.Smuggler.Migration
 
                 while (true)
                 {
-                    var attatchmentsArray = await GetAttachmentsList(lastEtag, transactionOperationContext);
-                    if (attatchmentsArray.Length == 0)
+                    var attachmentsArray = await GetAttachmentsList(lastEtag, transactionOperationContext);
+                    if (attachmentsArray.Length == 0)
                     {
                         var count = Result.Documents.Attachments.ReadCount;
                         if (count > 0)
@@ -112,11 +117,11 @@ namespace Raven.Server.Smuggler.Migration
                         return;
                     }
 
-                    foreach (var attachmentObject in attatchmentsArray)
+                    foreach (var attachmentObject in attachmentsArray)
                     {
                         var blittable = attachmentObject as BlittableJsonReaderObject;
                         if (blittable == null)
-                            throw new InvalidDataException("attchmentObject isn't a BlittableJsonReaderObject");
+                            throw new InvalidDataException("attachmentObject isn't a BlittableJsonReaderObject");
 
                         if (blittable.TryGet("Key", out string key) == false)
                             throw new InvalidDataException("Key doesn't exist");
@@ -145,7 +150,7 @@ namespace Raven.Server.Smuggler.Migration
                         }
                     }
 
-                    var lastAttachment = attatchmentsArray.Last() as BlittableJsonReaderObject;
+                    var lastAttachment = attachmentsArray.Last() as BlittableJsonReaderObject;
                     Debug.Assert(lastAttachment != null, "lastAttachment != null");
                     if (lastAttachment.TryGet("Etag", out string etag))
                         lastEtag = Result.LegacyLastAttachmentEtag = etag;
@@ -155,9 +160,14 @@ namespace Raven.Server.Smuggler.Migration
 
         private async Task<BlittableJsonReaderArray> GetAttachmentsList(string lastEtag, TransactionOperationContext context)
         {
-            var url = $"{ServerUrl}/databases/{DatabaseName}/static?pageSize={AttachmentsPageSize}&etag={lastEtag}";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            var response = await HttpClient.SendAsync(request, CancelToken.Token);
+            var response = await RunWithAuthRetry(async () =>
+            {
+                var url = $"{ServerUrl}/databases/{DatabaseName}/static?pageSize={AttachmentsPageSize}&etag={lastEtag}";
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                var responseMessage = await HttpClient.SendAsync(request, CancelToken.Token);
+                return responseMessage;
+            });
+            
             if (response.IsSuccessStatusCode == false)
             {
                 var responseString = await response.Content.ReadAsStringAsync();
@@ -179,9 +189,14 @@ namespace Raven.Server.Smuggler.Migration
 
         private async Task<Stream> GetAttachmentStream(string attachmentKey)
         {
-            var url = $"{ServerUrl}/databases/{DatabaseName}/static/{Uri.EscapeDataString(attachmentKey)}";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-            var response = await HttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, CancelToken.Token);
+            var response = await RunWithAuthRetry(async () =>
+            {
+                var url = $"{ServerUrl}/databases/{DatabaseName}/static/{Uri.EscapeDataString(attachmentKey)}";
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                var responseMessage = await HttpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, CancelToken.Token);
+                return responseMessage;
+            });
+
             if (response.StatusCode == HttpStatusCode.NotFound)
             {
                 // the attachment was deleted
@@ -201,10 +216,14 @@ namespace Raven.Server.Smuggler.Migration
 
         private async Task MigrateIndexes()
         {
-            var url = $"{ServerUrl}/databases/{DatabaseName}/indexes";
-            var request = new HttpRequestMessage(HttpMethod.Get, url);
-
-            var response = await HttpClient.SendAsync(request, CancelToken.Token);
+            var response = await RunWithAuthRetry(async () =>
+            {
+                var url = $"{ServerUrl}/databases/{DatabaseName}/indexes";
+                var request = new HttpRequestMessage(HttpMethod.Get, url);
+                var responseMessage = await HttpClient.SendAsync(request, CancelToken.Token);
+                return responseMessage;
+            });
+            
             if (response.IsSuccessStatusCode == false)
             {
                 var responseString = await response.Content.ReadAsStringAsync();

@@ -4,6 +4,7 @@ using System.Linq;
 using System.Net;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
+using Raven.Client.Documents.Operations.Configuration;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Commands;
@@ -26,7 +27,7 @@ namespace Raven.Server.Web.System
 {
     public sealed class DatabasesHandler : RequestHandler
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<DatabasesHandler>("DatabasesHandler");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<DatabasesHandler>("Server");
 
         [RavenAction("/databases", "GET", AuthorizationStatus.ValidUser)]
         public Task Databases()
@@ -137,14 +138,13 @@ namespace Raven.Server.Web.System
                                 })
                                 )
                             ),
-                            [nameof(Topology.Etag)] = dbRecord.Topology.Stamp.Index
+                            [nameof(Topology.Etag)] = dbRecord.Topology.Stamp?.Index ?? -1
                         });
                     }
                 }
             }
             return Task.CompletedTask;
         }
-
 
         // we can't use '/database/is-loaded` because that conflict with the `/databases/<db-name>`
         // route prefix
@@ -180,18 +180,25 @@ namespace Raven.Server.Web.System
             var serverUrl = GetQueryStringValueAndAssertIfSingleAndNotEmpty("serverUrl");
             var userName = GetStringQueryString("userName", required: false);
             var password = GetStringQueryString("password", required: false);
+            var domain = GetStringQueryString("domain", required: false);
+            var apiKey = GetStringQueryString("apiKey", required: false);
+            var enableBasicAuthenticationOverUnsecuredHttp = GetBoolValueQueryString("enableBasicAuthenticationOverUnsecuredHttp", required: false);
             var migrator = new Migrator(new SingleDatabaseMigrationConfiguration
             {
                 ServerUrl = serverUrl,
                 UserName = userName,
-                Password = password
+                Password = password,
+                Domain = domain,
+                ApiKey = apiKey,
+                EnableBasicAuthenticationOverUnsecuredHttp = enableBasicAuthenticationOverUnsecuredHttp ?? false
             }, ServerStore);
-
+            
             var buildInfo = await migrator.GetBuildInfo();
             var authorized = new Reference<bool>();
-            var databaseNames = await migrator.GetDatabaseNames(buildInfo.MajorVersion, authorized);
+            var isLegacyOAuthToken = new Reference<bool>();
+            var databaseNames = await migrator.GetDatabaseNames(buildInfo.MajorVersion, authorized, isLegacyOAuthToken);
             var fileSystemNames = await migrator.GetFileSystemNames(buildInfo.MajorVersion);
-            migrator.DisposeHttpClient(); // the http client isn't needed anymore
+        
             using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
             {
@@ -203,7 +210,8 @@ namespace Raven.Server.Web.System
                     [nameof(BuildInfoWithResourceNames.FullVersion)] = buildInfo.FullVersion,
                     [nameof(BuildInfoWithResourceNames.DatabaseNames)] = TypeConverter.ToBlittableSupportedType(databaseNames),
                     [nameof(BuildInfoWithResourceNames.FileSystemNames)] = TypeConverter.ToBlittableSupportedType(fileSystemNames),
-                    [nameof(BuildInfoWithResourceNames.Authorized)] = authorized.Value
+                    [nameof(BuildInfoWithResourceNames.Authorized)] = authorized.Value,
+                    [nameof(BuildInfoWithResourceNames.IsLegacyOAuthToken)] = isLegacyOAuthToken.Value
                 };
 
                 context.Write(writer, json);
@@ -278,6 +286,12 @@ namespace Raven.Server.Web.System
                 var clusterTopology = ServerStore.GetClusterTopology(context);
                 clusterTopology.ReplaceCurrentNodeUrlWithClientRequestedNodeUrlIfNecessary(ServerStore, HttpContext);
 
+                var studioEnvironment = StudioConfiguration.StudioEnvironment.None;
+                if (dbRecord.Studio != null && !dbRecord.Studio.Disabled)
+                {
+                    studioEnvironment = dbRecord.Studio.Environment;
+                }
+                
                 var nodesTopology = new NodesTopology();
 
                 var statuses = ServerStore.GetNodesStatuses();
@@ -324,7 +338,8 @@ namespace Raven.Server.Web.System
                             [nameof(DatabaseInfo.Disabled)] = disabled,
                             [nameof(DatabaseInfo.IndexingStatus)] = indexingStatus.ToString(),
                             [nameof(DatabaseInfo.NodesTopology)] = nodesTopology.ToJson(),
-                            [nameof(DatabaseInfo.DeletionInProgress)] = DynamicJsonValue.Convert(dbRecord.DeletionInProgress)
+                            [nameof(DatabaseInfo.DeletionInProgress)] = DynamicJsonValue.Convert(dbRecord.DeletionInProgress), 
+                            [nameof(DatabaseInfo.Environment)] = studioEnvironment
                         };
 
                         context.Write(writer, databaseInfoJson);
@@ -337,13 +352,14 @@ namespace Raven.Server.Web.System
                     // so just report empty values then
                 }
 
-                var size = new Size(db?.GetSizeOnDiskInBytes() ?? 0);
+                var size = db?.GetSizeOnDisk() ?? (new Size(0), new Size(0));
 
                 var databaseInfo = new DatabaseInfo
                 {
                     Name = databaseName,
                     Disabled = disabled,
-                    TotalSize = size,
+                    TotalSize = size.Data,
+                    TempBuffersSize = size.TempBuffers,
 
                     IsAdmin = true, 
                     IsEncrypted = dbRecord.Encrypted,
@@ -360,6 +376,7 @@ namespace Raven.Server.Web.System
                     HasExpirationConfiguration = db?.ExpiredDocumentsCleaner != null,
                     IndexesCount = db?.IndexStore?.GetIndexes()?.Count() ?? 0,
                     IndexingStatus = indexingStatus,
+                    Environment = studioEnvironment,
 
                     NodesTopology = nodesTopology,
                     ReplicationFactor = topology?.ReplicationFactor ?? -1,

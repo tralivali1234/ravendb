@@ -13,14 +13,18 @@ class statistics {
     countOfUniqueAttachments: string;
     countOfDocumentsConflicts: string;
     countOfTombstones: string;
+    countOfIdentities: string;
+    countOfCompareExchange: string;
     is64Bit: boolean;
     indexPerformanceURL: string;
-    sizeOnDisk: string;
-
+    dataSizeOnDisk: string;
+    tempBuffersSizeOnDisk: string;
+    totalSizeOnDisk: string;
+    
     // The observable indexes array, ordered by type
     indexesByType = ko.observableArray<indexesWithType>(); 
     
-    constructor(dbStats: Raven.Client.Documents.Operations.DatabaseStatistics, indexStats: Raven.Client.Documents.Indexes.IndexStats[]) {
+    constructor(dbStats: Raven.Client.Documents.Operations.DetailedDatabaseStatistics, indexStats: Raven.Client.Documents.Indexes.IndexStats[]) {
         this.databaseId = dbStats.DatabaseId;
 
         this.databaseChangeVector = changeVectorUtils.formatChangeVector(dbStats.DatabaseChangeVector, changeVectorUtils.shouldUseLongFormat([dbStats.DatabaseChangeVector]));
@@ -31,9 +35,12 @@ class statistics {
         this.countOfUniqueAttachments = dbStats.CountOfUniqueAttachments.toLocaleString();
         this.countOfDocumentsConflicts = dbStats.CountOfDocumentsConflicts.toLocaleString();
         this.countOfTombstones = dbStats.CountOfTombstones.toLocaleString();
+        this.countOfIdentities = dbStats.CountOfIdentities.toLocaleString();
+        this.countOfCompareExchange = dbStats.CountOfCompareExchange.toLocaleString();
         this.is64Bit = dbStats.Is64Bit;
-        this.sizeOnDisk = generalUtils.formatBytesToSize(dbStats.SizeOnDisk.SizeInBytes);
-        
+        this.dataSizeOnDisk = generalUtils.formatBytesToSize(dbStats.SizeOnDisk.SizeInBytes);
+        this.tempBuffersSizeOnDisk = generalUtils.formatBytesToSize(dbStats.TempBuffersSizeOnDisk.SizeInBytes);
+        this.totalSizeOnDisk = generalUtils.formatBytesToSize(dbStats.SizeOnDisk.SizeInBytes + dbStats.TempBuffersSizeOnDisk.SizeInBytes);
         
         // 1. Create the array with all indexes that we got from the endpoint
         const allIndexes = indexStats.map(x => new indexStatistics(x));
@@ -47,8 +54,7 @@ class statistics {
                 const newType = new indexesWithType(index.indexType);
                 newType.add(index);
                 indexesByTypeTemp.push(newType);
-            }
-            else {
+            } else {
                 // Type already exists, only add the index
                 existingEntry.add(index);
             }

@@ -33,7 +33,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
             : base(IndexType.AutoMapReduce, definition)
         {
             _isFanout = definition.GroupByFields.Any(x => x.Value.GroupByArrayBehavior == GroupByArrayBehavior.ByIndividualValues);
-           _output = new MapOutput(_isFanout);
+            _output = new MapOutput(_isFanout);
         }
 
         public static AutoMapReduceIndex CreateNew(AutoMapReduceIndexDefinition definition, DocumentDatabase documentDatabase)
@@ -71,7 +71,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
             };
         }
 
-        public override IIndexedDocumentsEnumerator GetMapEnumerator(IEnumerable<Document> documents, string collection, TransactionOperationContext indexContext, IndexingStatsScope stats)
+        public override IIndexedDocumentsEnumerator GetMapEnumerator(IEnumerable<Document> documents, string collection, TransactionOperationContext indexContext, IndexingStatsScope stats, IndexType type)
         {
             return new AutoIndexDocsEnumerator(documents, stats);
         }
@@ -81,10 +81,22 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
             SetPriority(definition.Priority);
         }
 
-        public override int HandleMap(LazyStringValue lowerId, IEnumerable mapResults, IndexWriteOperation writer, TransactionOperationContext indexContext, IndexingStatsScope stats)
+        public override void SetState(IndexState state)
+        {
+            base.SetState(state);
+            Definition.State = state;
+        }
+
+        protected override void LoadValues()
+        {
+            base.LoadValues();
+            Definition.State = State;
+        }
+
+        public override int HandleMap(LazyStringValue lowerId, LazyStringValue id, IEnumerable mapResults, IndexWriteOperation writer, TransactionOperationContext indexContext, IndexingStatsScope stats)
         {
             EnsureValidStats(stats);
-            
+
             var document = ((Document[])mapResults)[0];
             Debug.Assert(lowerId == document.LowerId);
 
@@ -126,8 +138,10 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
                 }
 
                 if (_isFanout == false)
+                {
                     _output.Results.Add((singleResult, _reduceKeyProcessor.Hash));
-                else
+                }
+                else if (_output.GroupByFields.Count >= Definition.GroupByFields.Count)
                 {
                     for (var i = 0; i < _output.MaxGroupByFieldsCount; i++)
                     {
@@ -148,6 +162,9 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
                         _reduceKeyProcessor.Reset();
                     }
                 }
+                // else { } - we have fanout index with multiple group by fields and one is collection
+                // if we have empty collection we cannot create composite key then
+                // let's skip putting such map results
 
                 foreach (var field in Definition.MapFields)
                 {
@@ -194,7 +211,7 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
                     }
                 }
 
-                var resultsCount = PutMapResults(lowerId, _results, indexContext, stats);
+                var resultsCount = PutMapResults(lowerId, id, _results, indexContext, stats);
 
                 DocumentDatabase.Metrics.MapReduceIndexes.MappedPerSec.Mark(resultsCount);
 
@@ -320,11 +337,6 @@ namespace Raven.Server.Documents.Indexes.MapReduce.Auto
                 GroupByFields?.Clear();
                 MaxGroupByFieldsCount = 0;
             }
-        }
-
-        private static void ThrowUndefinedGroupByArrayBehavior(string fieldName)
-        {
-            throw new InvalidOperationException($"There is no behavior defined for grouping by array. Field name: {fieldName}");
         }
     }
 }

@@ -61,8 +61,7 @@ class editExternalReplicationTask extends viewModelBase {
                     
                     router.navigate(appUrl.forOngoingTasks(this.activeDatabase()));
                 });
-        }
-        else {
+        } else {
             // 2. Creating a new task
             this.isAddingNewReplicationTask(true);
             this.editedExternalReplication(ongoingTaskReplicationEditModel.empty());
@@ -112,6 +111,9 @@ class editExternalReplicationTask extends viewModelBase {
 
         this.newConnectionString(connectionStringRavenEtlModel.empty());
 
+        // Open the 'Create new conn. str.' area if no connection strings are yet defined 
+        this.ravenEtlConnectionStringsDetails.subscribe((value) => { this.createNewConnectionString(!value.length) }); 
+        
         // Discard test connection result when needed
         this.createNewConnectionString.subscribe(() => this.testConnectionResult(null));
         this.newConnectionString().inputUrl().discoveryUrlName.subscribe(() => this.testConnectionResult(null));
@@ -180,6 +182,8 @@ class editExternalReplicationTask extends viewModelBase {
 
             const dto = this.editedExternalReplication().toDto(this.taskId);
             this.taskId = this.isAddingNewReplicationTask() ? 0 : this.taskId;
+
+            eventsCollector.default.reportEvent("external-replication", "save");
                         
             new saveExternalReplicationTaskCommand(this.activeDatabase(), dto)
                 .execute()

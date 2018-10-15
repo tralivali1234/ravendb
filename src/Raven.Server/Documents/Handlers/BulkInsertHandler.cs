@@ -1,6 +1,8 @@
 ﻿using System;
 using System.Diagnostics;
+using System.IO;
 using System.Linq;
+using Sparrow;
 using System.Net;
 using System.Threading;
 using System.Threading.Tasks;
@@ -8,7 +10,9 @@ using Raven.Client.Documents.Commands.Batches;
 using Raven.Client.Documents.Operations;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.Smuggler.Documents;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 
 namespace Raven.Server.Documents.Handlers
@@ -24,7 +28,7 @@ namespace Raven.Server.Documents.Handlers
             await Database.Operations.AddOperation(Database, "Bulk Insert", Operations.Operations.OperationType.BulkInsert,
                 progress => DoBulkInsert(progress, operationCancelToken.Token),
                 id,
-                operationCancelToken
+                token: operationCancelToken
             );
         }
 
@@ -161,20 +165,44 @@ namespace Raven.Server.Documents.Handlers
         }
 
 
-        private class MergedInsertBulkCommand : TransactionOperationsMerger.MergedTransactionCommand
+        public class MergedInsertBulkCommand : TransactionOperationsMerger.MergedTransactionCommand
         {
             public Logger Logger;
             public DocumentDatabase Database;
             public BatchRequestParser.CommandData[] Commands;
             public int NumberOfCommands;
             public long TotalSize;
-            public override int Execute(DocumentsOperationContext context)
+            protected override int ExecuteCmd(DocumentsOperationContext context)
             {
                 for (int i = 0; i < NumberOfCommands; i++)
                 {
                     var cmd = Commands[i];
                     Debug.Assert(cmd.Type == CommandType.PUT);
-                    Database.DocumentsStorage.Put(context, cmd.Id, null, cmd.Document);
+                    try
+                    {
+                        Database.DocumentsStorage.Put(context, cmd.Id, null, cmd.Document);
+                    }
+                    catch (Voron.Exceptions.VoronConcurrencyErrorException)
+                    {
+                        // RavenDB-10581 - If we have a concurrency error on "doc-id/" 
+                        // this means that we have existing values under the current etag
+                        // we'll generate a new (random) id for them. 
+
+                        // The TransactionMerger will re-run us when we ask it to as a 
+                        // separate transaction
+
+                        for (; i < NumberOfCommands; i++)
+                        {
+                            cmd = Commands[i];
+                            if (cmd.Id?.EndsWith('/') == true)
+                            {
+                                cmd.Id = MergedPutCommand.GenerateNonConflictingId(Database, cmd.Id);
+                                RetryOnError = true;
+                            }
+                        }
+
+                        throw;
+                    }
                 }
                 if (Logger.IsInfoEnabled)
                 {
@@ -182,6 +210,31 @@ namespace Raven.Server.Documents.Handlers
                 }
                 return NumberOfCommands;
             }
+
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            {
+                return new MergedInsertBulkCommandDto
+                {
+                    Commands = Commands.Take(NumberOfCommands).ToArray()
+                };
+            }
+        }
+    }
+
+    public class MergedInsertBulkCommandDto : TransactionOperationsMerger.IReplayableCommandDto<BulkInsertHandler.MergedInsertBulkCommand>
+    {
+        public BatchRequestParser.CommandData[] Commands { get; set; }
+
+        public BulkInsertHandler.MergedInsertBulkCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+        {
+            return new BulkInsertHandler.MergedInsertBulkCommand
+            {
+                NumberOfCommands = Commands.Length,
+                TotalSize = Commands.Sum(c => c.Document.Size),
+                Commands = Commands,
+                Database = database,
+                Logger = LoggingSource.Instance.GetLogger<DatabaseDestination>(database.Name)
+            };
         }
     }
 }

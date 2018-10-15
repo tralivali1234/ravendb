@@ -9,8 +9,11 @@ using System.Collections;
 using System.Collections.Generic;
 using System.Linq;
 using System.Linq.Expressions;
+using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Queries;
+using Raven.Client.Documents.Queries.Highlighting;
 using Raven.Client.Documents.Session;
+using Raven.Client.Extensions;
 
 namespace Raven.Client.Documents.Linq
 {
@@ -22,13 +25,12 @@ namespace Raven.Client.Documents.Linq
         private Expression _expression;
         private IRavenQueryProvider _provider;
         private QueryStatistics _queryStats;
-#if FEATURE_HIGHLIGHTING
-        private QueryHighlightings _highlightings;
-#endif
+        private LinqQueryHighlightings _highlightings;
         private string _indexName;
         private string _collectionName;
         private InMemoryDocumentSessionOperations _session;
         private bool _isMapReduce;
+        private DocumentConventions _conventions;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="RavenQueryInspector{T}"/> class.
@@ -36,20 +38,17 @@ namespace Raven.Client.Documents.Linq
         public void Init(
             IRavenQueryProvider provider,
             QueryStatistics queryStats,
-#if FEATURE_HIGHLIGHTING
-            QueryHighlightings highlightings,
-#endif
+            LinqQueryHighlightings highlightings,
             string indexName,
             string collectionName,
             Expression expression,
             InMemoryDocumentSessionOperations session,
             bool isMapReduce)
         {
+            _conventions = session.Conventions;
             _provider = provider?.For<T>() ?? throw new ArgumentNullException(nameof(provider));
             _queryStats = queryStats;
-#if FEATURE_HIGHLIGHTING
             _highlightings = highlightings;
-#endif
             _indexName = indexName;
             _collectionName = collectionName;
             _session = session;
@@ -61,9 +60,7 @@ namespace Raven.Client.Documents.Linq
         private void AfterQueryExecuted(QueryResult queryResult)
         {
             _queryStats.UpdateQueryStats(queryResult);
-#if FEATURE_HIGHLIGHTING
             _highlightings.Update(queryResult);
-#endif
         }
 
         #region IOrderedQueryable<T> Members
@@ -111,6 +108,29 @@ namespace Raven.Client.Documents.Linq
             return this;
         }
 
+        public IRavenQueryable<T> Highlight(string fieldName, int fragmentLength, int fragmentCount, out Highlightings highlightings)
+        {
+            return Highlight(fieldName, fragmentLength, fragmentCount, null, out highlightings);
+        }
+
+        public IRavenQueryable<T> Highlight(string fieldName, int fragmentLength, int fragmentCount, HighlightingOptions options,
+            out Highlightings highlightings)
+        {
+            highlightings = _highlightings.Add(fieldName, fragmentLength, fragmentCount, options);
+            return this;
+        }
+
+        public IRavenQueryable<T> Highlight(Expression<Func<T, object>> path, int fragmentLength, int fragmentCount, out Highlightings highlightings)
+        {
+            return Highlight(path.ToPropertyPath(), fragmentLength, fragmentCount, out highlightings);
+        }
+
+        public IRavenQueryable<T> Highlight(Expression<Func<T, object>> path, int fragmentLength, int fragmentCount, HighlightingOptions options,
+            out Highlightings highlightings)
+        {
+            return Highlight(path.ToPropertyPath(), fragmentLength, fragmentCount, options, out highlightings);
+        }
+
         /// <summary>
         /// Returns a <see cref="System.String"/> that represents this instance.
         /// </summary>
@@ -153,11 +173,13 @@ namespace Raven.Client.Documents.Linq
                 _provider.QueryGenerator,
                 _provider.CustomizeQuery,
                 null,
+                _highlightings,
                 _indexName,
                 _collectionName,
                 new HashSet<FieldToFetch>(_provider.FieldsToFetch),
                 _isMapReduce,
-                _provider.OriginalQueryType);
+                _provider.OriginalQueryType,
+                _conventions);
         }
 
         public string IndexName => _indexName;

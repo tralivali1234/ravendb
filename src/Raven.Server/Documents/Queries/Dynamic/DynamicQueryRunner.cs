@@ -8,6 +8,7 @@ using Raven.Client.Documents.Queries;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Auto;
+using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Sparrow;
@@ -29,18 +30,20 @@ namespace Raven.Server.Documents.Queries.Dynamic
         public override async Task ExecuteStreamQuery(IndexQueryServerSide query, DocumentsOperationContext documentsContext, HttpResponse response, IStreamDocumentQueryResultWriter writer,
             OperationCancelToken token)
         {
-            var index = await MatchIndex(query, true, TimeSpan.FromSeconds(60), token.Token);
+            var index = await MatchIndex(query, true, customStalenessWaitTimeout: TimeSpan.FromSeconds(60), documentsContext, token.Token);
 
             await index.StreamQuery(response, writer, query, documentsContext, token);
         }
 
         public override async Task<DocumentQueryResult> ExecuteQuery(IndexQueryServerSide query, DocumentsOperationContext documentsContext, long? existingResultEtag, OperationCancelToken token)
         {
-            var index = await MatchIndex(query, true, null, token.Token);
+            Index index;
+            using (query.Timings?.For(nameof(QueryTimingsScope.Names.Optimizer)))
+                index = await MatchIndex(query, true, null, documentsContext, token.Token);
 
-            if (existingResultEtag.HasValue)
+            if (query.Metadata.HasOrderByRandom == false && existingResultEtag.HasValue)
             {
-                var etag = index.GetIndexEtag();
+                var etag = index.GetIndexEtag(query.Metadata);
                 if (etag == existingResultEtag)
                     return DocumentQueryResult.NotModifiedResult;
             }
@@ -50,14 +53,14 @@ namespace Raven.Server.Documents.Queries.Dynamic
 
         public override async Task<IndexEntriesQueryResult> ExecuteIndexEntriesQuery(IndexQueryServerSide query, DocumentsOperationContext context, long? existingResultEtag, OperationCancelToken token)
         {
-            var index = await MatchIndex(query, false, null, token.Token);
+            var index = await MatchIndex(query, false, null, context, token.Token);
 
             if (index == null)
                 IndexDoesNotExistException.ThrowFor(query.Metadata.CollectionName);
 
             if (existingResultEtag.HasValue)
             {
-                var etag = index.GetIndexEtag();
+                var etag = index.GetIndexEtag(query.Metadata);
                 if (etag == existingResultEtag)
                     return IndexEntriesQueryResult.NotModifiedResult;
             }
@@ -67,19 +70,20 @@ namespace Raven.Server.Documents.Queries.Dynamic
 
         public override async Task<IOperationResult> ExecuteDeleteQuery(IndexQueryServerSide query, QueryOperationOptions options, DocumentsOperationContext context, Action<IOperationProgress> onProgress, OperationCancelToken token)
         {
-            var index = await MatchIndex(query, true, null, token.Token);
+            var index = await MatchIndex(query, true, null, context, token.Token);
 
             return await ExecuteDelete(query, index, options, context, onProgress, token);
         }
 
         public override async Task<IOperationResult> ExecutePatchQuery(IndexQueryServerSide query, QueryOperationOptions options, PatchRequest patch, BlittableJsonReaderObject patchArgs, DocumentsOperationContext context, Action<IOperationProgress> onProgress, OperationCancelToken token)
         {
-            var index = await MatchIndex(query, true, null, token.Token);
+            var index = await MatchIndex(query, true, null, context, token.Token);
 
             return await ExecutePatch(query, index, options, patch, patchArgs, context, onProgress, token);
         }
 
-        private async Task<Index> MatchIndex(IndexQueryServerSide query, bool createAutoIndexIfNoMatchIsFound, TimeSpan? customStalenessWaitTimeout, CancellationToken token)
+        private async Task<Index> MatchIndex(IndexQueryServerSide query, bool createAutoIndexIfNoMatchIsFound, TimeSpan? customStalenessWaitTimeout, DocumentsOperationContext docsContext,
+            CancellationToken token)
         {
             Index index;
             if (query.Metadata.AutoIndexName != null)
@@ -92,7 +96,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
 
             var map = DynamicQueryMapping.Create(query);
 
-            if (TryMatchExistingIndexToQuery(map, out index) == false)
+            if (TryMatchExistingIndexToQuery(map, docsContext, out index) == false)
             {
                 if (createAutoIndexIfNoMatchIsFound == false)
                     throw new IndexDoesNotExistException("Could not find index for a given query.");
@@ -109,7 +113,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
                         query.WaitForNonStaleResultsTimeout = TimeSpan.FromSeconds(15); // allow new auto indexes to have some results
                 }
 
-                var t = CleanupSupercededAutoIndexes(index, map, token)
+                var t = CleanupSupersededAutoIndexes(index, map, token)
                     .ContinueWith(task =>
                     {
                         if (task.Exception != null)
@@ -119,7 +123,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
 
                             if (_indexStore.Logger.IsInfoEnabled)
                             {
-                                _indexStore.Logger.Info("Failed to delete superceded indexes for index " + index.Name);
+                                _indexStore.Logger.Info("Failed to delete superseded indexes for index " + index.Name);
                             }
                         }
                     });
@@ -133,12 +137,12 @@ namespace Raven.Server.Documents.Queries.Dynamic
             return index;
         }
 
-        private async Task CleanupSupercededAutoIndexes(Index index, DynamicQueryMapping map, CancellationToken token)
+        private async Task CleanupSupersededAutoIndexes(Index index, DynamicQueryMapping map, CancellationToken token)
         {
             if (map.SupersededIndexes == null || map.SupersededIndexes.Count == 0)
                 return;
 
-            // this is meant to remove superceded indexes immediately when they are of no use
+            // this is meant to remove superseded indexes immediately when they are of no use
             // however, they'll also be cleaned by the idle timer, so we don't worry too much
             // about this being in memory only operation
 
@@ -154,17 +158,17 @@ namespace Raven.Server.Documents.Queries.Dynamic
                     break;
                 }
 
-                var maxSupercededEtag = 0L;
-                foreach (var supercededIndex in map.SupersededIndexes)
+                var maxSupersededEtag = 0L;
+                foreach (var supersededIndex in map.SupersededIndexes)
                 {
                     try
                     {
-                        var etag = supercededIndex.GetLastMappedEtagFor(map.ForCollection);
-                        maxSupercededEtag = Math.Max(etag, maxSupercededEtag);
+                        var etag = supersededIndex.GetLastMappedEtagFor(map.ForCollection);
+                        maxSupersededEtag = Math.Max(etag, maxSupersededEtag);
                     }
                     catch (OperationCanceledException)
                     {
-                        // the superceded index was already deleted
+                        // the superseded index was already deleted
                     }
                 }
 
@@ -178,7 +182,7 @@ namespace Raven.Server.Documents.Queries.Dynamic
                     // the index was already disposed by something else
                     break;
                 }
-                if (currentEtag >= maxSupercededEtag)
+                if (currentEtag >= maxSupersededEtag)
                 {
                     // we'll give it a few seconds to drain any pending queries,
                     // and because it make it easier to demonstrate how we auto
@@ -191,11 +195,11 @@ namespace Raven.Server.Documents.Queries.Dynamic
                         ).ConfigureAwait(false);
                     }
 
-                    foreach (var supercededIndex in map.SupersededIndexes)
+                    foreach (var supersededIndex in map.SupersededIndexes)
                     {
                         try
                         {
-                            await _indexStore.DeleteIndex(supercededIndex.Name);
+                            await _indexStore.DeleteIndex(supersededIndex.Name);
                         }
                         catch (IndexDoesNotExistException)
                         {
@@ -209,26 +213,28 @@ namespace Raven.Server.Documents.Queries.Dynamic
             }
         }
 
-        public List<DynamicQueryToIndexMatcher.Explanation> ExplainIndexSelection(IndexQueryServerSide query)
+        public List<DynamicQueryToIndexMatcher.Explanation> ExplainIndexSelection(IndexQueryServerSide query, DocumentsOperationContext docsContext, out string indexName)
         {
             var map = DynamicQueryMapping.Create(query);
             var explanations = new List<DynamicQueryToIndexMatcher.Explanation>();
 
             var dynamicQueryToIndex = new DynamicQueryToIndexMatcher(_indexStore);
-            dynamicQueryToIndex.Match(map, explanations);
+            var match = dynamicQueryToIndex.Match(map, docsContext, explanations);
+            indexName = match.IndexName;
 
             return explanations;
         }
 
-        private bool TryMatchExistingIndexToQuery(DynamicQueryMapping map, out Index index)
+        private bool TryMatchExistingIndexToQuery(DynamicQueryMapping map, DocumentsOperationContext docsContext, out Index index)
         {
             var dynamicQueryToIndex = new DynamicQueryToIndexMatcher(_indexStore);
 
-            var matchResult = dynamicQueryToIndex.Match(map);
+            var matchResult = dynamicQueryToIndex.Match(map, docsContext);
 
             switch (matchResult.MatchType)
             {
                 case DynamicQueryMatchType.Complete:
+                case DynamicQueryMatchType.CompleteButIdle:
                     index = _indexStore.GetIndex(matchResult.IndexName);
                     return true;
                 case DynamicQueryMatchType.Partial:

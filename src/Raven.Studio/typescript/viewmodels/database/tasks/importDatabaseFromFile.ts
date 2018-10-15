@@ -36,7 +36,9 @@ class importDatabaseFromFile extends viewModelBase {
     isUploading = ko.observable<boolean>(false);
     uploadStatus = ko.observable<number>();
 
-    importCommand: KnockoutComputed<string>;
+    importCommandPowerShell: KnockoutComputed<string>;
+    importCommandCmd: KnockoutComputed<string>;
+    importCommandBash: KnockoutComputed<string>;
 
     validationGroup = ko.validatedObservable({
         importedFileName: this.importedFileName,
@@ -64,24 +66,54 @@ class importDatabaseFromFile extends viewModelBase {
                 this.model.transformScript("");
             }
         });
+        
+        const modelAsJson = () => {
+            const args = this.model.toDto();
+            if (!args.TransformScript) {
+                delete args.TransformScript;
+            }
+            return JSON.stringify(args);
+        };
+        
+        const fileNameProvider = () => this.importedFileName() || "Dump of Database.ravendbdump";
+        const commandEndpointUrl = (db: database) => appUrl.forServer() + appUrl.forDatabaseQuery(db) + endpoints.databases.smuggler.smugglerImport;
+        
+        
 
-        //TODO: change input file name to be full document path
+        this.importCommandPowerShell = ko.pureComputed(() => {
+            const db = this.activeDatabase();
+            if (!db) {
+                return "";
+            }
+            
+            const json = modelAsJson();
+            const fileName = fileNameProvider();
 
-        this.importCommand = ko.pureComputed(() => {
+            return `curl.exe -F 'importOptions=${json.replace(/"/g, '\\"')}' -F 'file=@.\\${fileName}' ${commandEndpointUrl(db)}`;
+        });
+        
+        this.importCommandBash = ko.pureComputed(() => {
             const db = this.activeDatabase();
             if (!db) {
                 return "";
             }
 
-            const args = this.model.toDto();
-            if (!args.TransformScript) {
-                delete args.TransformScript;
+            const json = modelAsJson();
+            const fileName = fileNameProvider();
+            
+            return `curl -F 'importOptions=${json}' -F 'file=@${fileName}' ${commandEndpointUrl(db)}`;
+        });
+        
+        this.importCommandCmd = ko.pureComputed(() => {
+            const db = this.activeDatabase();
+            if (!db) {
+                return "";
             }
-            const json = JSON.stringify(args);
 
-            const curl = "curl" + (navigator.platform.startsWith("Win") ? ".exe" : "");
-            return curl + " -F 'importOptions=" + json.replace(/"/g, '\\"') + "' -F 'file=@.\\Dump of Database.ravendbdump' " +
-                appUrl.forServer() + appUrl.forDatabaseQuery(db) + endpoints.databases.smuggler.smugglerImport;
+            const json = modelAsJson();
+            const fileName = fileNameProvider();
+
+            return `curl.exe -F "importOptions=${json.replace(/"/g, '\\"')}" -F "file=@.\\${fileName}" ${commandEndpointUrl(db)}`;
         });
 
         this.isUploading.subscribe((newValue) => {
@@ -94,7 +126,7 @@ class importDatabaseFromFile extends viewModelBase {
 
         this.setupValidation();
     }
-
+    
     private setupValidation() {
         this.importedFileName.extend({
             required: true
@@ -104,7 +136,7 @@ class importDatabaseFromFile extends viewModelBase {
     attached() {
         super.attached();
 
-        popoverUtils.longWithHover($(".scriptPopover"),
+        popoverUtils.longWithHover($("#scriptPopover"),
             {
                 content:
                 "<div class=\"text-center\">Transform scripts are written in JavaScript </div>" +
@@ -113,6 +145,13 @@ class importDatabaseFromFile extends viewModelBase {
                 "<span class=\"token keyword\">throw </span><span class=\"token string\">'skip'</span>; <span class=\"token comment\">// filter-out</span><br /><br />" +
                 "<span class=\"token keyword\">this</span>.Freight = <span class=\"token number\">15.3</span>;<br />" +
                 "</pre>" 
+            });
+
+        popoverUtils.longWithHover($("#configurationPopover"),
+            {
+                content:
+                    "<div>The following configuration settings will be imported:</div>" +
+                    "<strong>Revisions, Expiration & Client Configuration</strong>"
             });
         
         this.updateHelpLink("YD9M1R");
@@ -131,22 +170,6 @@ class importDatabaseFromFile extends viewModelBase {
 
     createPostboxSubscriptions(): Array<KnockoutSubscription> {
         return [
-            ko.postbox.subscribe("UploadProgress", (percentComplete: number) => {
-                const db = this.activeDatabase();
-                if (!db) {
-                    return;
-                }
-
-                if (!this.isUploading()) {
-                    return;
-                }
-
-                if (percentComplete === 100) {
-                    setTimeout(() => this.isUploading(false), 700);
-                }
-
-                this.uploadStatus(percentComplete);
-            }),
             ko.postbox.subscribe(EVENTS.ChangesApi.Reconnected, (db: database) => {
                 this.isUploading(false);
             })
@@ -193,7 +216,7 @@ class importDatabaseFromFile extends viewModelBase {
     
                     this.checkIfRevisionsWasEnabled(db, operationId);
                     
-                    new importDatabaseCommand(db, operationId, fileInput.files[0], this.model)
+                    new importDatabaseCommand(db, operationId, fileInput.files[0], this.model, this.isUploading, this.uploadStatus)
                         .execute()
                         .always(() => this.isUploading(false));
                 });                
@@ -208,21 +231,21 @@ class importDatabaseFromFile extends viewModelBase {
         if (!db.hasRevisionsConfiguration()) {
             notificationCenter.instance.databaseOperationsWatch.monitorOperation(operationId)
             .done(() => {
-                new getDatabaseCommand(db.name)
-                    .execute()
-                    .done(dbInfo => {
-                        if (dbInfo.HasRevisionsConfiguration) {
-                            db.hasRevisionsConfiguration(true);
-                            
-                            collectionsTracker.default.configureRevisions(db);
-                        }
-                    })
-            });    
+                    new getDatabaseCommand(db.name)
+                        .execute()
+                        .done(dbInfo => {
+                            if (dbInfo.HasRevisionsConfiguration) {
+                                db.hasRevisionsConfiguration(true);
+
+                                collectionsTracker.default.configureRevisions(db);
+                            }
+                        });
+                });    
         }
     }
 
-    copyCommandToClipboard() {
-        copyToClipboard.copy(this.importCommand(), "Command was copied to clipboard.");
+    copyCommandToClipboard(command: string) {
+        copyToClipboard.copy(command, "Command was copied to clipboard.");
     }
 
     private getNextOperationId(db: database): JQueryPromise<number> {

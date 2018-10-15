@@ -10,18 +10,24 @@ namespace Raven.Client.Documents.Operations
 {
     public partial class OperationExecutor
     {
-        private readonly DocumentStoreBase _store;
+        private readonly IDocumentStore _store;
         private readonly string _databaseName;
         private readonly RequestExecutor _requestExecutor;
 
-        public OperationExecutor(DocumentStoreBase store, string databaseName = null)
+        public OperationExecutor(DocumentStoreBase store, string databaseName = null) 
+            : this((IDocumentStore)store, databaseName)
+        {
+        }
+
+        protected OperationExecutor(IDocumentStore store, string databaseName = null)
         {
             _store = store;
             _databaseName = databaseName ?? store.Database;
-            _requestExecutor = store.GetRequestExecutor(databaseName);
+            if (_databaseName != null)
+                _requestExecutor = store.GetRequestExecutor(_databaseName);
         }
 
-        public OperationExecutor ForDatabase(string databaseName)
+        public virtual OperationExecutor ForDatabase(string databaseName)
         {
             if (string.Equals(_databaseName, databaseName, StringComparison.OrdinalIgnoreCase))
                 return this;
@@ -39,7 +45,7 @@ namespace Raven.Client.Documents.Operations
             return AsyncHelpers.RunSync(() => SendAsync(operation, sessionInfo));
         }
 
-        public async Task SendAsync(IOperation operation, SessionInfo sessionInfo = null, CancellationToken token = default(CancellationToken))
+        public async Task SendAsync(IOperation operation, SessionInfo sessionInfo = null, CancellationToken token = default)
         {
             using (GetContext(out JsonOperationContext context))
             {
@@ -49,7 +55,7 @@ namespace Raven.Client.Documents.Operations
             }
         }
 
-        public async Task<TResult> SendAsync<TResult>(IOperation<TResult> operation, SessionInfo sessionInfo = null, CancellationToken token = default(CancellationToken))
+        public async Task<TResult> SendAsync<TResult>(IOperation<TResult> operation, SessionInfo sessionInfo = null, CancellationToken token = default)
         {
             using (GetContext(out JsonOperationContext context))
             {
@@ -61,8 +67,10 @@ namespace Raven.Client.Documents.Operations
             }
         }
 
-        private IDisposable GetContext(out JsonOperationContext context)
+        protected virtual IDisposable GetContext(out JsonOperationContext context)
         {
+            if (_requestExecutor == null)
+                throw new InvalidOperationException("Cannot use Operations without a database defined, did you forget to call ForDatabase?");
             return _requestExecutor.ContextPool.AllocateOperationContext(out context);
         }
     }

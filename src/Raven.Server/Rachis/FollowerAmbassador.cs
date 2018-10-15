@@ -9,12 +9,14 @@ using System.Threading;
 using Raven.Client.Exceptions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
+using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Binary;
 using Sparrow.Json;
 using Sparrow.Threading;
+using Sparrow.Utils;
 using Voron;
 using Voron.Data;
 using Voron.Data.Tables;
@@ -30,6 +32,7 @@ namespace Raven.Server.Rachis
         FailedToConnect,
         Disconnected,
         Closed,
+        Error,
     }
 
     public class FollowerAmbassador : IDisposable
@@ -39,7 +42,6 @@ namespace Raven.Server.Rachis
         private ManualResetEvent _wakeLeader;
         private readonly string _tag;
         private readonly string _url;
-        private readonly X509Certificate2 _certificate;
         private string _statusMessage;
 
         public string StatusMessage
@@ -49,7 +51,7 @@ namespace Raven.Server.Rachis
             {
                 if (_statusMessage == value)
                     return;
-                
+
                 _statusMessage = value;
                 _engine.NotifyTopologyChange();
             }
@@ -64,6 +66,8 @@ namespace Raven.Server.Rachis
         private RemoteConnection _connection;
         private readonly MultipleUseFlag _running = new MultipleUseFlag(true);
         private readonly long _term;
+
+        private static int _uniqueId;
 
         public string Tag => _tag;
 
@@ -86,7 +90,9 @@ namespace Raven.Server.Rachis
         public string LastSendMsg => _lastSentMsg;
         public bool ForceElectionsNow { get; set; }
         public string Url => _url;
-        
+
+        public int FollowerCommandsVersion { get; set; }
+
         private readonly string _debugName;
         private readonly RachisLogRecorder _debugRecorder;
 
@@ -107,8 +113,8 @@ namespace Raven.Server.Rachis
         {
             Interlocked.Exchange(ref _lastReplyFromFollower, DateTime.UtcNow.Ticks);
         }
-        
-        public FollowerAmbassador(RachisConsensus engine, Leader leader, ManualResetEvent wakeLeader, string tag, string url, X509Certificate2 certificate, RemoteConnection connection = null)
+
+        public FollowerAmbassador(RachisConsensus engine, Leader leader, ManualResetEvent wakeLeader, string tag, string url, RemoteConnection connection = null)
         {
             _engine = engine;
             _term = leader.Term;
@@ -116,15 +122,14 @@ namespace Raven.Server.Rachis
             _wakeLeader = wakeLeader;
             _tag = tag;
             _url = url;
-            _certificate = certificate;
             _connection = connection;
             Status = AmbassadorStatus.Started;
             StatusMessage = $"Started Follower Ambassador for {_engine.Tag} > {_tag} in term {_term}";
-            
-            _debugName = $"Follower Ambassador for {_tag} in term {_term}";
+            var id = Interlocked.Increment(ref _uniqueId);
+            _debugName = $"Follower Ambassador for {_tag} in term {_term} (id:{id})";
             _debugRecorder = _engine.InMemoryDebug.GetNewRecorder(_debugName);
         }
-        
+
         public void UpdateLeaderWake(ManualResetEvent wakeLeader)
         {
             _wakeLeader = wakeLeader;
@@ -151,6 +156,7 @@ namespace Raven.Server.Rachis
                     }
                 }
 
+                var hadConnectionFailure = false;
                 var needNewConnection = _connection == null;
                 while (_leader.Running && _running)
                 {
@@ -166,10 +172,13 @@ namespace Raven.Server.Rachis
                                 {
                                     _engine.Log.Info($"FollowerAmbassador for {_tag}: Creating new connection to {_tag}");
                                 }
+
                                 using (_engine.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                                 {
-                                    _connection?.Dispose();
-                                    var (stream, disconnect) = _engine.ConnectToPeer(_url, _certificate, context).Result;
+                                    _engine.RemoveAndDispose(_leader, _connection);
+                                    var connection = _engine.ConnectToPeer(_url, _tag, _engine.ClusterCertificate).Result;
+                                    var stream = connection.Stream;
+                                    var disconnect = connection.Disconnect;
                                     var con = new RemoteConnection(_tag, _engine.Tag, _term, stream, disconnect);
                                     Interlocked.Exchange(ref _connection, con);
                                     ClusterTopology topology;
@@ -177,26 +186,31 @@ namespace Raven.Server.Rachis
                                     {
                                         topology = _engine.GetTopology(context);
                                     }
+
                                     SendHello(context, topology);
                                 }
+                            }
+                            else
+                            {
+                                // if we are here we have won the elections, let's notify the elector about it.
+                                if (_engine.Log.IsInfoEnabled)
+                                {
+                                    _engine.Log.Info($"Follower ambassador reuses the connection for {_tag} and send a winning message to his elector.");
+                                }
+
+                                CandidateAmbassador.SendElectionResult(_engine, _connection, _term, ElectionResult.Won);
                             }
                         }
                         catch (Exception e)
                         {
-                            Status = AmbassadorStatus.FailedToConnect;
-                            StatusMessage = $"Failed to connect with {_tag}.{Environment.NewLine}" + e.Message;
-                            if (_engine.Log.IsInfoEnabled)
-                            {
-                                _engine.Log.Info($"{ToString()}: Failed to connect to remote follower: {_tag} {_url}", e);
-                            }
-                            // wait a bit
+                            NotifyOnException(ref hadConnectionFailure, new Exception($"Failed to create a connection to node {_tag} at {_url}", e));
                             _leader.WaitForNewEntries().Wait(TimeSpan.FromMilliseconds(_engine.ElectionTimeout.TotalMilliseconds / 2));
                             continue; // we'll retry connecting
                         }
                         finally
                         {
                             needNewConnection = true;
-                            _debugRecorder.Record("Connection obtatined");
+                            _debugRecorder.Record("Connection obtained");
                         }
 
                         Status = AmbassadorStatus.Connected;
@@ -225,7 +239,7 @@ namespace Raven.Server.Rachis
                         {
                             entries.Clear();
                             _engine.ValidateTerm(_term);
-                            
+
                             using (_engine.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                             {
                                 AppendEntries appendEntries;
@@ -240,6 +254,7 @@ namespace Raven.Server.Rachis
                                         foreach (var value in table.SeekByPrimaryKey(key, 0))
                                         {
                                             var entry = BuildRachisEntryToSend(context, value);
+                                            _engine.Validator.AssertEntryBeforeSendToFollower(entry, FollowerCommandsVersion, _tag);
                                             entries.Add(entry);
                                             totalSize += entry.Size;
                                             if (totalSize > Constants.Size.Megabyte)
@@ -255,7 +270,8 @@ namespace Raven.Server.Rachis
                                             TruncateLogBefore = _leader.LowestIndexInEntireCluster,
                                             PrevLogTerm = _engine.GetTermFor(context, _followerMatchIndex) ?? 0,
                                             PrevLogIndex = _followerMatchIndex,
-                                            TimeAsLeader = _leader.LeaderShipDuration
+                                            TimeAsLeader = _leader.LeaderShipDuration,
+                                            MinCommandVersion = ClusterCommandsVersionManager.CurrentClusterMinimalVersion
                                         };
                                     }
                                 }
@@ -275,6 +291,7 @@ namespace Raven.Server.Rachis
 #endif
                                     );
                                 }
+
                                 _debugRecorder.Record("Sending entries");
                                 _connection.Send(context, UpdateFollowerTicks, appendEntries, entries);
                                 _debugRecorder.Record("Waiting for response");
@@ -293,16 +310,18 @@ namespace Raven.Server.Rachis
                                             if (_engine.Log.IsInfoEnabled)
                                             {
                                                 var msg = aer?.Success == true ? "successfully" : "failed";
-                                                _engine.Log.Info($"{ToString()}: waited long time ({readWatcher.ElapsedMilliseconds}) to read a single response from stream ({msg}).");
+                                                _engine.Log.Info(
+                                                    $"{ToString()}: waited long time ({readWatcher.ElapsedMilliseconds}) to read a single response from stream ({msg}).");
                                             }
                                         }
                                     }
-                                    
+
                                     if (aer.Pending == false)
                                         break;
                                     UpdateFollowerTicks();
                                 }
-                                _debugRecorder.Record("Response was recieved");
+
+                                _debugRecorder.Record("Response was received");
                                 if (aer.Success == false)
                                 {
                                     // shouldn't happen, the connection should be aborted if this is the case, but still
@@ -313,17 +332,31 @@ namespace Raven.Server.Rachis
                                     {
                                         _engine.Log.Info($"{ToString()}: failure to append entries to {_tag} because: " + msg);
                                     }
-                                    throw new InvalidOperationException(msg);
+
+                                    RachisInvalidOperationException.Throw(msg);
                                 }
+
                                 if (aer.CurrentTerm != _term)
-                                    ThrowInvalidTermChanged(aer);
+                                {
+                                    var msg = $"The current engine term has changed " +
+                                              $"({aer.CurrentTerm:#,#;;0} -> {_term:#,#;;0}), " +
+                                              $"this ambassador term is no longer valid";
+                                    if (_engine.Log.IsInfoEnabled)
+                                    {
+                                        _engine.Log.Info($"{ToString()}: failure to append entries to {_tag} because: {msg}");
+                                    }
+
+                                    RachisConcurrencyException.Throw(msg);
+                                }
 
                                 UpdateLastMatchFromFollower(aer.LastLogIndex);
                             }
-                            
-                            if(_running == false)
+
+                            if (_running == false)
                                 break;
-                            
+
+                            hadConnectionFailure = false;
+
                             var task = _leader.WaitForNewEntries();
                             using (_engine.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                             using (context.OpenReadTransaction())
@@ -331,7 +364,7 @@ namespace Raven.Server.Rachis
                                 if (_engine.GetLastEntryIndex(context) != _followerMatchIndex)
                                     continue; // instead of waiting, we have new entries, start immediately
                             }
-                            
+
                             // either we have new entries to send, or we waited for long enough 
                             // to send another heartbeat
                             task.Wait(TimeSpan.FromMilliseconds(_engine.ElectionTimeout.TotalMilliseconds / 3));
@@ -340,27 +373,33 @@ namespace Raven.Server.Rachis
                             _debugRecorder.Start();
                         }
                     }
-                    catch (OperationCanceledException)
+
+                    catch (RachisConcurrencyException)
                     {
+                        // our term is no longer valid
                         throw;
                     }
-                    catch (AggregateException ae) when (ae.InnerException is OperationCanceledException)
+                    catch (RachisException)
                     {
+                        // this is a rachis protocol violation exception, we must close this ambassador. 
+                        throw;
+                    }
+                    catch (AggregateException ae) when (ae.InnerException is OperationCanceledException || ae.InnerException is LockAlreadyDisposedException)
+                    {
+                        // Those are expected exceptions which indicate that this ambassador is shutting down.
+                        throw;
+                    }
+                    catch (Exception e) when (e is LockAlreadyDisposedException || e is OperationCanceledException)
+                    {
+                        // Those are expected exceptions which indicate that this ambassador is shutting down.
                         throw;
                     }
                     catch (Exception e)
                     {
-                        Status = AmbassadorStatus.FailedToConnect;
-                        StatusMessage = $"Failed to talk with {_tag}.{Environment.NewLine}" + e;
-                        if (_engine.Log.IsInfoEnabled)
-                        {
-                            _engine.Log.Info("Failed to talk to remote follower: " + _tag, e);
-                        }
-                        // notify leader about an error
-
+                        // This is an unexpected exception which indicate the something is wrong with the connection.
+                        // So we will retry to reconnect. 
                         _connection?.Dispose();
-
-                        _leader?.NotifyAboutException(Tag, e);
+                        NotifyOnException(ref hadConnectionFailure, new Exception($"The connection with node {_tag} was suddenly broken.", e));
                         _leader.WaitForNewEntries().Wait(TimeSpan.FromMilliseconds(_engine.ElectionTimeout.TotalMilliseconds / 2));
                     }
                     finally
@@ -373,26 +412,27 @@ namespace Raven.Server.Rachis
                         {
                             StatusMessage = "Disconnected due to :" + StatusMessage;
                         }
+
                         Status = AmbassadorStatus.Disconnected;
                         _debugRecorder.Record(StatusMessage);
                     }
                 }
             }
-            catch (OperationCanceledException)
-            {
-                StatusMessage = "Closed";
-                Status = AmbassadorStatus.Closed;
-            }
-            catch (ObjectDisposedException)
-            {
-                StatusMessage = "Closed";
-                Status = AmbassadorStatus.Closed;
-            }
             catch (AggregateException ae)
-                when (ae.InnerException is OperationCanceledException || ae.InnerException is ObjectDisposedException)
+                when (ae.InnerException is OperationCanceledException || ae.InnerException is LockAlreadyDisposedException)
             {
                 StatusMessage = "Closed";
                 Status = AmbassadorStatus.Closed;
+            }
+            catch (Exception e) when (e is LockAlreadyDisposedException || e is OperationCanceledException)
+            {
+                StatusMessage = "Closed";
+                Status = AmbassadorStatus.Closed;
+            }
+            catch (RachisException e)
+            {
+                StatusMessage = $"Reached an erroneous state due to :{Environment.NewLine}{e.Message}";
+                Status = AmbassadorStatus.Error;
             }
             catch (Exception e)
             {
@@ -414,11 +454,24 @@ namespace Raven.Server.Rachis
             }
         }
 
-        private void ThrowInvalidTermChanged(AppendEntriesResponse aer)
+        private void NotifyOnException(ref bool hadConnectionFailure, Exception e)
         {
-            throw new ConcurrencyException($"The current engine term has changed " +
-                                           $"({aer.CurrentTerm:#,#;;0} -> {_term:#,#;;0}), " +
-                                           $"this ambassador term is no longer valid");
+            // It could be that due to election or leader change, the follower has forcefully closed the connection.
+            // In any case we don't want to raise a notification due to a one-time connection failure.
+            if (hadConnectionFailure || e.InnerException is IOException == false)
+            {
+                Status = AmbassadorStatus.FailedToConnect;
+                StatusMessage = $"{e.Message}.{Environment.NewLine}" + e.InnerException;
+                if (_engine.Log.IsInfoEnabled)
+                {
+                    _engine.Log.Info(e.Message, e.InnerException);
+                }
+                _leader?.NotifyAboutException(Tag, e);
+            }
+            if (e.InnerException is IOException)
+            {
+                hadConnectionFailure = true;
+            }
         }
 
         private void SendSnapshot(Stream stream)
@@ -426,8 +479,8 @@ namespace Raven.Server.Rachis
             using (_engine.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (context.OpenReadTransaction())
             {
-                var earliestIndexEtry = _engine.GetFirstEntryIndex(context);
-                if (_followerMatchIndex >= earliestIndexEtry)
+                var earliestIndexEntry = _engine.GetFirstEntryIndex(context);
+                if (_followerMatchIndex >= earliestIndexEntry)
                 {
                     // we don't need a snapshot, so just send updated topology
                     UpdateLastSend("Send empty snapshot");
@@ -437,8 +490,8 @@ namespace Raven.Server.Rachis
                     }
                     _connection.Send(context, new InstallSnapshot
                     {
-                        LastIncludedIndex = earliestIndexEtry,
-                        LastIncludedTerm = _engine.GetTermForKnownExisting(context, earliestIndexEtry),
+                        LastIncludedIndex = earliestIndexEntry,
+                        LastIncludedTerm = _engine.GetTermForKnownExisting(context, earliestIndexEntry),
                         Topology = _engine.GetTopologyRaw(context)
                     });
                     using (var binaryWriter = new BinaryWriter(stream, Encoding.UTF8, leaveOpen: true))
@@ -674,10 +727,16 @@ namespace Raven.Server.Rachis
                 _connection.Send(context, lln);
 
                 var llr = _connection.Read<LogLengthNegotiationResponse>(context);
+
+                FollowerCommandsVersion = GetFollowerVersion(llr);
+                _leader.PeersVersion[_tag] = FollowerCommandsVersion;
+                var minimalVersion = ClusterCommandsVersionManager.GetClusterMinimalVersion(_leader.PeersVersion.Values.ToList(), _engine.MaximalVersion);
+                ClusterCommandsVersionManager.SetClusterVersion(minimalVersion);
+
                 if (_engine.Log.IsInfoEnabled)
                 {
                     _engine.Log.Info($"Got 1st LogLengthNegotiationResponse from {_tag} with term {llr.CurrentTerm:#,#;;0} " +
-                                     $"({llr.MidpointIndex:#,#;;0} / {llr.MidpointTerm:#,#;;0}) {llr.Status}");
+                                     $"({llr.MidpointIndex:#,#;;0} / {llr.MidpointTerm:#,#;;0}) {llr.Status}, version: {FollowerCommandsVersion}");
                 }
                 // need to negotiate
                 do
@@ -688,7 +747,7 @@ namespace Raven.Server.Rachis
                         var msg = $"{ToString()}: found election term {llr.CurrentTerm:#,#;;0} that is higher than ours {_term:#,#;;0}";
                         _engine.SetNewState(RachisState.Follower, null, _term, msg);
                         _engine.FoundAboutHigherTerm(llr.CurrentTerm, "Append entries response with higher term");
-                        throw new InvalidOperationException(msg);
+                        RachisInvalidOperationException.Throw(msg);
                     }
 
                     if (llr.Status == LogLengthNegotiationResponse.ResponseStatus.Acceptable)
@@ -707,7 +766,7 @@ namespace Raven.Server.Rachis
                         {
                             _engine.Log.Info($"{ToString()}: {message}");
                         }
-                        throw new InvalidOperationException(message);
+                        RachisInvalidOperationException.Throw(message);
                     }
 
                     UpdateLastMatchFromFollower(0);
@@ -741,7 +800,7 @@ namespace Raven.Server.Rachis
                         if (_engine.Log.IsInfoEnabled)
                         {
                             _engine.Log.Info($"Sending LogLengthNegotiation to {_tag} with term {lln.Term:#,#;;0} " +
-                                             $"({lln.PrevLogIndex:#,#;;0} / {lln.PrevLogTerm:#,#;;0}) - Trnuncated {lln.Truncated}");
+                                             $"({lln.PrevLogIndex:#,#;;0} / {lln.PrevLogTerm:#,#;;0}) - Truncated {lln.Truncated}");
                         }
                     }
                     UpdateLastSend("Negotiation 2");
@@ -754,6 +813,14 @@ namespace Raven.Server.Rachis
                     }
                 } while (true);
             }
+        }
+
+        private static int GetFollowerVersion(LogLengthNegotiationResponse llr)
+        {
+            var version = llr.CommandsVersion ?? ClusterCommandsVersionManager.Base40CommandsVersion;
+            if (version == 400)
+                return ClusterCommandsVersionManager.Base40CommandsVersion;
+            return version;
         }
 
         private void SendHello(TransactionOperationContext context, ClusterTopology clusterTopology)
@@ -780,7 +847,7 @@ namespace Raven.Server.Rachis
         {
             UpdateLastMatchFromFollower(0);
             _followerAmbassadorLongRunningOperation =
-                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null, ToString()); 
+                PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => Run(), null, ToString());
         }
 
         public override string ToString()
@@ -803,7 +870,7 @@ namespace Raven.Server.Rachis
                 {
                     if (_engine.Log.IsInfoEnabled)
                     {
-                        _engine.Log.Info($"{ToString()}: Waited for a full second for thread {_followerAmbassadorLongRunningOperation.ManagedThreadId} ({(_followerAmbassadorLongRunningOperation.Join(0)?"Running":"Finished")}) to close, disposing connection and trying");
+                        _engine.Log.Info($"{ToString()}: Waited for a full second for thread {_followerAmbassadorLongRunningOperation.ManagedThreadId} ({(_followerAmbassadorLongRunningOperation.Join(0) ? "Running" : "Finished")}) to close, disposing connection and trying");
                     }
                     // the thread may have create a new connection, so need
                     // to dispose that as well

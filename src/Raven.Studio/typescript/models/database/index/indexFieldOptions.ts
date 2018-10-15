@@ -1,6 +1,6 @@
 /// <reference path="../../../../typings/tsd.d.ts"/>
-
 import spatialOptions = require("models/database/index/spatialOptions");
+import jsonUtil = require("common/jsonUtil");
 
 function labelMatcher<T>(labels: Array<valueAndLabelItem<T, string>>): (arg: T) => string {
     return(arg) => labels.find(x => x.value === arg).label;
@@ -10,10 +10,26 @@ function yesNoLabelProvider(arg: boolean) {
     return arg ? 'Yes' : 'No';
 }
 
+interface analyzerName {
+    shortName: string;
+    fullName: string;
+}
+
 class indexFieldOptions {
 
-    static readonly DefaultFieldOptions = "__all_fields";
+    static readonly analyzersNamesDictionary: analyzerName[] = [
+        { shortName: "KeywordAnalyzer", fullName: "KeywordAnalyzer" },
+        { shortName: "LowerCaseKeywordAnalyzer", fullName: "Raven.Server.Documents.Indexes.Persistence.Lucene.Analyzers.LowerCaseKeywordAnalyzer" },
+        { shortName: "SimpleAnalyzer", fullName: "SimpleAnalyzer" },
+        { shortName: "StandardAnalyzer", fullName: null }, // default option
+        { shortName: "StopAnalyzer", fullName: "StopAnalyzer" },
+        { shortName: "WhitespaceAnalyzer", fullName:"WhitespaceAnalyzer" }
+    ];
 
+    static readonly analyzersNames =  indexFieldOptions.analyzersNamesDictionary.map(a => a.shortName);
+
+    static readonly DefaultFieldOptions = "__all_fields";   
+    
     static readonly TermVectors: Array<valueAndLabelItem<Raven.Client.Documents.Indexes.FieldTermVector, string>> = [{
             label: "No",
             value: "No"
@@ -54,6 +70,9 @@ class indexFieldOptions {
     static readonly CircleRadiusType: Array<Raven.Client.Documents.Indexes.Spatial.SpatialUnits> = [ "Kilometers", "Miles"];
 
     name = ko.observable<string>();
+    
+    isDefaultFieldOptions = ko.pureComputed(() => this.name() === indexFieldOptions.DefaultFieldOptions);    
+    isStandardAnalyzer = ko.pureComputed(() => !this.analyzer() || this.analyzer() === 'StandardAnalyzer' || this.analyzer() === 'Lucene.Net.Analysis.Standard.StandardAnalyzer');
 
     parent = ko.observable<indexFieldOptions>();
 
@@ -61,18 +80,27 @@ class indexFieldOptions {
 
     indexing = ko.observable<Raven.Client.Documents.Indexes.FieldIndexing>();
     effectiveIndexing = this.effectiveComputed(x => x.indexing(), labelMatcher(indexFieldOptions.Indexing));
+    defaultIndexing = this.defaultComputed(x => x.indexing(), labelMatcher(indexFieldOptions.Indexing));
 
     storage = ko.observable<Raven.Client.Documents.Indexes.FieldStorage>();
     effectiveStorage = this.effectiveComputed(x => x.storage());
+    defaultStorage = this.defaultComputed(x => x.storage());
 
     suggestions = ko.observable<boolean>();
     effectiveSuggestions = this.effectiveComputed(x => x.suggestions(), yesNoLabelProvider);
+    defaultSuggestions = this.defaultComputed(x => x.suggestions(), yesNoLabelProvider);
 
     termVector = ko.observable<Raven.Client.Documents.Indexes.FieldTermVector>();
     effectiveTermVector = this.effectiveComputed(x => x.termVector(), labelMatcher(indexFieldOptions.TermVectors));
+    defaultTermVector = this.defaultComputed(x => x.termVector(), labelMatcher(indexFieldOptions.TermVectors));
 
     fullTextSearch = ko.observable<boolean>();
     effectiveFullTextSearch = this.effectiveComputed(x => x.fullTextSearch(), yesNoLabelProvider);
+    defaultFullTextSearch = this.defaultComputed(x => x.fullTextSearch(), yesNoLabelProvider);
+
+    highlighting = ko.observable<boolean>();
+    effectiveHighlighting = this.effectiveComputed(x => x.highlighting(), yesNoLabelProvider);
+    defaultHighlighting = this.defaultComputed(x => x.highlighting(), yesNoLabelProvider);
 
     spatial = ko.observable<spatialOptions>();
 
@@ -81,7 +109,8 @@ class indexFieldOptions {
     canProvideAnalyzer = ko.pureComputed(() => this.indexing() === "Search");
 
     validationGroup: KnockoutObservable<any>;
-
+    dirtyFlag: () => DirtyFlag;
+    
     constructor(name: string, dto: Raven.Client.Documents.Indexes.IndexFieldOptions, parentFields?: indexFieldOptions) {
         this.name(name);
         this.parent(parentFields);
@@ -96,54 +125,159 @@ class indexFieldOptions {
         } else {
             this.spatial(spatialOptions.empty());
         }
-        if (this.indexing() === "Search" && !this.analyzer()) {
+        
+        if (this.indexing() === "Search" && this.isStandardAnalyzer()) {
             this.fullTextSearch(true);
+            
+            if (this.storage() === "Yes" && this.termVector() === "WithPositionsAndOffsets") {
+                this.highlighting(true);
+            }
         }
-
+        
         _.bindAll(this, "toggleAdvancedOptions");
 
         this.initValidation();
 
         // used to avoid circular updates
-        let fullTextChangeInProgress = false;
-        let indexingChangeInProgess = false;
+        let changeInProgess = false;
 
         const onFullTextChanged = () => {
-            if (!indexingChangeInProgess) {
+            if (!changeInProgess) {
                 const newValue = this.fullTextSearch();
-                fullTextChangeInProgress = true;
+                
+                changeInProgess = true;
+                
                 if (newValue) {
                     this.analyzer(null);
                     this.indexing("Search");
+                    
+                    // make sure advanced options are visible
+                    this.showAdvancedOptions(true);
                 } else {
                     this.analyzer(null);
                     this.indexing("Default");
                 }
-                fullTextChangeInProgress = false;
+                
+                this.computeHighlighting();
+                changeInProgess = false;
             }
         };
 
         this.fullTextSearch.subscribe(() => onFullTextChanged());
+        
+        const onHighlightingChanged = () => {
+            if (!changeInProgess) {
+                const newValue = this.highlighting();
 
-        this.indexing.subscribe(newIndexing => {
-            if (!fullTextChangeInProgress) {
-                indexingChangeInProgess = true;
-                this.fullTextSearch(newIndexing === "Search" && !this.fullTextSearch() && !this.analyzer());
-                indexingChangeInProgess = false;
+                changeInProgess = true;
+                
+                if (newValue) {
+                    this.analyzer(null);
+                    this.storage("Yes");
+                    this.indexing("Search");
+                    this.termVector("WithPositionsAndOffsets");
+                } else if (newValue === null) {
+                    this.analyzer(null); 
+                    this.storage(null);
+                    this.indexing(null);
+                    this.termVector(null);
+                } else {
+                    this.analyzer(null);
+                    this.storage("No");
+                    this.indexing("Default");
+                    this.termVector("No");
+                }
+                
+                this.computeFullTextSearch();
+                changeInProgess = false;
+            }
+        };
+        
+        this.highlighting.subscribe(() => onHighlightingChanged());
+        
+        this.indexing.subscribe(() => {
+            if (!changeInProgess) {
+                changeInProgess = true;
+                this.computeFullTextSearch();
+                this.computeHighlighting();
+                this.computeAnalyzer();
+                changeInProgess = false;
             }
         });
 
-        this.analyzer.subscribe(newAnalyzer => {
-            if (!fullTextChangeInProgress) {
-                indexingChangeInProgess = true;
-                this.fullTextSearch(!newAnalyzer && !this.fullTextSearch() && this.indexing() == "Search");
-                indexingChangeInProgess = false;
+        this.analyzer.subscribe(() => {
+            if (!changeInProgess) {
+                changeInProgess = true;
+                this.computeFullTextSearch();
+                this.computeHighlighting();
+                changeInProgess = false;
             }
         });
+        
+        this.storage.subscribe(() => {
+            if (!changeInProgess) {
+                changeInProgess = true;
+                this.computeFullTextSearch();
+                this.computeHighlighting();
+                changeInProgess = false;
+            }
+        });
+
+        this.termVector.subscribe(() => {
+            if (!changeInProgess) {
+                changeInProgess = true;
+                this.computeFullTextSearch();
+                this.computeHighlighting();
+                changeInProgess = false;
+            }
+        });
+
+        this.dirtyFlag = new ko.DirtyFlag([
+            this.name,
+            this.analyzer,
+            this.indexing,
+            this.storage,
+            this.suggestions,
+            this.termVector,
+            this.hasSpatialOptions,
+            this.spatial().dirtyFlag().isDirty
+        ], false, jsonUtil.newLineNormalizingHashFunction);       
     }
 
+    private computeFullTextSearch() {
+        this.fullTextSearch(this.isStandardAnalyzer() &&
+            this.indexing() === "Search");
+        
+        if (this.indexing() === null) {
+            this.fullTextSearch(null);
+        } 
+    }
+
+    private computeHighlighting() {
+        this.highlighting(!this.analyzer() &&
+                           this.indexing() === 'Search' &&
+                           this.storage() === "Yes" && 
+                           this.termVector() === "WithPositionsAndOffsets");
+       
+        if (this.storage() === null &&
+            this.termVector() === null) {
+            this.highlighting(null);
+        }
+    }
+    
+    private computeAnalyzer() {      
+        if (this.indexing() === null) {
+            // take analyzer from default if indexing is set to 'inherit'
+            this.analyzer(this.parent().analyzer());
+        }
+    }
+    
     private effectiveComputed<T>(extractor: (field: indexFieldOptions) => T, labelProvider?: (arg: T) => string): KnockoutComputed<string> {
         return ko.pureComputed(() => this.extractEffectiveValue(x => extractor(x), true, labelProvider));
+    }
+
+    private defaultComputed<T>(extractor: (field: indexFieldOptions) => T, labelProvider?: (arg: T) => string): KnockoutComputed<string> {
+        return ko.pureComputed(() => "Inherit (" + this.parent().extractEffectiveValue(x => extractor(x), false, labelProvider) + ")");
     }
 
     private extractEffectiveValue<T>(extractor: (field: indexFieldOptions) => T, wrapWithDefault: boolean, labelProvider?: (arg: T) => string): string {
@@ -161,12 +295,12 @@ class indexFieldOptions {
 
         const label = labelProvider ? labelProvider(value) : value;
 
-        return (index > 0 && wrapWithDefault) ? "Default" : <any>label;
+        return (index > 0 && wrapWithDefault) ? "Inherit (" + label + ")" : <any>label;
     }
 
     private initValidation() {
         if (!this.isDefaultOptions()) {
-            this.name.extend({ required: true });
+            this.name.extend({required: true});
         }
 
         this.validationGroup = ko.validatedObservable({
@@ -192,6 +326,7 @@ class indexFieldOptions {
             TermVector: "No"
         });
         field.fullTextSearch(false);
+        field.highlighting(false);
 
         return field;
     }
@@ -217,8 +352,11 @@ class indexFieldOptions {
     }
 
     toDto(): Raven.Client.Documents.Indexes.IndexFieldOptions {
+        const analyzer = indexFieldOptions.analyzersNamesDictionary.find(x => x.shortName === this.analyzer()); 
+        const analyzerFullName = analyzer ? analyzer.fullName : (this.analyzer() || null);
+        
         return {
-            Analyzer: this.analyzer(),
+            Analyzer: analyzerFullName, 
             Indexing: this.indexing(),
             Storage: this.storage(),
             Suggestions: this.suggestions(),
@@ -226,7 +364,6 @@ class indexFieldOptions {
             Spatial: this.hasSpatialOptions() ? this.spatial().toDto() : undefined
         }
     }
-
 }
 
 export = indexFieldOptions; 

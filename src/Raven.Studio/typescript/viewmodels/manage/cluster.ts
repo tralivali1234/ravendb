@@ -3,6 +3,7 @@ import removeNodeFromClusterCommand = require("commands/database/cluster/removeN
 import leaderStepDownCommand = require("commands/database/cluster/leaderStepDownCommand");
 import promoteClusterNodeCommand = require("commands/database/cluster/promoteClusterNodeCommand");
 import demoteClusterNodeCommand = require("commands/database/cluster/demoteClusterNodeCommand");
+import bootstrapClusterCommand = require("commands/database/cluster/bootstrapClusterCommand");
 import forceLeaderTimeoutCommand = require("commands/database/cluster/forceLeaderTimeoutCommand");
 import changesContext = require("common/changesContext");
 import clusterNode = require("models/database/cluster/clusterNode");
@@ -15,17 +16,19 @@ import clusterGraph = require("models/database/cluster/clusterGraph");
 import assignCores = require("viewmodels/manage/assignCores");
 import license = require("models/auth/licenseModel");
 import eventsCollector = require("common/eventsCollector");
+import accessManager = require("common/shell/accessManager");
 
 class cluster extends viewModelBase {
 
     private graph = new clusterGraph();
 
     topology = clusterTopologyManager.default.topology;
+    accessManager = accessManager.default.clusterView;
 
     canDeleteNodes: KnockoutComputed<boolean>;
     canAddNodes: KnockoutComputed<boolean>;
-    showConnectivity: KnockoutComputed<boolean>;
-
+    canBootstrapCluster: KnockoutComputed<boolean>;
+    
     leaderUrl: KnockoutComputed<string>;
     utilizedCores: KnockoutComputed<number>;
     maxCores: KnockoutComputed<number>;
@@ -45,7 +48,8 @@ class cluster extends viewModelBase {
         promote: ko.observableArray<string>([]),
         demote: ko.observableArray<string>([]),
         forceTimeout: ko.observable<boolean>(false),
-        assignCores: ko.observable<boolean>(false)
+        assignCores: ko.observable<boolean>(false),
+        bootstrap: ko.observable<boolean>(false)
     };
 
     constructor() {
@@ -73,6 +77,7 @@ class cluster extends viewModelBase {
     private initObservables() {
         this.canDeleteNodes = ko.pureComputed(() => this.topology().leader() && this.topology().nodes().length > 1);
         this.canAddNodes = ko.pureComputed(() => !!this.topology().leader() || this.topology().nodeTag() === "?");
+        this.canBootstrapCluster = ko.pureComputed(() => this.topology().nodeTag() === "?");
 
         this.leaderUrl = ko.pureComputed(() => {
             const topology = this.topology();
@@ -91,10 +96,6 @@ class cluster extends viewModelBase {
             const localPart = appUrl.forCluster();
 
             return appUrl.toExternalUrl(serverUrl, localPart);
-        });
-
-        this.showConnectivity = ko.pureComputed(() => {
-            return !this.topology().leader() || this.topology().leader() === this.topology().nodeTag();
         });
 
         this.utilizedCores = ko.pureComputed(() => {
@@ -179,6 +180,13 @@ class cluster extends viewModelBase {
 
     addNode() {
         router.navigate(appUrl.forAddClusterNode());
+    }
+
+    bootstrapCluster() {
+        this.spinners.bootstrap(true);    
+        new bootstrapClusterCommand()
+            .execute()
+            .always(() => this.spinners.bootstrap(false));
     }
 
     forceTimeout(node: clusterNode) {

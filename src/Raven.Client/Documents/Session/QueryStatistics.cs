@@ -5,7 +5,6 @@
 //-----------------------------------------------------------------------
 
 using System;
-using System.Collections.Generic;
 using Raven.Client.Documents.Queries;
 
 namespace Raven.Client.Documents.Session
@@ -16,11 +15,6 @@ namespace Raven.Client.Documents.Session
     /// </summary>
     public class QueryStatistics
     {
-        public QueryStatistics()
-        {
-            TimingsInMs = new Dictionary<string, double>();
-        }
-
         /// <summary>
         /// Whether the query returned potentially stale results
         /// </summary>
@@ -61,11 +55,6 @@ namespace Raven.Client.Documents.Session
         /// </summary>
         public DateTime LastQueryTime { get; set; }
 
-        /// <summary>
-        /// Detailed timings for various parts of a query (Lucene search, loading documents, transforming results)
-        /// </summary>
-        public Dictionary<string, double> TimingsInMs { get; set; }
-
         public long? ResultEtag { get; set; }
 
         /// <summary>
@@ -73,6 +62,11 @@ namespace Raven.Client.Documents.Session
         /// This value is the _uncompressed_ size. 
         /// </summary>
         public long ResultSize { get; set; }
+
+        /// <summary>
+        /// Tag of a cluster node which responded to the query
+        /// </summary>
+        public string NodeTag { get; set; }
 
         /// <summary>
         /// Update the query stats from the query results
@@ -86,16 +80,10 @@ namespace Raven.Client.Documents.Session
             Timestamp = qr.IndexTimestamp;
             IndexName = qr.IndexName;
             IndexTimestamp = qr.IndexTimestamp;
-            TimingsInMs = qr.TimingsInMs;
             LastQueryTime = qr.LastQueryTime;
             ResultSize = qr.ResultSize;
             ResultEtag = qr.ResultEtag;
-            ScoreExplanations = qr.ScoreExplanations;
+            NodeTag = qr.NodeTag;
         }
-
-        /// <summary>
-        /// Gets or sets explanations of document scores 
-        /// </summary>
-        public Dictionary<string, string> ScoreExplanations { get; set; }
     }
 }

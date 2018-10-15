@@ -1,17 +1,20 @@
 ﻿using Lucene.Net.Store;
 using Raven.Client;
 using Raven.Server.Documents.Includes;
+using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
+using Sparrow.Json.Parsing;
 
 namespace Raven.Server.Documents.Queries.Results
 {
     public class MapReduceQueryResultRetriever : QueryResultRetrieverBase
     {
         private readonly JsonOperationContext _context;
+        private QueryTimingsScope _storageScope;
 
-        public MapReduceQueryResultRetriever(DocumentDatabase database, IndexQueryServerSide query, DocumentsStorage documentsStorage, JsonOperationContext context, FieldsToFetch fieldsToFetch, IncludeDocumentsCommand includeDocumentsCommand)
-            : base(database, query, fieldsToFetch, documentsStorage, context, true, includeDocumentsCommand)
+        public MapReduceQueryResultRetriever(DocumentDatabase database, IndexQueryServerSide query, QueryTimingsScope queryTimings, DocumentsStorage documentsStorage, JsonOperationContext context, FieldsToFetch fieldsToFetch, IncludeDocumentsCommand includeDocumentsCommand)
+            : base(database, query, queryTimings, fieldsToFetch, documentsStorage, context, true, includeDocumentsCommand)
         {
             _context = context;
         }
@@ -25,11 +28,39 @@ namespace Raven.Server.Documents.Queries.Results
             return null;
         }
 
+        protected override long? GetCounter(string docId, string name)
+        {
+            if (DocumentsStorage != null &&
+                _context is DocumentsOperationContext ctx)
+                return DocumentsStorage.CountersStorage.GetCounterValue(ctx, docId, name);
+            return null;
+        }
+
+        protected override DynamicJsonValue GetCounterRaw(string docId, string name)
+        {
+            if (DocumentsStorage == null || !(_context is DocumentsOperationContext ctx))
+                return null;
+
+            var djv = new DynamicJsonValue();
+
+            foreach (var (cv, val) in DocumentsStorage.CountersStorage.GetCounterValues(ctx, docId, name))
+            {
+                djv[cv] = val;
+            }
+
+            return djv;
+        }
+
         protected override unsafe Document DirectGet(Lucene.Net.Documents.Document input, string id, IState state)
         {
             var reduceValue = input.GetField(Constants.Documents.Indexing.Fields.ReduceKeyValueFieldName).GetBinaryValue(state);
 
-            var result = new BlittableJsonReaderObject((byte*)_context.PinObjectAndGetAddress(reduceValue), reduceValue.Length, _context);
+            var allocation = _context.GetMemory(reduceValue.Length);
+
+            UnmanagedWriteBuffer buffer = new UnmanagedWriteBuffer(_context, allocation);
+            buffer.Write(reduceValue, 0, reduceValue.Length);
+
+            var result = new BlittableJsonReaderObject(allocation.Address, reduceValue.Length, _context, buffer);
 
             return new Document
             {
@@ -42,7 +73,8 @@ namespace Raven.Server.Documents.Queries.Results
             if (FieldsToFetch.IsProjection)
                 return GetProjection(input, score, null, state);
 
-            return DirectGet(input, null, state);
+            using (_storageScope = _storageScope?.Start() ?? RetrieverScope?.For(nameof(QueryTimingsScope.Names.Storage)))
+                return DirectGet(input, null, state);
         }
 
         public override bool TryGetKey(Lucene.Net.Documents.Document document, IState state, out string key)

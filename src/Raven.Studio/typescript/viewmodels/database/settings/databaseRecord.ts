@@ -5,16 +5,16 @@ import document = require("models/database/documents/document");
 import database = require("models/resources/database");
 import viewModelBase = require("viewmodels/viewModelBase");
 import messagePublisher = require("common/messagePublisher");
-import accessHelper = require("viewmodels/shell/accessHelper");
+import accessManager = require("common/shell/accessManager");
 import eventsCollector = require("common/eventsCollector");
 
 class databaseRecord extends viewModelBase {
+    autoCollapseMode = ko.observable<boolean>(false);
     document = ko.observable<document>();
     documentText = ko.observable<string>().extend({ required: true });
     docEditor: AceAjax.Editor;
     securedSettings: string;
     updatedDto: documentDto;
-    leavePageDeferred: JQueryPromise<any>;
     isForbidden = ko.observable<boolean>(false);
 
     static containerId ="#databaseSettingsContainer";
@@ -31,26 +31,31 @@ class databaseRecord extends viewModelBase {
                 this.documentText(docText);
             }
         });
+        
+        this.bindToCurrentInstance("toggleAutoCollapse");
     }
 
     canActivate(args: any) {
-        super.canActivate(args);
-        var deferred = $.Deferred();
+        return $.when<any>(super.canActivate(args))
+            .then(() => {
+                const deferred = $.Deferred<canActivateResultDto>();
 
-        this.isForbidden(!accessHelper.isGlobalAdmin());
-        if (this.isForbidden()) {
-            deferred.resolve({ can: true });
-        } else {
-            var db: database = this.activeDatabase();
-            this.fetchDatabaseSettings(db)
-                .done(() => deferred.resolve({ can: true }))
-                .fail((response: JQueryXHR) => {
-                    messagePublisher.reportError("Error fetching database settings!", response.responseText, response.statusText);
-                    deferred.resolve({ redirect: appUrl.forStatus(db) });
-                });
-        }
+                this.isForbidden(!accessManager.default.clusterAdminOrClusterNode());
 
-        return deferred;
+                if (this.isForbidden()) {
+                    deferred.resolve({ can: true });
+                } else {
+                    const db: database = this.activeDatabase();
+                    this.fetchDatabaseSettings(db)
+                        .done(() => deferred.resolve({ can: true }))
+                        .fail((response: JQueryXHR) => {
+                            messagePublisher.reportError("Error fetching database settings!", response.responseText, response.statusText);
+                            deferred.resolve({ redirect: appUrl.forStatus(db) });
+                        });
+                }
+
+                return deferred;
+            });
     }
 
     activate(args: any) {
@@ -62,12 +67,27 @@ class databaseRecord extends viewModelBase {
         super.compositionComplete();
 
         var editorElement = $("#dbDocEditor");
-        if (editorElement.length > 0)
-        {
+        if (editorElement.length > 0) {
             this.docEditor = ko.utils.domData.get(editorElement[0], "aceEditor");
         }
     }
 
+    toggleAutoCollapse() {
+        this.autoCollapseMode.toggle();
+        if (this.autoCollapseMode()) {
+            this.foldAll();
+        } else {
+            this.docEditor.getSession().unfold(null, true);
+        }
+    }
+
+    foldAll() {
+        const AceRange = ace.require("ace/range").Range;
+        this.docEditor.getSession().foldAll();
+        const folds = <any[]> this.docEditor.getSession().getFoldsInRange(new AceRange(0, 0, this.docEditor.getSession().getLength(), 0));
+        folds.map(f => this.docEditor.getSession().expandFold(f));
+    }
+    
     refreshFromServer() {
         eventsCollector.default.reportEvent("database-settings", "refresh");
 

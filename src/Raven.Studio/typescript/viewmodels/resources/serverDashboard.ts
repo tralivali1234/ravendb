@@ -18,13 +18,16 @@ import clusterNode = require("models/database/cluster/clusterNode");
 import databasesManager = require("common/shell/databasesManager");
 import createDatabase = require("viewmodels/resources/createDatabase");
 import serverTime = require("common/helpers/database/serverTime");
+import accessManager = require("common/shell/accessManager");
+import utils = require("widgets/virtualGrid/virtualGridUtils");
+import driveUsageDetails = require("models/resources/serverDashboard/driveUsageDetails");
 
 class machineResourcesSection {
 
     cpuChart: dashboardChart;
     memoryChart: dashboardChart;
     
-    systemCommitLimit: number;
+    totalMemory: number;
     
     resources = ko.observable<machineResources>();
 
@@ -36,9 +39,9 @@ class machineResourcesSection {
         });
 
         this.memoryChart = new dashboardChart("#memoryChart", {
-            yMaxProvider: () => this.systemCommitLimit,
+            yMaxProvider: () => this.totalMemory,
             topPaddingProvider: () => 2,
-            tooltipProvider: data => machineResourcesSection.memoryTooltip(data)
+            tooltipProvider: data => machineResourcesSection.memoryTooltip(data, this.totalMemory)
         });
     }
     
@@ -48,7 +51,7 @@ class machineResourcesSection {
     }
     
     onData(data: Raven.Server.Dashboard.MachineResources) {
-        this.systemCommitLimit = data.SystemCommitLimit;
+        this.totalMemory = data.TotalMemory;
 
         this.cpuChart.onData(moment.utc(data.Date).toDate(),
             [
@@ -57,8 +60,7 @@ class machineResourcesSection {
             ]);
         this.memoryChart.onData(moment.utc(data.Date).toDate(),
             [
-                { key: "physical", value: data.TotalMemory },
-                { key: "machine", value: data.CommitedMemory },
+                { key: "machine", value: data.TotalMemory - data.AvailableMemory },
                 { key: "process", value: data.ProcessMemoryUsage }
             ]);
         
@@ -86,16 +88,16 @@ class machineResourcesSection {
         return null;
     }
 
-    private static memoryTooltip(data: dashboardChartTooltipProviderArgs) {
+    private static memoryTooltip(data: dashboardChartTooltipProviderArgs, totalMemory: number) {
         if (data) {
             const date = moment(data.date).format(serverDashboard.timeFormat);
-            const physical = generalUtils.formatBytesToSize(data.values['physical']); 
+            const physical = generalUtils.formatBytesToSize(totalMemory); 
             const machine = generalUtils.formatBytesToSize(data.values['machine']); 
             const process = generalUtils.formatBytesToSize(data.values['process']);
             return `<div>
                 Time: <strong>${date}</strong><br />
-                Physical memory: <strong>${physical}</strong><br />
-                Commited memory: <strong>${machine}</strong><br />
+                Usable physical memory: <strong>${physical}</strong><br />
+                Machine memory usage: <strong>${machine}</strong><br />
                 Process memory usage: <strong>${process}</strong>
                 </div>`;
         }
@@ -132,7 +134,6 @@ class indexingSpeedSection {
             items: this.table
         }), () => {
             return [
-                //TODO:  new checkedColumn(true),
                 new hyperlinkColumn<indexingSpeed>(grid, x => x.database(), x => appUrl.forIndexPerformance(x.database()), "Database", "30%"),
                 new textColumn<indexingSpeed>(grid, x => x.indexedPerSecond() != null ? x.indexedPerSecond() : "n/a", "Indexed / sec", "15%", {
                     extraClass: item => item.indexedPerSecond() != null ? "" : "na"
@@ -238,10 +239,11 @@ class databasesSection {
     
     totalOfflineDatabases = ko.observable<number>(0);
     totalOnlineDatabases = ko.observable<number>(0);
+    totalDisabledDatabases = ko.observable<number>(0);
     totalDatabases: KnockoutComputed<number>;
     
     constructor() {
-        this.totalDatabases = ko.pureComputed(() => this.totalOnlineDatabases() + this.totalOfflineDatabases());
+        this.totalDatabases = ko.pureComputed(() => this.totalOnlineDatabases() + this.totalOfflineDatabases() + this.totalDisabledDatabases());
     }
     
     init() {
@@ -249,12 +251,25 @@ class databasesSection {
 
         grid.headerVisible(true);
 
+        const iconProvider = (item: databaseItem) => {
+            if (item.online()) {
+                return '<i class="icon-database-cutout icon-addon-check"></i>';
+            } else if (item.disabled()) {
+                return '<i class="icon-database-cutout icon-addon-cancel"></i>';
+            } else {
+                return '<i class="icon-database-cutout icon-addon-clock"></i>';
+            }
+        };
+        
         grid.init((s, t) => $.when({
             totalResultCount: this.table.length,
             items: this.table
         }), () => {
-            return [
-                new hyperlinkColumn<databaseItem>(grid, x => x.database(), x => appUrl.forDocuments(null, x.database()), "Database", "30%"), 
+            return [ 
+                new hyperlinkColumn<databaseItem>(grid, x => iconProvider(x) + '<span>' + utils.escape(x.database()) + '</span>', x => appUrl.forDocuments(null, x.database()), "Database", "30%", {
+                    extraClass: x => x.disabled() ? "disabled" : "",
+                    useRawValue: () => true
+                }), 
                 new textColumn<databaseItem>(grid, x => x.documentsCount(), "Docs #", "25%"),
                 new textColumn<databaseItem>(grid, 
                         x => x.indexesCount() + ( x.erroredIndexesCount() ? ' (<span class=\'text-danger\'>' + x.erroredIndexesCount() + '</span>)' : '' ), 
@@ -301,10 +316,13 @@ class databasesSection {
     private updateTotals() {
         let totalOnline = 0;
         let totalOffline = 0;
+        let totalDisabled = 0;
         
         this.table.forEach(item => {
             if (item.online()) {
                 totalOnline++;
+            } else if (item.disabled()) {
+                totalDisabled++;
             } else {
                 totalOffline++;
             }
@@ -312,6 +330,7 @@ class databasesSection {
         
         this.totalOnlineDatabases(totalOnline);
         this.totalOfflineDatabases(totalOffline);
+        this.totalDisabledDatabases(totalDisabled);
     }
 }
 
@@ -326,8 +345,36 @@ class trafficSection {
     totalRequestsPerSecond = ko.observable<number>(0);
     totalWritesPerSecond = ko.observable<number>(0);
     totalDataWritesPerSecond = ko.observable<number>(0);
-    
-    init()  {
+
+    totalDocsWritesPerSecond = ko.observable<number>(0);
+    totalAttachmentsWritesPerSecond = ko.observable<number>(0);
+    totalCountersWritesPerSecond = ko.observable<number>(0);
+    totalDocsWriteBytesPerSecond = ko.observable<number>(0);
+    totalAttachmentsWriteBytesPerSecond = ko.observable<number>(0);
+    totalCountersWriteBytesPerSecond = ko.observable<number>(0);
+
+    writesPerSecondTooltip: KnockoutComputed<string>;
+    writeBytesPerSecondTooltip: KnockoutComputed<string>;
+
+    constructor() {
+        this.writesPerSecondTooltip = ko.pureComputed(() => {
+            return `<div>
+                    Documents: <strong>${this.totalDocsWritesPerSecond().toLocaleString()}</strong><br />
+                    Attachments: <strong>${this.totalAttachmentsWritesPerSecond().toLocaleString()}</strong><br />
+                    Counters: <strong>${this.totalCountersWritesPerSecond().toLocaleString()}</strong>
+                    </div>`;
+        });
+
+        this.writeBytesPerSecondTooltip = ko.pureComputed(() => {
+            return `<div>
+                    Documents: <strong>${this.sizeFormatter(this.totalDocsWriteBytesPerSecond())}/s</strong><br />
+                    Attachments: <strong>${this.sizeFormatter(this.totalAttachmentsWriteBytesPerSecond())}/s</strong><br />
+                    Counters: <strong>${this.sizeFormatter(this.totalCountersWriteBytesPerSecond())}/s</strong>
+                    </div>`;
+        });
+    }
+
+    init() {
         const grid = this.gridController();
 
         grid.headerVisible(true);
@@ -337,7 +384,6 @@ class trafficSection {
             items: this.table
         }), () => {
             return [
-                //TODO: new checkedColumn(true),
                 new hyperlinkColumn<trafficItem>(grid, x => x.database(), x => appUrl.forTrafficWatch(x.database()), "Database", "30%"),
                 new textColumn<trafficItem>(grid, x => x.requestsPerSecond(), "Requests / s", "20%"),
                 new textColumn<trafficItem>(grid, x => x.writesPerSecond(), "Writes / s", "25%"),
@@ -359,6 +405,8 @@ class trafficSection {
             },
             tooltipProvider: data => this.trafficTooltip(data)
         });
+
+        $('.dashboard-traffic [data-toggle="tooltip"]').tooltip();
     }
     
     onResize() {
@@ -425,13 +473,33 @@ class trafficSection {
         let totalRequests = 0;
         let writesPerSecond = 0;
         let dataWritesPerSecond = 0;
+        let docsWritesPerSeconds = 0;
+        let attachmentsWritesPerSecond = 0;
+        let countersWritesPerSecond = 0;
+        let docsWriteBytesPerSeconds = 0;
+        let attachmentsWriteBytesPerSecond = 0;
+        let countersWriteBytesPerSecond = 0;
 
         this.table.forEach(item => {
             totalRequests += item.requestsPerSecond();
             writesPerSecond += item.writesPerSecond();
             dataWritesPerSecond += item.dataWritesPerSecond();
+
+            docsWritesPerSeconds += item.docsWritesPerSeconds();
+            attachmentsWritesPerSecond += item.attachmentsWritesPerSecond();
+            countersWritesPerSecond += item.countersWritesPerSecond();
+            docsWriteBytesPerSeconds += item.docsWriteBytesPerSeconds();
+            attachmentsWriteBytesPerSecond += item.attachmentsWriteBytesPerSecond();
+            countersWriteBytesPerSecond += item.countersWriteBytesPerSecond();
         });
 
+        this.totalDocsWritesPerSecond(docsWritesPerSeconds);
+        this.totalAttachmentsWritesPerSecond(attachmentsWritesPerSecond);
+        this.totalCountersWritesPerSecond(countersWritesPerSecond);
+        this.totalDocsWriteBytesPerSecond(docsWriteBytesPerSeconds);
+        this.totalAttachmentsWriteBytesPerSecond(attachmentsWriteBytesPerSecond);
+        this.totalCountersWriteBytesPerSecond(countersWriteBytesPerSecond);
+        
         this.totalRequestsPerSecond(totalRequests);
         this.totalWritesPerSecond(writesPerSecond);
         this.totalDataWritesPerSecond(dataWritesPerSecond);
@@ -439,13 +507,58 @@ class trafficSection {
 }
 
 class driveUsageSection {
+    private data: Raven.Server.Dashboard.DrivesUsage;
     private table = ko.observableArray<driveUsage>();
     private storageChart: storagePieChart;
     
-    totalDocumentsSize = ko.observable<number>(0);
+    includeTemporaryBuffers = ko.observable<boolean>(true);
+    
+    totalDocumentsSize: KnockoutComputed<number>;
+    
+    constructor() {
+        this.totalDocumentsSize = ko.pureComputed(() => {
+            return _.sum(this.table().map(x => x.totalDocumentsSpaceUsed()));
+        });
+    }
     
     init() {
-        this.storageChart = new storagePieChart("#storageChart");
+        this.storageChart = new storagePieChart("#storageChart", db => this.highlightRowInTable(db));
+        
+        this.includeTemporaryBuffers.subscribe(() => {
+            this.table().forEach(item => {
+                item.gridController().reset(true);
+            });
+            this.updateChart(this.data, true);
+        });
+        
+        this.initTableHighlightEvents();
+    }
+
+    initTableHighlightEvents() {
+        const storageContainer = $(".dashboard-storage");
+        storageContainer.on("mouseenter", ".virtual-row", event => {
+            this.table().forEach(table => {
+                const row = table.gridController().findRowForCell(event.target);
+                if (row) {
+                    this.storageChart.highlightDatabase((row.data as driveUsageDetails).database(), storageContainer);
+                }
+            });
+        });
+
+        storageContainer.on("mouseleave", ".virtual-row", event => {
+            this.storageChart.highlightDatabase(null, storageContainer);
+        });
+    }
+    
+    private highlightRowInTable(dbName: string) {
+        this.table().forEach(usage => {
+            if (dbName) {
+                const item = usage.gridController().findItem((item, idx) => item.database() === dbName);
+                usage.gridController().setSelectedItems([item]);
+            } else {
+                usage.gridController().setSelectedItems([]);
+            }
+        });
     }
     
     onResize() {
@@ -457,9 +570,10 @@ class driveUsageSection {
     }
     
     onData(data: Raven.Server.Dashboard.DrivesUsage) {
+        this.data = data;
         const items = data.Items;
 
-        this.updateChart(data);
+        this.updateChart(data, false);
 
         const newMountPoints = items.map(x => x.MountPoint);
         const oldMountPoints = this.table().map(x => x.mountPoint());
@@ -475,43 +589,40 @@ class driveUsageSection {
             if (matched) {
                 matched.update(incomingItem);
             } else {
-                const usage = new driveUsage(incomingItem, this.storageChart.getColorProvider());
+                const usage = new driveUsage(incomingItem, this.storageChart.getColorProvider(), this.includeTemporaryBuffers);
                 this.table.push(usage);
             }
         });
-
-        this.updateTotals();
-        
     }
     
-    private updateChart(data: Raven.Server.Dashboard.DrivesUsage) {
+    private updateChart(data: Raven.Server.Dashboard.DrivesUsage, withTween: boolean) {
         const cache = new Map<string, number>();
 
+        const includeTemp = this.includeTemporaryBuffers();
+        
         // group by database size
         data.Items.forEach(mountPointUsage => {
             mountPointUsage.Items.forEach(item => {
+                const sizeToUse = includeTemp ? item.Size + item.TempBuffersSize : item.Size;
+                
                 if (cache.has(item.Database)) {
-                    cache.set(item.Database, item.Size + cache.get(item.Database));
+                    cache.set(item.Database, sizeToUse + cache.get(item.Database));
                 } else {
-                    cache.set(item.Database, item.Size);
+                    cache.set(item.Database, sizeToUse);
                 }
             });
         });
         
-        const result = [] as Raven.Server.Dashboard.DatabaseDiskUsage[];
+        const result = [] as Array<{ Database: string, Size: number }>;
         
         cache.forEach((value, key) => {
             result.push({
                 Database: key,
-                Size: value
+                Size: value,
             });
         });
 
-        this.storageChart.onData(result);
-    }
-    
-    private updateTotals() {
-        this.totalDocumentsSize(_.sum(this.table().map(x => x.totalDocumentsSpaceUsed())));
+        this.storageChart.onData(result, withTween);
     }
 }
 
@@ -521,7 +632,13 @@ class serverDashboard extends viewModelBase {
     static readonly timeFormat = "h:mm:ss A";
     liveClient = ko.observable<serverDashboardWebSocketClient>();
     
+    spinners = {
+        loading: ko.observable<boolean>(true)
+    };
+    
     clusterManager = clusterTopologyManager.default;
+    accessManager = accessManager.default.dashboardView;
+    
     formattedUpTime: KnockoutComputed<string>;
     formattedStartTime: KnockoutComputed<string>;
     node: KnockoutComputed<clusterNode>;
@@ -601,6 +718,8 @@ class serverDashboard extends viewModelBase {
     }
 
     private onData(data: Raven.Server.Dashboard.AbstractDashboardNotification) {
+        this.spinners.loading(false);
+        
         switch (data.Type) {
             case "DriveUsage":
                 this.driveUsageSection.onData(data as Raven.Server.Dashboard.DrivesUsage);

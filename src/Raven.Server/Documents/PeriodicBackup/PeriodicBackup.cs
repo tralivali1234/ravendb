@@ -2,16 +2,26 @@ using System;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Operations.Backups;
+using Raven.Server.ServerWide;
+using Sparrow.Collections;
+using Sparrow.Threading;
 
 namespace Raven.Server.Documents.PeriodicBackup
 {
-    public class PeriodicBackup
+    public class PeriodicBackup : IDisposable
     {
-        private Timer _backupTimer;
         private readonly SemaphoreSlim _updateTimerSemaphore = new SemaphoreSlim(1);
-        private readonly SemaphoreSlim _updateBackupTaskSemaphore = new SemaphoreSlim(1);
+        public readonly SemaphoreSlim UpdateBackupTaskSemaphore = new SemaphoreSlim(1);
+
+        private readonly DisposeOnce<SingleAttempt> _disposeOnce;
+
+        public Timer BackupTimer { get; private set; }
 
         public Task RunningTask { get; set; }
+
+        public long? RunningBackupTaskId { get; set; }
+
+        public OperationCancelToken CancelToken { get; set; }
 
         public DateTime StartTime { get; set; }
 
@@ -20,6 +30,19 @@ namespace Raven.Server.Documents.PeriodicBackup
         public PeriodicBackupStatus BackupStatus { get; set; }
 
         public PeriodicBackupStatus RunningBackupStatus { get; set; }
+        
+        public PeriodicBackup(ConcurrentSet<Task> inactiveRunningPeriodicBackupsTasks)
+        {
+            _disposeOnce = new DisposeOnce<SingleAttempt>(() =>
+            {
+                DisableFutureBackups();
+
+                if (RunningTask?.IsCompleted == false)
+                {
+                    inactiveRunningPeriodicBackupsTasks.Add(RunningTask);
+                }
+            });
+        }
 
         public void DisableFutureBackups()
         {
@@ -27,8 +50,14 @@ namespace Raven.Server.Documents.PeriodicBackup
 
             try
             {
-                _backupTimer?.Dispose();
-                _backupTimer = null;
+                BackupTimer?.Dispose();
+                BackupTimer = null;
+
+                try
+                {
+                    CancelToken?.Cancel();
+                }
+                catch {}
             }
             finally
             {
@@ -42,11 +71,11 @@ namespace Raven.Server.Documents.PeriodicBackup
 
             try
             {
-                if (discardIfDisabled && _backupTimer == null)
+                if (discardIfDisabled && BackupTimer == null)
                     return;
 
-                _backupTimer?.Dispose();
-                _backupTimer = newBackupTimer;
+                BackupTimer?.Dispose();
+                BackupTimer = newBackupTimer;
             }
             finally
             {
@@ -54,24 +83,14 @@ namespace Raven.Server.Documents.PeriodicBackup
             }
         }
 
-        public void UpdateBackupTask(Action action)
-        {
-            if (_updateBackupTaskSemaphore.Wait(0) == false)
-                return;
-
-            try
-            {
-                action();
-            }
-            finally
-            {
-                _updateBackupTaskSemaphore.Release();
-            }
-        }
-
         public bool HasScheduledBackup()
         {
-            return _backupTimer != null;
+            return BackupTimer != null;
+        }
+
+        public void Dispose()
+        {
+            _disposeOnce.Dispose();
         }
     }
 }

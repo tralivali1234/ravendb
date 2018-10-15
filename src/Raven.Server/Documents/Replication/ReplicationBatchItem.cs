@@ -31,6 +31,12 @@ namespace Raven.Server.Documents.Replication
 
         #endregion
 
+        #region Counter
+
+        public long Value;
+
+        #endregion
+
         public static ReplicationBatchItem From(Document doc)
         {
             return new ReplicationBatchItem
@@ -46,7 +52,7 @@ namespace Raven.Server.Documents.Replication
             };
         }
 
-        public static ReplicationBatchItem From(DocumentTombstone doc)
+        public static ReplicationBatchItem From(Tombstone doc)
         {
             var item = new ReplicationBatchItem
             {
@@ -58,17 +64,21 @@ namespace Raven.Server.Documents.Replication
 
             switch (doc.Type)
             {
-                case DocumentTombstone.TombstoneType.Document:
+                case Tombstone.TombstoneType.Document:
                     item.Type = ReplicationItemType.DocumentTombstone;
                     item.Collection = doc.Collection;
                     item.Flags = doc.Flags;
                     item.LastModifiedTicks = doc.LastModified.Ticks;
                     break;
-                case DocumentTombstone.TombstoneType.Attachment:
+                case Tombstone.TombstoneType.Attachment:
                     item.Type = ReplicationItemType.AttachmentTombstone;
                     break;
-                case DocumentTombstone.TombstoneType.Revision:
+                case Tombstone.TombstoneType.Revision:
                     item.Type = ReplicationItemType.RevisionTombstone;
+                    item.Collection = doc.Collection;
+                    break;
+                case Tombstone.TombstoneType.Counter:
+                    item.Type = ReplicationItemType.CounterTombstone;
                     item.Collection = doc.Collection;
                     break;
                 default:
@@ -117,7 +127,9 @@ namespace Raven.Server.Documents.Replication
             Attachment = 3,
             AttachmentStream = 4,
             AttachmentTombstone = 5,
-            RevisionTombstone = 6
+            RevisionTombstone = 6,
+            Counter = 7,
+            CounterTombstone = 8
         }
     }
 }

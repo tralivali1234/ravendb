@@ -5,6 +5,7 @@ using System.Diagnostics;
 using System.IO;
 using Sparrow.Compression;
 using Sparrow.Utils;
+using Voron.Data;
 using Voron.Global;
 using Voron.Impl.Paging;
 
@@ -158,6 +159,28 @@ namespace Voron.Impl.Journal
                 {
                     Memory.Copy(pagePtr, outputPage + totalRead, pageInfoPtr[i].Size);
                     totalRead += pageInfoPtr[i].Size;
+
+                    if (options.EncryptionEnabled)
+                    {
+                        var pageHeader = (PageHeader*)pagePtr;
+
+                        if ((pageHeader->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                        {
+                            // need to mark overlapped buffers as invalid for commit
+
+                            var encryptionBuffers = ((IPagerLevelTransactionState)this).CryptoPagerTransactionState[_dataPager].LoadedBuffers;
+
+                            var numberOfPages = VirtualPagerLegacyExtensions.GetNumberOfOverflowPages(pageHeader->OverflowSize);
+
+                            for (var j = 1; j < numberOfPages; j++)
+                            {
+                                if (encryptionBuffers.TryGetValue(pageNumber + j, out var buffer))
+                                {
+                                    buffer.SkipOnTxCommit = true;
+                                }
+                            }
+                        }
+                    }
                 }
                 else
                 {
@@ -177,12 +200,16 @@ namespace Voron.Impl.Journal
             return true;
         }
 
-        public void RecoverAndValidate(StorageEnvironmentOptions options)
+        public int RecoverAndValidate(StorageEnvironmentOptions options, TransactionHeader[] transactionHeaders)
         {
+            int index = 0;
             while (ReadOneTransactionToDataFile(options))
             {
+                transactionHeaders[index++] = *LastTransactionHeader;
             }
             ZeroRecoveryBufferIfNeeded(this, options);
+
+            return index;
         }
 
         public void ZeroRecoveryBufferIfNeeded(IPagerLevelTransactionState tx, StorageEnvironmentOptions options)
@@ -190,6 +217,7 @@ namespace Voron.Impl.Journal
             if (options.EncryptionEnabled == false)
                 return;
             var recoveryBufferSize = _recoveryPager.NumberOfAllocatedPages * Constants.Storage.PageSize;
+            _recoveryPager.EnsureMapped(tx, 0, checked((int)_recoveryPager.NumberOfAllocatedPages));
             var pagePointer = _recoveryPager.AcquirePagePointer(tx, 0);
             Sodium.sodium_memzero(pagePointer, (UIntPtr)recoveryBufferSize);
         }
@@ -340,8 +368,6 @@ namespace Voron.Impl.Journal
             if (hashIsValid == false)
             {
                 RequireHeaderUpdate = true;
-                options.InvokeRecoveryError(this, "Transaction " + current->TransactionId + " was not committed",
-                    null);
                 return false;
             }
 
@@ -434,6 +460,8 @@ namespace Voron.Impl.Journal
         StorageEnvironment IPagerLevelTransactionState.Environment => null;
 
         // JournalReader actually writes to the data file
-        bool IPagerLevelTransactionState.IsWriteTransaction => true; 
+        bool IPagerLevelTransactionState.IsWriteTransaction => true;
+
+        public long NumberOfAllocated4Kb => _journalPagerNumberOfAllocated4Kb;
     }
 }

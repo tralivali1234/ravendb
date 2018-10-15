@@ -1,8 +1,10 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
 using System.Threading;
+using System.Threading.Tasks;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Smuggler;
@@ -28,15 +30,14 @@ namespace Raven.Server.Smuggler.Documents
         private readonly SystemTime _time;
         private readonly Action<IOperationProgress> _onProgress;
         private readonly SmugglerPatcher _patcher;
-        private CancellationToken _token;
+        private readonly CancellationToken _token;
 
         public Action<IndexDefinitionAndType> OnIndexAction;
         public Action<DatabaseRecord> OnDatabaseRecordAction;
-        public Action<(string Prefix, long Value)> OnIdentityAction;
 
-        public DatabaseSmuggler(DocumentDatabase database, ISmugglerSource source, ISmugglerDestination destination, SystemTime time, 
-            DatabaseSmugglerOptionsServerSide options = null, SmugglerResult result = null, Action<IOperationProgress> onProgress = null, 
-            CancellationToken token = default(CancellationToken))
+        public DatabaseSmuggler(DocumentDatabase database, ISmugglerSource source, ISmugglerDestination destination, SystemTime time,
+            DatabaseSmugglerOptionsServerSide options = null, SmugglerResult result = null, Action<IOperationProgress> onProgress = null,
+            CancellationToken token = default)
         {
             _database = database;
             _source = source;
@@ -55,6 +56,7 @@ namespace Raven.Server.Smuggler.Documents
         public SmugglerResult Execute(bool ensureStepsProcessed = true)
         {
             var result = _result ?? new SmugglerResult();
+
             using (_patcher?.Initialize())
             using (_source.Initialize(_options, result, out long buildVersion))
             using (_destination.Initialize(_options, result, buildVersion))
@@ -84,6 +86,7 @@ namespace Raven.Server.Smuggler.Documents
             EnsureStepProcessed(result.Documents.Attachments);
             EnsureStepProcessed(result.RevisionDocuments);
             EnsureStepProcessed(result.RevisionDocuments.Attachments);
+            EnsureStepProcessed(result.Counters);
             EnsureStepProcessed(result.Tombstones);
             EnsureStepProcessed(result.Conflicts);
             EnsureStepProcessed(result.Indexes);
@@ -163,14 +166,22 @@ namespace Raven.Server.Smuggler.Documents
                 case DatabaseItemType.CompareExchange:
                     counts = ProcessCompareExchange(result);
                     break;
+                case DatabaseItemType.Counters:
+                    counts = ProcessCounters(result);
+                    break;
                 default:
                     throw new ArgumentOutOfRangeException(nameof(type), type, null);
             }
 
-            counts.Processed = true;
+            if (ensureStepsProcessed)
+            {
+                counts.Processed = true;
 
-            if (counts is SmugglerProgressBase.CountsWithLastEtag countsWithEtag)
-                countsWithEtag.Attachments.Processed = true;
+                if (counts is SmugglerProgressBase.CountsWithLastEtag countsWithEtag)
+                {
+                    countsWithEtag.Attachments.Processed = true;
+                }
+            }
 
             result.AddInfo($"Finished processing {type}. {counts}");
             _onProgress.Invoke(result.Progress);
@@ -208,6 +219,9 @@ namespace Raven.Server.Smuggler.Documents
                 case DatabaseItemType.CompareExchange:
                     counts = result.CompareExchange;
                     break;
+                case DatabaseItemType.Counters:
+                    counts = result.Counters;
+                    break;
                 case DatabaseItemType.LegacyDocumentDeletions:
                     counts = new SmugglerProgressBase.Counts();
                     break;
@@ -217,6 +231,9 @@ namespace Raven.Server.Smuggler.Documents
 
             void OnSkipped(long skipped)
             {
+                if (ensureStepProcessed == false)
+                    return;
+
                 if (type == DatabaseItemType.Documents)
                     result.Documents.SkippedCount = skipped;
 
@@ -227,7 +244,7 @@ namespace Raven.Server.Smuggler.Documents
                 _onProgress.Invoke(result.Progress);
             }
 
-            var numberOfItemsSkipped = _source.SkipType(type, onSkipped: OnSkipped);
+            var numberOfItemsSkipped = _source.SkipType(type, OnSkipped, _token);
 
             if (ensureStepProcessed == false)
                 return;
@@ -249,14 +266,13 @@ namespace Raven.Server.Smuggler.Documents
         private SmugglerProgressBase.Counts ProcessIdentities(SmugglerResult result)
         {
             using (var actions = _destination.Identities())
-            using (_source.GetIdentities(out var identities))
             {
-                foreach (var kvp in identities)
+                foreach (var kvp in _source.GetIdentities())
                 {
                     _token.ThrowIfCancellationRequested();
                     result.Identities.ReadCount++;
 
-                    if (kvp.Equals(default(ValueTuple<string, long>)))
+                    if (kvp.Equals(default))
                     {
                         result.Identities.ErroredCount++;
                         continue;
@@ -327,6 +343,8 @@ namespace Raven.Server.Smuggler.Documents
                             break;
                         case IndexType.Map:
                         case IndexType.MapReduce:
+                        case IndexType.JavaScriptMap:
+                        case IndexType.JavaScriptMapReduce:
                             var indexDefinition = (IndexDefinition)index.IndexDefinition;
                             if (string.Equals(indexDefinition.Name, "Raven/DocumentsByEntityName", StringComparison.OrdinalIgnoreCase))
                             {
@@ -376,7 +394,7 @@ namespace Raven.Server.Smuggler.Documents
                 var exceptionMessage = e.Message;
                 if (exceptionMessage.Contains("CS1501") && exceptionMessage.Contains("'LoadDocument'"))
                 {
-                    exceptionMessage = 
+                    exceptionMessage =
                             "LoadDocument requires a second argument which is a collection name of the loaded document" + Environment.NewLine +
                             "For example: " + Environment.NewLine +
                                 "\tfrom doc in doc.Orders" + Environment.NewLine +
@@ -478,7 +496,7 @@ namespace Raven.Server.Smuggler.Documents
         {
             using (var actions = _destination.Documents())
             {
-                foreach (var item in _source.GetDocuments(_options.Collections, actions))
+                foreach (DocumentItem item in _source.GetDocuments(_options.Collections, actions))
                 {
                     _token.ThrowIfCancellationRequested();
                     result.Documents.ReadCount++;
@@ -524,7 +542,13 @@ namespace Raven.Server.Smuggler.Documents
                         }
                     }
 
+                    item.Document.Flags = item.Document.Flags.Strip(DocumentFlags.FromClusterTransaction);
                     item.Document.NonPersistentFlags |= NonPersistentDocumentFlags.FromSmuggler;
+
+                    if (_options.SkipRevisionCreation)
+                    {
+                        item.Document.NonPersistentFlags |= NonPersistentDocumentFlags.SkipRevisionCreation;
+                    }
 
                     actions.WriteDocument(item, result.Documents);
 
@@ -537,15 +561,15 @@ namespace Raven.Server.Smuggler.Documents
 
         private SmugglerProgressBase.Counts ProcessCompareExchange(SmugglerResult result)
         {
-            using (var actions = _destination.CompareExchange())
-            using (_source.GetCompareExchangeValues(out var compareExchange))
+            using (_database.DocumentsStorage.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+            using (var actions = _destination.CompareExchange(context))
             {
-                foreach (var kvp in compareExchange)
+                foreach (var kvp in _source.GetCompareExchangeValues())
                 {
                     _token.ThrowIfCancellationRequested();
                     result.CompareExchange.ReadCount++;
 
-                    if (kvp.Equals(default((string, long, BlittableJsonReaderObject))))
+                    if (kvp.Equals(default))
                     {
                         result.CompareExchange.ErroredCount++;
                         continue;
@@ -558,12 +582,37 @@ namespace Raven.Server.Smuggler.Documents
                     catch (Exception e)
                     {
                         result.CompareExchange.ErroredCount++;
-                        result.AddError($"Could not write compare exhcnage '{kvp.key}->{kvp.value}': {e.Message}");
+                        result.AddError($"Could not write compare exchange '{kvp.key}->{kvp.value}': {e.Message}");
                     }
                 }
             }
 
             return result.CompareExchange;
+        }
+
+        private SmugglerProgressBase.Counts ProcessCounters(SmugglerResult result)
+        {
+            using (var actions = _destination.Counters())
+            {
+                foreach (var counterDetail in _source.GetCounterValues())
+                {
+                    _token.ThrowIfCancellationRequested();
+                    result.Counters.ReadCount++;
+
+                    if (result.Counters.ReadCount % 1000 == 0)
+                    {
+                        var message = $"Read {result.Counters.ReadCount:#,#;;0} counters.";
+                        result.AddInfo(message);
+                        _onProgress.Invoke(result.Progress);
+                    }
+
+                    actions.WriteCounter(counterDetail);
+
+                    result.Counters.LastEtag = counterDetail.Etag;
+                }
+            }
+
+            return result.Counters;
         }
 
         private SmugglerProgressBase.Counts ProcessLegacyAttachments(SmugglerResult result)
@@ -684,6 +733,7 @@ namespace Raven.Server.Smuggler.Documents
                     if (tombstone.LowerId == null)
                         ThrowInvalidData();
 
+                    tombstone.Flags = tombstone.Flags.Strip(DocumentFlags.FromClusterTransaction);
                     actions.WriteTombstone(tombstone, result.Tombstones);
 
                     result.Tombstones.LastEtag = tombstone.Etag;
@@ -759,7 +809,7 @@ namespace Raven.Server.Smuggler.Documents
             // "Raven/Backup/Status" and 
             // "Raven/Backup/Periodic/Status"
             if (document.Id.Size != 34 && document.Id.Size != 62 &&
-                document.Id.Size != 30 && document.Id.Size != 27 && 
+                document.Id.Size != 30 && document.Id.Size != 27 &&
                 document.Id.Size != 19 && document.Id.Size != 28)
                 return false;
 

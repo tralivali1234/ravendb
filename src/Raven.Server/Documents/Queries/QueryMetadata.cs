@@ -13,7 +13,10 @@ using Raven.Client.Documents.Queries.Facets;
 using Raven.Client.Exceptions;
 using Raven.Client.Util;
 using Raven.Server.Documents.Queries.AST;
+using Raven.Server.Documents.Queries.Counters;
+using Raven.Server.Documents.Queries.Explanation;
 using Raven.Server.Documents.Queries.Facets;
+using Raven.Server.Documents.Queries.Highlightings;
 using Raven.Server.Documents.Queries.Parser;
 using Raven.Server.Documents.Queries.Suggestions;
 using Sparrow;
@@ -50,13 +53,31 @@ namespace Raven.Server.Documents.Queries
             else
                 IndexName = fromToken.FieldValue;
 
-            if (IsDynamic == false || IsGroupBy || IsDistinct)
+            if (IsDynamic == false || IsGroupBy)
                 IsCollectionQuery = false;
+
+            if (IsGroupBy && IsDynamic == false)
+                throw new ArgumentException("Can't use 'group by' when querying on an Index. 'group by' can be used only when querying on collections.");
+
+            DeclaredFunctions = Query.DeclaredFunctions;
 
             Build(parameters);
 
             CanCache = cacheKey != 0;
+
+            IsOptimizedSortOnly = IsCollectionQuery == false
+                                  && WhereFields.Count == 0
+                                  && OrderBy?.Length == 1
+                                  && (OrderBy[0].OrderingType == OrderByFieldType.Implicit || OrderBy[0].OrderingType == OrderByFieldType.String)
+                                  && HasExplanations == false
+                                  && HasHighlightings == false
+                                  && IsDistinct == false;
+
+            CreatedAt = DateTime.UtcNow;
+            LastQueriedAt = CreatedAt;
         }
+
+        public readonly bool IsOptimizedSortOnly;
 
         public readonly bool IsDistinct;
 
@@ -70,11 +91,23 @@ namespace Raven.Server.Documents.Queries
 
         public bool HasMoreLikeThis { get; private set; }
 
+        public bool HasBoost { get; private set; }
+
         public bool HasIntersect { get; private set; }
 
         public bool HasCmpXchg { get; private set; }
 
+        public bool HasHighlightings { get; private set; }
+
+        public bool HasExplanations { get; private set; }
+
+        public bool HasTimings { get; private set; }
+
+        public bool HasCounters { get; private set; }
+
         public bool IsCollectionQuery { get; private set; } = true;
+
+        public Dictionary<StringSegment, (string FunctionText, Esprima.Ast.Program Program)> DeclaredFunctions { get; }
 
         public readonly string CollectionName;
 
@@ -96,6 +129,12 @@ namespace Raven.Server.Documents.Queries
 
         public SelectField[] SelectFields;
 
+        public HighlightingField[] Highlightings;
+
+        public ExplanationField Explanation;
+
+        public CounterIncludesField CounterIncludes;
+
         public readonly ulong CacheKey;
 
         public readonly bool CanCache;
@@ -103,6 +142,12 @@ namespace Raven.Server.Documents.Queries
         public string[] Includes;
 
         public bool HasIncludeOrLoad;
+
+        public bool HasOrderByRandom;
+
+        public DateTime CreatedAt;
+
+        public DateTime LastQueriedAt;
 
         private void AddExistField(QueryFieldName fieldName, BlittableJsonReaderObject parameters)
         {
@@ -122,13 +167,13 @@ namespace Raven.Server.Documents.Queries
         {
             var indexFieldName = GetIndexFieldName(fieldName, parameters);
 
-            if (operatorType == null && 
+            if (operatorType == null &&
                 // to support startsWith(id(), ...)
                 string.Equals(methodName, "startsWith", StringComparison.OrdinalIgnoreCase))
                 operatorType = OperatorType.Equal;
 
-            if (search || exact || spatial != null || isNegated || 
-                operatorType != OperatorType.Equal )
+            if (search || exact || spatial != null || isNegated ||
+                operatorType != OperatorType.Equal)
             {
                 IsCollectionQuery = false;
             }
@@ -208,7 +253,7 @@ namespace Raven.Server.Documents.Queries
                         ThrowInvalidOperatorTypeInOrderBy(order.Expression.Type.ToString(), QueryText, parameters);
                     }
 
-                    if (IsCollectionQuery && (OrderBy.Length > 1 || OrderBy[0].OrderingType != OrderByFieldType.Random))
+                    if (IsCollectionQuery && OrderBy.Length > 0)
                         IsCollectionQuery = false;
                 }
             }
@@ -269,7 +314,7 @@ namespace Raven.Server.Documents.Queries
             {
                 if (callExpression.Callee is Identifier identifier)
                 {
-                    if (identifier.Name == "load")
+                    if (identifier.Name == "load" || identifier.Name == "include")
                     {
                         HasIncludeOrLoad = true;
                     }
@@ -279,37 +324,137 @@ namespace Raven.Server.Documents.Queries
 
         private void ThrowInvalidMethod(BlittableJsonReaderObject parameters, MethodExpression me)
         {
-            throw new InvalidQueryException("Where clause cannot conatin just an '" + me.Name + "' method", Query.QueryText, parameters);
+            throw new InvalidQueryException("Where clause cannot contain just an '" + me.Name + "' method", Query.QueryText, parameters);
         }
 
         private void HandleQueryInclude(BlittableJsonReaderObject parameters)
         {
-            HasIncludeOrLoad = true;
+            List<string> includes = null;
+            List<HighlightingField> highlightings = null;
 
-            var includes = new List<string>();
-            foreach (var include in Query.Include)
+            void AddInclude(QueryExpression include, string path)
             {
-                string path;
+                var expressionPath = ParseExpressionPath(include, path, Query.From.Alias);
 
-                if (include is FieldExpression fe)
-                {
-                    path = fe.FieldValue;
-                }
-                else if (include is ValueExpression ve)
-                {
-                    path = ve.Token;
-                }
-                else
-                {
-                    throw new InvalidQueryException("Unable to figure out how to deal with include of type " + include.Type, QueryText, parameters);
-                }
+                if (includes == null)
+                    includes = new List<string>();
 
-                var expressionPath = ParseExpressionPath(include, path, parameters);
                 includes.Add(expressionPath.Path);
             }
-            Includes = includes.ToArray();
+
+            foreach (var include in Query.Include)
+            {
+                switch (include)
+                {
+                    case FieldExpression fe:
+                        HasIncludeOrLoad = true;
+
+                        AddInclude(include, fe.FieldValue);
+                        break;
+                    case ValueExpression ve:
+                        HasIncludeOrLoad = true;
+
+                        AddInclude(include, ve.Token);
+                        break;
+                    case MethodExpression me:
+                        var methodType = QueryMethod.GetMethodType(me.Name);
+                        switch (methodType)
+                        {
+                            case MethodType.Highlight:
+                                if (IsGroupBy)
+                                    throw new InvalidQueryException("Dynamic group by queries cannot have highlighting.", QueryText, parameters);
+
+                                HasHighlightings = true;
+
+                                QueryValidator.ValidateHighlight(me.Arguments, QueryText, parameters);
+
+                                if (highlightings == null)
+                                    highlightings = new List<HighlightingField>();
+
+                                highlightings.Add(CreateHighlightingField(me, parameters));
+                                break;
+                            case MethodType.Explanation:
+                                if (IsCollectionQuery)
+                                    throw new InvalidQueryException("Collection queries cannot return explanations.", QueryText, parameters);
+
+                                if (HasExplanations)
+                                    throw new InvalidQueryException("Query cannot include duplicate explanations.", QueryText, parameters);
+
+                                QueryValidator.ValidateExplanations(me.Arguments, QueryText, parameters);
+
+                                Explanation = CreateExplanationField(me);
+                                HasExplanations = true;
+                                break;
+                            case MethodType.Timings:
+                                QueryValidator.ValidateTimings(me.Arguments, QueryText, parameters);
+                                HasTimings = true;
+                                break;
+                            case MethodType.Counters:
+                                QueryValidator.ValidateIncludeCounter(me.Arguments, QueryText, parameters);
+
+                                if (CounterIncludes == null)
+                                {
+                                    CounterIncludes = new CounterIncludesField();
+                                    HasCounters = true;
+                                }
+
+                                AddToCounterIncludes(CounterIncludes, me, parameters);
+                                break;
+                            default:
+                                throw new InvalidQueryException($"Unable to figure out how to deal with include method '{methodType}'", QueryText, parameters);
+                        }
+                        break;
+                    default:
+                        throw new InvalidQueryException("Unable to figure out how to deal with include of type " + include.Type, QueryText, parameters);
+                }
+            }
+
+            if (HasIncludeOrLoad)
+                Includes = includes?.ToArray();
+
+            if (HasHighlightings)
+                Highlightings = highlightings?.ToArray();
         }
 
+        private static ExplanationField CreateExplanationField(MethodExpression expression)
+        {
+            var result = new ExplanationField();
+
+            if (expression.Arguments.Count == 1)
+            {
+                var ve = (ValueExpression)expression.Arguments[0];
+                result.AddOptions(ve.Token, ve.Value);
+            }
+
+            return result;
+        }
+
+        private HighlightingField CreateHighlightingField(MethodExpression expression, BlittableJsonReaderObject parameters)
+        {
+            var fieldName = ExtractFieldNameFromFirstArgument(expression.Arguments, expression.Name, parameters);
+
+            var result = new HighlightingField(fieldName);
+
+            for (var i = 1; i < expression.Arguments.Count; i++)
+            {
+                var ve = (ValueExpression)expression.Arguments[i];
+
+                switch (i)
+                {
+                    case 1:
+                        result.AddFragmentLength(ve.Token, ve.Value);
+                        break;
+                    case 2:
+                        result.AddFragmentCount(ve.Token, ve.Value);
+                        break;
+                    case 3:
+                        result.AddOptions(ve.Token, ve.Value);
+                        break;
+                }
+            }
+
+            return result;
+        }
 
         private void HandleSelectFunctionBody(BlittableJsonReaderObject parameters)
         {
@@ -360,6 +505,79 @@ namespace Raven.Server.Documents.Queries
             SelectFields = new[] { SelectField.CreateMethodCall(name, null, args) };
         }
 
+        private void AddToCounterIncludes(CounterIncludesField counterIncludes, MethodExpression expression, BlittableJsonReaderObject parameters)
+        {
+            string sourcePath = null;
+            var start = 0;
+            if (expression.Arguments.Count > 0 &&
+                expression.Arguments[0] is FieldExpression fe)
+            {
+                start = 1;
+
+                if (Query.From.Alias?.Value != fe.FieldValue)
+                {
+                    if (RootAliasPaths.TryGetValue(fe.FieldValue, out var value))
+                    {
+                        sourcePath = value.PropertyPath;
+                    }
+
+                    else if (fe.FieldValue != null)
+                    {
+                        if (Query.From.Alias?.Value == null)
+                        {
+                            sourcePath = fe.FieldValue;
+                        }
+                        else
+                        {
+                            var split = fe.FieldValue.Split('.');
+                            if (split.Length >= 2 &&
+                                split[0] == Query.From.Alias.Value)
+                            {
+                                sourcePath = fe.FieldValue.Substring(split[0].Length + 1);
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (start == expression.Arguments.Count)
+            {
+                counterIncludes.Counters[sourcePath ?? string.Empty] = new HashSet<string>();
+                return;
+            }
+
+            for (var index = start; index < expression.Arguments.Count; index++)
+            {
+                if (!(expression.Arguments[index] is ValueExpression vt))
+                    continue;
+
+                if (vt.Value == ValueTokenType.Parameter)
+                {
+                    foreach (var v in QueryBuilder.GetValues(Query, this, parameters, vt))
+                    {
+                        AddCounterToInclude(counterIncludes, parameters, v, sourcePath);
+                    }
+
+                    continue;
+                }
+
+                var value = QueryBuilder.GetValue(Query, this, parameters, vt);
+
+                AddCounterToInclude(counterIncludes, parameters, value, sourcePath);
+
+            }
+        }
+
+        private void AddCounterToInclude(CounterIncludesField counterIncludes, BlittableJsonReaderObject parameters,
+            (object Value, ValueTokenType Type) parameterValue, string sourcePath)
+        {
+            if (parameterValue.Type != ValueTokenType.String)
+                throw new InvalidQueryException("Parameters of method `counters` must be of type `string` or `string[]`, " +
+                                                $"but got `{parameterValue.Value}` of type `{parameterValue.Type}`", QueryText, parameters);
+
+            counterIncludes.AddCounter(parameterValue.Value.ToString(), sourcePath);
+        }
+
         private void ThrowUseOfReserveFunctionBodyMethodName(BlittableJsonReaderObject parameters)
         {
             throw new InvalidQueryException("When using select function body, the '__selectOutput' function is reserved",
@@ -378,17 +596,17 @@ namespace Raven.Server.Documents.Queries
                 parameters);
         }
 
-        private (string Path, string LoadFromAlias) ParseExpressionPath(QueryExpression expr, string path, BlittableJsonReaderObject parameters)
+        public static (string Path, string LoadFromAlias) ParseExpressionPath(QueryExpression expr, string path, StringSegment? alias)
         {
             var indexOf = path.IndexOf('.');
-            if (indexOf == -1 || Query.From.Alias == null)
+            if (indexOf == -1 || alias == null)
                 return (path, null);
 
-            Debug.Assert(Query.From.Alias != null);
+            Debug.Assert(alias != null);
 
             var compare = string.Compare(
-                Query.From.Alias.Value.Buffer,
-                Query.From.Alias.Value.Offset,
+                alias.Value.Buffer,
+                alias.Value.Offset,
                 path, 0, indexOf, StringComparison.OrdinalIgnoreCase);
 
             return compare != 0 ? (path.Substring(indexOf + 1), path.Substring(0, indexOf)) : (path.Substring(indexOf + 1), null);
@@ -422,7 +640,7 @@ namespace Raven.Server.Documents.Queries
                 }
                 else
                 {
-                    ThrowInvalidWith(load.Expression, "LOAD clause require a field or value refereces", parameters);
+                    ThrowInvalidWith(load.Expression, "LOAD clause require a field or value references", parameters);
                     return; // never hit
                 }
 
@@ -434,7 +652,7 @@ namespace Raven.Server.Documents.Queries
                 }
 
                 string loadFromAlias;
-                (path, loadFromAlias) = ParseExpressionPath(load.Expression, path, parameters);
+                (path, loadFromAlias) = ParseExpressionPath(load.Expression, path, Query.From.Alias);
 
                 if (RootAliasPaths.TryAdd(alias, (path, array, parameter, quoted, loadFromAlias)) == false)
                 {
@@ -460,6 +678,8 @@ namespace Raven.Server.Documents.Queries
             }
             if (me.Name.Equals("random", StringComparison.OrdinalIgnoreCase))
             {
+                HasOrderByRandom = true;
+
                 if (me.Arguments == null || me.Arguments.Count == 0)
                     return new OrderByField(null, OrderByFieldType.Random, asc);
 
@@ -730,6 +950,35 @@ namespace Raven.Server.Documents.Queries
                         return CreateSuggest(me, alias, parameters);
                     }
 
+                    if (string.Equals("counter", methodName, StringComparison.OrdinalIgnoreCase)
+                        || string.Equals("counterRaw", methodName, StringComparison.OrdinalIgnoreCase))
+                    {
+                        if (HasFacet)
+                            ThrowFacetQueryMustContainsOnlyFacetInSelect(me, parameters);
+
+                        if (me.Arguments.Count == 0 || me.Arguments.Count > 2)
+                            ThrowInvalidNumberOfArgumentsForCounter(methodName, parameters, me.Arguments.Count);
+
+                        var args = new SelectField[me.Arguments.Count];
+                        for (int i = 0; i < me.Arguments.Count; i++)
+                        {
+                            if (me.Arguments[i] is ValueExpression vt)
+                                args[i] = SelectField.CreateValue(vt.Token, alias, vt.Value);
+                            else if (me.Arguments[i] is FieldExpression ft)
+                                args[i] = GetSelectValue(null, ft, parameters);
+                            else
+                                ThrowCounterInvalidArgument(methodName, me.Arguments[i], parameters);
+                        }
+
+                        var counterField = SelectField.CreateCounterField(alias, args);
+                        if (string.Equals("counterRaw", methodName, StringComparison.OrdinalIgnoreCase))
+                        {
+                            counterField.FunctionArgs = new SelectField[0];
+                        }
+
+                        return counterField;
+                    }
+
                     if (IsGroupBy == false)
                         ThrowUnknownMethodInSelect(methodName, QueryText, parameters);
 
@@ -943,7 +1192,7 @@ namespace Raven.Server.Documents.Queries
 
         public QueryFieldName GetIndexFieldName(FieldExpression fe, BlittableJsonReaderObject parameters)
         {
-            if (_aliasToName.TryGetValue(fe.Compound[0], out var indexFieldName) && 
+            if (_aliasToName.TryGetValue(fe.Compound[0], out var indexFieldName) &&
                 fe.Compound[0] != Query.From.Alias)
             {
                 if (fe.Compound.Count != 1)
@@ -1134,7 +1383,7 @@ namespace Raven.Server.Documents.Queries
 
         private void ThrowInvalidFacetUsingSetupDocument(BlittableJsonReaderObject parameters)
         {
-            throw new InvalidQueryException("facet() specyfying a facet setup document using id() call must not have any additional arguments", QueryText, parameters);
+            throw new InvalidQueryException("facet() specifying a facet setup document using id() call must not have any additional arguments", QueryText, parameters);
         }
 
         private void ThrowInvalidArgumentExpressionInFacetQuery(QueryExpression expression, BlittableJsonReaderObject parameters)
@@ -1175,6 +1424,17 @@ namespace Raven.Server.Documents.Queries
         private void ThrowSuggestMethodMustHaveTwoOrThreeArguments(int count, BlittableJsonReaderObject parameters)
         {
             throw new InvalidQueryException($"Method suggest() must contain two or three arguments but '{count}' were specified", QueryText, parameters);
+        }
+
+        private void ThrowInvalidNumberOfArgumentsForCounter(string methodName, BlittableJsonReaderObject parameters, int argsCount)
+        {
+            throw new InvalidQueryException($"There is no overload of method '{methodName}' that takes {argsCount} arguments. " +
+                                            $"Supported overloads are : {methodName}(name), {methodName}(doc, name).", QueryText, parameters);
+        }
+
+        private void ThrowCounterInvalidArgument(string methodName, QueryExpression expression, BlittableJsonReaderObject parameters)
+        {
+            throw new InvalidQueryException($"Invalid argument of type {expression.GetType().Name} specified as an argument of {methodName}(). Text: {expression.GetText(null)}.", QueryText, parameters);
         }
 
         private class FillWhereFieldsAndParametersVisitor : WhereExpressionVisitor
@@ -1230,7 +1490,7 @@ namespace Raven.Server.Documents.Queries
                             VisitFieldToken(leftSide, rightSide, parameters, null);
                             break;
                         default:
-                            throw new ArgumentException($"The method {methodType} on the left side inside the WHERE clausel is not supported.");
+                            throw new ArgumentException($"The method {methodType} on the left side inside the WHERE clause is not supported.");
                     }
                 }
 
@@ -1411,7 +1671,7 @@ namespace Raven.Server.Documents.Queries
                         _metadata.AddExistField(fieldName, parameters);
                         break;
                     case MethodType.Boost:
-
+                        _metadata.HasBoost = true;
                         var firstArg = arguments.Count == 0 ? null : arguments[0];
 
                         if (firstArg == null)
@@ -1453,10 +1713,63 @@ namespace Raven.Server.Documents.Queries
                     case MethodType.MoreLikeThis:
                         HandleMoreLikeThis(methodName, arguments, parameters);
                         return;
+                    case MethodType.Fuzzy:
+                        HandleFuzzy(methodName, arguments, parameters);
+                        return;
+                    case MethodType.Proximity:
+                        HandleProximity(methodName, arguments, parameters);
+                        return;
                     default:
                         QueryMethod.ThrowMethodNotSupported(methodType, QueryText, parameters);
                         break;
                 }
+            }
+
+            private void HandleProximity(string methodName, List<QueryExpression> arguments, BlittableJsonReaderObject parameters)
+            {
+                if (arguments.Count != 2)
+                    throw new InvalidQueryException($"Method {methodName}() expects to have two arguments", QueryText, parameters);
+
+                var firstArgument = arguments[0] as MethodExpression;
+                if (firstArgument == null)
+                    throw new InvalidQueryException($"Method {methodName}() expects that first argument will be a method expression", QueryText, parameters);
+
+                var method = QueryMethod.GetMethodType(firstArgument.Name);
+                if (method != MethodType.Search)
+                    throw new InvalidQueryException($"Method {methodName}() expects that first argument will be a search method", QueryText, parameters);
+
+                var secondArgument = arguments[1];
+                if (secondArgument is ValueExpression == false)
+                    throw new InvalidQueryException($"Method {methodName}() expects that second argument will be a value", QueryText, parameters);
+
+                var value = QueryBuilder.GetValue(_metadata.Query, _metadata, parameters, secondArgument);
+                if (value.Type != ValueTokenType.Long)
+                    throw new InvalidQueryException($"Method {methodName}() expects that second argument will be a number", QueryText, parameters);
+
+                Visit(firstArgument, parameters);
+            }
+
+            private void HandleFuzzy(string methodName, List<QueryExpression> arguments, BlittableJsonReaderObject parameters)
+            {
+                if (arguments.Count != 2)
+                    throw new InvalidQueryException($"Method {methodName}() expects to have two arguments", QueryText, parameters);
+
+                var firstArgument = arguments[0] as BinaryExpression;
+                if (firstArgument == null)
+                    throw new InvalidQueryException($"Method {methodName}() expects that first argument will be a binary expression", QueryText, parameters);
+
+                if (firstArgument.Operator != OperatorType.Equal)
+                    throw new InvalidQueryException($"Method {methodName}() expects that first argument will be a binary expression with equals operator", QueryText, parameters);
+
+                var secondArgument = arguments[1];
+                if (secondArgument is ValueExpression == false)
+                    throw new InvalidQueryException($"Method {methodName}() expects that second argument will be a value", QueryText, parameters);
+
+                var value = QueryBuilder.GetValue(_metadata.Query, _metadata, parameters, secondArgument);
+                if (value.Type != ValueTokenType.Long && value.Type != ValueTokenType.Double)
+                    throw new InvalidQueryException($"Method {methodName}() expects that second argument will be a number", QueryText, parameters);
+
+                Visit(firstArgument, parameters);
             }
 
             private void HandleMoreLikeThis(string methodName, List<QueryExpression> arguments, BlittableJsonReaderObject parameters)
@@ -1488,7 +1801,16 @@ namespace Raven.Server.Documents.Queries
                 AutoSpatialOptions fieldOptions = null;
                 QueryFieldName fieldName;
                 if (_metadata.IsDynamic == false)
-                    fieldName = _metadata.ExtractFieldNameFromFirstArgument(arguments, methodName, parameters);
+                {
+                    if (arguments.Count == 0)
+                        throw new InvalidQueryException($"Method {methodName}() expects at least one argument to be passed", QueryText, parameters);
+
+                    var argument = arguments[0];
+                    if (argument is FieldExpression == false && argument is ValueExpression == false)
+                        throw new InvalidQueryException($"Method {methodName}() expects that first argument will be a field name when static index is queried", QueryText, parameters);
+
+                    fieldName = ExtractFieldNameFromArgument(argument, methodName, parameters, QueryText);
+                }
                 else
                 {
                     if (!(arguments[0] is MethodExpression spatialExpression))
@@ -1604,7 +1926,7 @@ namespace Raven.Server.Documents.Queries
         public string GetUpdateBody(BlittableJsonReaderObject parameters)
         {
             if (Query.UpdateBody == null)
-                throw new InvalidQueryException("UPDATE cluase was not specified", QueryText, parameters);
+                throw new InvalidQueryException("UPDATE clause was not specified", QueryText, parameters);
 
             var updateBody = Query.UpdateBody;
 
@@ -1644,3 +1966,4 @@ namespace Raven.Server.Documents.Queries
         }
     }
 }
+

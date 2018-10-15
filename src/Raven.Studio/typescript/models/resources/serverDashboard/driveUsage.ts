@@ -7,6 +7,7 @@ import textColumn = require("widgets/virtualGrid/columns/textColumn");
 import generalUtils = require("common/generalUtils");
 import appUrl = require("common/appUrl");
 import virtualColumn = require("widgets/virtualGrid/columns/virtualColumn");
+import databasesManager = require("common/shell/databasesManager");
 
 class legendColumn<T> implements virtualColumn {
     constructor(
@@ -20,6 +21,10 @@ class legendColumn<T> implements virtualColumn {
         return this.header;
     }
 
+    get headerAsText() {
+        return this.header;
+    }
+
     renderCell(item: T, isSelected: boolean): string {
         const color = this.colorAccessor(item);
         return `<div class="cell text-cell" style="width: ${this.width}"><div class="legend-rect" style="background-color: ${color}"></div></div>`;
@@ -29,6 +34,8 @@ class legendColumn<T> implements virtualColumn {
 
 class driveUsage {
     private sizeFormatter = generalUtils.formatBytesToSize;
+    
+    private includeTemp: KnockoutObservable<boolean>;
     
     mountPoint = ko.observable<string>();
     volumeLabel = ko.observable<string>();
@@ -46,8 +53,9 @@ class driveUsage {
     gridController = ko.observable<virtualGridController<driveUsageDetails>>();
     private colorProvider: (name: string) => string;
     
-    constructor(dto: Raven.Server.Dashboard.MountPointUsage, colorProvider: (name: string) => string) {
+    constructor(dto: Raven.Server.Dashboard.MountPointUsage, colorProvider: (name: string) => string, includeTemp: KnockoutObservable<boolean>) {
         this.colorProvider = colorProvider;
+        this.includeTemp = includeTemp;
         this.update(dto);
         
         this.freeSpaceLevelClass = ko.pureComputed(() => {
@@ -73,8 +81,17 @@ class driveUsage {
         });
         
         this.totalDocumentsSpaceUsed = ko.pureComputed(() => {
-           return _.sum(this.items().map(x => x.size()));
+            const includeTemp = this.includeTemp();
+            return _.sum(this.items().map(x => includeTemp ? x.size() + x.tempBuffersSize() : x.size()));
         });
+        
+        const isDisabled = (dbName: string) => {
+            const db = databasesManager.default.getDatabaseByName(dbName);
+            if (db) {
+                return db.disabled();
+            }
+            return false;
+        };
         
         const gridInitialization = this.gridController.subscribe((grid) => {
             grid.headerVisible(true);
@@ -83,11 +100,26 @@ class driveUsage {
                 totalResultCount: this.items().length,
                 items: this.items()
             }), () => {
-                return [
-                    new legendColumn<driveUsageDetails>(grid, x => this.colorProvider(x.database()), "", "26px"),
-                    new hyperlinkColumn<driveUsageDetails>(grid, x => x.database(), x => appUrl.forStatusStorageReport(x.database()), "Database", "60%"),
-                    new textColumn<driveUsageDetails>(grid, x => this.sizeFormatter(x.size()), "Size", "30%"),
-                ];
+                if (this.includeTemp()) {
+                    return [
+                        new legendColumn<driveUsageDetails>(grid, x => this.colorProvider(x.database()), "", "26px"),
+                        new hyperlinkColumn<driveUsageDetails>(grid, x => x.database(), x => appUrl.forStatusStorageReport(x.database()), "Database", "42%", {
+                            extraClass: d => isDisabled(d.database()) ? "disabled" : ""
+                        }),
+                        new textColumn<driveUsageDetails>(grid, x => this.sizeFormatter(x.size()), "Data", "16%"),
+                        new textColumn<driveUsageDetails>(grid, x => this.sizeFormatter(x.tempBuffersSize()), "Temp", "16%"),
+                        new textColumn<driveUsageDetails>(grid, x => this.sizeFormatter(x.tempBuffersSize() + x.size()), "Total", "16%")
+                        
+                    ] 
+                } else {
+                    return [ 
+                        new legendColumn<driveUsageDetails>(grid, x => this.colorProvider(x.database()), "", "26px"),
+                        new hyperlinkColumn<driveUsageDetails>(grid, x => x.database(), x => appUrl.forStatusStorageReport(x.database()), "Database", "60%", {
+                            extraClass: d => isDisabled(d.database()) ? "disabled" : ""
+                        }),
+                        new textColumn<driveUsageDetails>(grid, x => this.sizeFormatter(x.size()), "Data", "30%") 
+                    ]
+                }
             });
             
             gridInitialization.dispose();
@@ -132,7 +164,12 @@ class driveUsage {
         this.items.sort((a, b) => generalUtils.sortAlphaNumeric(a.database(), b.database()));
 
         if (this.gridController()) {
+            const selectedItems = this.gridController().getSelectedItems();
             this.gridController().reset(false);
+            if (selectedItems && selectedItems.length) {
+                // maintain selection after grid update
+                this.gridController().setSelectedItems(selectedItems);
+            }
         }
     }
 }

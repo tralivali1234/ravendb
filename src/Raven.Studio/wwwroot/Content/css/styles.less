@@ -14,13 +14,12 @@
 @import "toastr.less";
 @import "usageStats.less";
 
-@brand-database-color: #ad1457;
-@color-revisions: #cfa125;
-@color-recent: #198fd1;
-@color-attachments: #50b068;
-@color-related: #9466d5;
-@link-color: #e33572;
-@link-hover-color: #ff6565;
+
+
+@tooltip-inner-min-width:     100px;
+@tooltip-inner-max-width:     200px;
+@tooltip-inner-bg-color:      rgba(18, 18, 18, 0.95);
+@tooltip-inner-color:         #ececf3;
 
 .text-revisions {
     color: @color-revisions !important;
@@ -110,6 +109,11 @@ h1 {
     margin-bottom: @grid-gutter-width;
 }
 
+h5 {
+    margin-top:0;
+    margin-bottom: 3px;
+}
+
 h6 {
     text-transform: uppercase;
 }
@@ -136,6 +140,16 @@ h6 {
 
 .nobr {
     white-space: nowrap;
+    display: inline !important;
+}
+
+.small-properties {
+    font-size: 11px;
+    text-transform: uppercase;
+}
+
+.whitespace-initial {
+    white-space: initial !important;
 }
 
 .visible-block {
@@ -149,9 +163,7 @@ h6 {
         .caret {
             margin-left: 2px;
             margin-right: -2px;
-            float: right;
             position: relative;
-            top: 10px;
             margin-left: 7px;
             margin-right: -2px;
         }
@@ -319,11 +331,11 @@ a {
 
 .flex-row {
     display: flex;
-    flex-wrap: wrap;
     flex-direction: column;
 
     @media (min-width: @screen-sm) {
         flex-direction: row;
+        flex-wrap: wrap;
     }
 
     .flex-bottom {
@@ -388,6 +400,20 @@ a {
 .text-elipsis {
     overflow: hidden;
     text-overflow: ellipsis;
+}
+
+.text-capitalize {
+    text-transform: capitalize;
+}
+
+i {
+    + strong {
+        color: inherit;
+    }
+}
+
+.display-contents {
+    display: contents;
 }
 
 .padding {
@@ -807,6 +833,10 @@ input[type=file] + .form-control {
         margin-bottom: @grid-gutter-width / 4;
     }
 
+    &.margin-bottom-xs {
+        margin-bottom: @grid-gutter-width / 8;
+    }
+
     &.margin-bottom-lg, &.margin-lg {
         margin-bottom: @grid-gutter-width;
     }
@@ -1173,9 +1203,9 @@ pre {
 
 .properties-container {
     @media (min-width: @screen-sm) {
-        display: flex;
-        flex-wrap: wrap;
-        align-content: center;
+        display: grid;
+        justify-items: stretch;
+        grid-template-columns: 1fr 1fr;
     }
 
     .toggle {
@@ -1215,13 +1245,13 @@ pre {
                 display: block;
 
                 &:before {
-                    left: 150px;
+                    left: 170px;
                     top: 13px;
                 }
 
                 &:after {
                     top: 7px;
-                    left: 112px;
+                    left: 132px;
                 }
             }
 
@@ -1229,7 +1259,7 @@ pre {
                 position: absolute;
 
                 &:checked + label:after {
-                    left: 130px;
+                    left: 150px;
                 }
             }
         }
@@ -1241,29 +1271,14 @@ pre {
         margin-bottom: 2px;
         display: flex;
         position: relative;
-        height: 36px;
         flex-wrap: nowrap;
-        width: 100%;
 
         @media (min-width: @screen-sm) {
-            max-width: 300px;
-            min-width: 100px;
-            width: 49%;
-
-            &.grow-2 {
-                flex-grow: 2;
-                width: 100%;
-                max-width: 600px;
-                min-width: 200px;
-            }
+            height: 36px;
         }
 
-        @media (min-width: @screen-lg) {
-            width: 32%;
-
-            &.grow-2 {
-                width: 64%;
-            }
+        &.grow-2 {
+            grid-column-start: span 2;
         }
 
         .dropdown-menu {
@@ -1272,7 +1287,7 @@ pre {
 
         .properties-label {
             .btn-sm;
-            flex: 0 0 110px;
+            flex: 0 0 130px;
             overflow: hidden;
             text-overflow: ellipsis;
             white-space: nowrap;
@@ -1335,11 +1350,6 @@ pre {
         &:not(.value-only) {
             .properties-value {
                 & .set-size {
-                    position: absolute;
-                    top: 0;
-                    left: 0;
-                    right: 0;
-                    bottom: 0;
                     width: 100%;
                     padding-right: 20px;
                     text-align: left;
@@ -1545,14 +1555,6 @@ pre {
     }
 }
 
-.popover:not(.right) {
-    margin-left: 60px;
-
-    .arrow {
-        left: 35% !important;
-    }
-}
-
 .popover-lg {
     max-width: 100%;
 }
@@ -1668,10 +1670,10 @@ pre {
 }
 
 .feedback-link {
-    color: #a140b0 !important;
+    color: @color-5 !important;
 
     &:hover {
-        color: lighten(#a140b0, 10%) !important;
+        color: lighten(@color-5, 10%) !important;
     }
 }
 
@@ -1794,7 +1796,7 @@ ul.properties {
     list-style: none;
     padding: 0;
     margin: 0;
-
+    
     li {
         & > span {
             display: inline-block;
@@ -1817,17 +1819,40 @@ ul.properties {
     margin-right: auto;
 }
 
+.no-margin { 
+    margin: 0;
+}
+
+.tooltip {
+    .tooltip-inner {
+        min-width: @tooltip-inner-min-width;
+        max-width: @tooltip-inner-max-width;
+        background-color: @tooltip-inner-bg-color;
+        color: @tooltip-inner-color;
+    }
+}
+@state-experimental-text: @color-5-2;
+@state-experimental-bg: @color-5-1;
+@state-experimental-border: darken(spin(@state-experimental-bg, -10), 5%);
+
+.bg-experimental {
+    .bg-variant(@state-experimental-bg, @state-experimental-text);
+}
+
 @import "pages/tasks-sampleData";
 @import "pages/tasks-csvImport";
 @import "pages/tasks-subscriptions";
 @import "pages/documents-edit";
 @import "pages/documents";
-@import "pages/indexes.less";
 @import "pages/databases.less";
+@import "pages/indexes.less";
 @import "pages/indexes-terms.less";
+@import "pages/indexes-maintenance.less";
+@import "pages/index-errors.less";
 @import "pages/storage-report.less";
 @import "pages/sample-data.less";
 @import "pages/about.less";
+@import "pages/details-providers.less";
 @import "pages/edit-index.less";
 @import "pages/query.less";
 @import "pages/patch.less";
@@ -1835,17 +1860,16 @@ ul.properties {
 @import "pages/debug-advanced.less";
 @import "pages/metrics.less";
 @import "pages/export-progress.less";
+@import "pages/sql-migration-progress.less";
 @import "pages/compaction-progress.less";
 @import "pages/stats.less";
 @import "pages/revisions.less";
 @import "pages/etl.less";
 @import "pages/conflicts.less";
-@import "pages/index-errors.less";
 @import "pages/ongoing-tasks.less";
 @import "pages/visualizer.less";
 @import "pages/edit-subscription.less";
 @import "pages/info-package.less";
-@import "pages/indexes-maintenance.less";
 @import "pages/database-group-graph.less";
 @import "pages/database-group.less";
 @import "pages/edit-backup.less";
@@ -1856,3 +1880,5 @@ ul.properties {
 @import "pages/license.less";
 @import "pages/cmp-xchg.less";
 @import "pages/eula.less";
+@import "pages/sql-migration.less";
+@import "pages/other-migration.less";

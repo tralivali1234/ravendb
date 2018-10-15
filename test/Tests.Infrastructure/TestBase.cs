@@ -6,18 +6,24 @@ using System.Linq;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Loader;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json.Linq;
+using Raven.Client;
 using Raven.Client.Http;
+using Raven.Client.Util;
 using Raven.Server;
 using Raven.Server.Config;
+using Raven.Server.Config.Categories;
 using Raven.Server.Config.Settings;
 using Raven.Server.Documents;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
+using Raven.Server.Utils.Cli;
 using Sparrow.Collections;
 using Sparrow.Logging;
 using Sparrow.Platform;
@@ -82,6 +88,8 @@ namespace FastTests
 
             var maxNumberOfConcurrentTests = Math.Max(ProcessorInfo.ProcessorCount / 2, 2);
 
+            RequestExecutor.RemoteCertificateValidationCallback += (sender, cert, chain, errors) => true;
+
             var fileInfo = new FileInfo(XunitConfigurationFile);
             if (fileInfo.Exists)
             {
@@ -117,23 +125,63 @@ namespace FastTests
         }
 
         protected static volatile string _selfSignedCertFileName;
+
         protected static string GenerateAndSaveSelfSignedCertificate()
         {
-            if (_selfSignedCertFileName != null)
-                return _selfSignedCertFileName;
+            if (_selfSignedCertFileName == null)
+                GenerateSelfSignedCertFileName();
 
+            var tmp = Path.GetTempFileName();
+            File.Copy(_selfSignedCertFileName, tmp, true);
+            return tmp;
+        }
+
+        private static void GenerateSelfSignedCertFileName()
+        {
             lock (typeof(TestBase))
             {
                 if (_selfSignedCertFileName != null)
-                    return _selfSignedCertFileName;
+                    return;
 
-                var selfCertificate = CertificateUtils.CreateSelfSignedCertificate(Environment.MachineName, "RavenTestsServer");
-                RequestExecutor.ServerCertificateCustomValidationCallback += (message, certificate2, arg3, arg4) => true;
-                var tempFileName = Path.GetTempFileName();
-                byte[] certData = selfCertificate.Export(X509ContentType.Pfx);
-                File.WriteAllBytes(tempFileName, certData);
+                var log = new StringBuilder();
+                byte[] certBytes;
+                try
+                {
+                    certBytes = CertificateUtils.CreateSelfSignedCertificate(Environment.MachineName, "RavenTestsServer", log);
+                }
+                catch (Exception e)
+                {
+                    throw new CryptographicException($"Unable to generate the test certificate for the machine '{Environment.MachineName}'. Log: {log}", e);
+                }
+
+                try
+                {
+                    new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
+                }
+                catch (Exception e)
+                {
+                    throw new CryptographicException($"Unable to load the test certificate for the machine '{Environment.MachineName}'. Log: {log}", e);
+                }
+
+                if (certBytes.Length == 0)
+                    throw new CryptographicException($"Test certificate length is 0 bytes. Machine: '{Environment.MachineName}', Log: {log}");
+
+                string tempFileName = null;
+                try
+                {
+                    tempFileName = Path.GetTempFileName();
+                    File.WriteAllBytes(tempFileName, certBytes);
+                }
+                catch (Exception e)
+                {
+                    throw new InvalidOperationException("Failed to write the test certificate to a temp file." +
+                                                        $"tempFileName = {tempFileName}" +
+                                                        $"certBytes.Length = {certBytes.Length}" +
+                                                        $"MachineName = {Environment.MachineName}.", e);
+
+                }
+
                 _selfSignedCertFileName = tempFileName;
-                return tempFileName;
             }
         }
 
@@ -167,6 +215,8 @@ namespace FastTests
                 {
                     UseNewLocalServer();
                     Servers.Add(_localServer);
+                    _doNotReuseServer = false;
+
                     return _localServer;
                 }
 
@@ -200,7 +250,7 @@ namespace FastTests
             }
         }
 
-        private void UnloadServer(AssemblyLoadContext obj)
+        private static void UnloadServer(AssemblyLoadContext obj)
         {
             try
             {
@@ -210,6 +260,50 @@ namespace FastTests
                     _globalServer = null;
                     if (copyGlobalServer == null)
                         return;
+
+                    try
+                    {
+                        using (copyGlobalServer.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+                        using (context.OpenReadTransaction())
+                        {
+                            var databases = copyGlobalServer
+                                .ServerStore
+                                .Cluster
+                                .ItemsStartingWith(context, Constants.Documents.Prefix, 0, int.MaxValue)
+                                .ToList();
+
+                            if (databases.Count > 0)
+                            {
+                                var sb = new StringBuilder();
+                                sb.AppendLine("List of non-deleted databases:");
+
+                                foreach (var t in databases)
+                                {
+                                    var databaseName = t.ItemName.Substring(Constants.Documents.Prefix.Length);
+
+                                    try
+                                    {
+                                        AsyncHelpers.RunSync(() => copyGlobalServer.ServerStore.DeleteDatabaseAsync(databaseName, hardDelete: true, null));
+                                    }
+                                    catch (Exception)
+                                    {
+                                        // ignored
+                                    }
+
+                                    sb
+                                        .Append("- ")
+                                        .AppendLine(databaseName);
+                                }
+
+                                Console.WriteLine(sb.ToString());
+                            }
+                        }
+                    }
+                    catch (Exception e)
+                    {
+                        Console.WriteLine($"Could not retrieve list of non-deleted databases. Exception: {e}");
+                    }
+
                     copyGlobalServer.Dispose();
 
                     GC.Collect(2);
@@ -228,19 +322,21 @@ namespace FastTests
             }
         }
 
-        public void UseNewLocalServer()
+        public void UseNewLocalServer(IDictionary<string, string> customSettings = null, bool runInMemory = true, string customConfigPath = null)
         {
             _localServer?.Dispose();
-            _localServer = GetNewServer(_customServerSettings);
+            if (_localServer != null)
+                Servers.Remove(_localServer);
+            _localServer = GetNewServer(customSettings: customSettings ?? _customServerSettings, runInMemory: runInMemory, customConfigPath: customConfigPath);
         }
 
         private readonly object _getNewServerSync = new object();
 
-        protected RavenServer GetNewServer(IDictionary<string, string> customSettings = null, bool deletePrevious = true, bool runInMemory = true, string partialPath = null)
+        protected virtual RavenServer GetNewServer(IDictionary<string, string> customSettings = null, bool deletePrevious = true, bool runInMemory = true, string partialPath = null, string customConfigPath = null)
         {
             lock (_getNewServerSync)
             {
-                var configuration = new RavenConfiguration(Guid.NewGuid().ToString(), ResourceType.Server);
+                var configuration = new RavenConfiguration(Guid.NewGuid().ToString(), ResourceType.Server, customConfigPath);
 
                 if (customSettings != null)
                 {
@@ -264,6 +360,11 @@ namespace FastTests
                 configuration.Replication.ReplicationMinimalHeartbeat = new TimeSetting(100, TimeUnit.Milliseconds);
                 configuration.Replication.RetryReplicateAfter = new TimeSetting(3, TimeUnit.Seconds);
                 configuration.Cluster.AddReplicaTimeout = new TimeSetting(10, TimeUnit.Seconds);
+                configuration.Licensing.EulaAccepted = true;
+                if (customSettings == null || customSettings.ContainsKey(RavenConfiguration.GetKey(x => x.Core.FeaturesAvailability)) == false)
+                {
+                    configuration.Core.FeaturesAvailability = FeaturesAvailability.Experimental;
+                }
 
                 if (deletePrevious)
                     IOExtensions.DeleteDirectory(configuration.Core.DataDirectory.FullPath);
@@ -295,18 +396,19 @@ namespace FastTests
         {
             Console.WriteLine(url);
 
-            if (RuntimeInformation.IsOSPlatform(OSPlatform.Windows))
+            if (PlatformDetails.RunningOnPosix == false)
             {
-                Process.Start(new ProcessStartInfo("cmd", $"/c start \"Stop & look at studio\" \"{url}\"")); // Works ok on windows
+                Process.Start(new ProcessStartInfo("cmd", $"/c start \"Stop & look at studio\" \"{url}\""));
+                return;
             }
-            else if (RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+
+            if (PlatformDetails.RunningOnMacOsx)
             {
-                Process.Start("xdg-open", url); // Works ok on linux
+                Process.Start("open", url);
+                return;
             }
-            else
-            {
-                Console.WriteLine("Do it yourself!");
-            }
+
+            Process.Start("xdg-open", url);
         }
 
         protected string NewDataPath([CallerMemberName] string prefix = null, string suffix = null, bool forceCreateDir = false)

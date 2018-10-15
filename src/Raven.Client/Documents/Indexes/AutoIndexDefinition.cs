@@ -18,7 +18,7 @@ namespace Raven.Client.Documents.Indexes
 
         public IndexPriority? Priority { get; set; }
 
-        public IndexLockMode? LockMode { get; set; }
+        public IndexState? State { get; set; }
 
         public string Collection { get; set; }
 
@@ -45,8 +45,8 @@ namespace Raven.Client.Documents.Indexes
             if (Priority != other.Priority)
                 result |= IndexDefinitionCompareDifferences.Priority;
 
-            if (LockMode != other.LockMode)
-                result |= IndexDefinitionCompareDifferences.LockMode;
+            if (State != other.State)
+                result |= IndexDefinitionCompareDifferences.State;
 
             return result;
         }

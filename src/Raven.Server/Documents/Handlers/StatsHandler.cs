@@ -2,7 +2,6 @@
 using System.Linq;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Operations;
-using Raven.Client.Util;
 using Raven.Server.Json;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
@@ -13,32 +12,68 @@ namespace Raven.Server.Documents.Handlers
 {
     public class StatsHandler : DatabaseRequestHandler
     {
+        [RavenAction("/databases/*/stats/detailed", "GET", AuthorizationStatus.ValidUser)]
+        public Task DetailedStats()
+        {
+            using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+            {
+                var stats = new DetailedDatabaseStatistics();
+
+                FillDatabaseStatistics(stats, context);
+
+                using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext serverContext))
+                using (serverContext.OpenReadTransaction())
+                {
+                    stats.CountOfIdentities = ServerStore.Cluster.GetNumberOfIdentities(serverContext, Database.Name);
+                    stats.CountOfCompareExchange = ServerStore.Cluster.GetNumberOfCompareExchange(serverContext, Database.Name);
+                }
+
+                using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+                    writer.WriteDetailedDatabaseStatistics(context, stats);
+            }
+
+            return Task.CompletedTask;
+        }
+
         [RavenAction("/databases/*/stats", "GET", AuthorizationStatus.ValidUser)]
         public Task Stats()
         {
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
-            using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+            {
+                var stats = new DatabaseStatistics();
+
+                FillDatabaseStatistics(stats, context);
+
+                using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+                    writer.WriteDatabaseStatistics(context, stats);
+            }
+
+            return Task.CompletedTask;
+        }
+
+        private void FillDatabaseStatistics(DatabaseStatistics stats, DocumentsOperationContext context)
+        {
             using (context.OpenReadTransaction())
             {
                 var indexes = Database.IndexStore.GetIndexes().ToList();
 
-                var sizeOnDiskInBytes = Database.GetSizeOnDiskInBytes();
+                var size = Database.GetSizeOnDisk();
 
-                var stats = new DatabaseStatistics
-                {
-                    LastDocEtag = DocumentsStorage.ReadLastDocumentEtag(context.Transaction.InnerTransaction),
-                    CountOfDocuments = Database.DocumentsStorage.GetNumberOfDocuments(context),
-                    CountOfRevisionDocuments = Database.DocumentsStorage.RevisionsStorage.GetNumberOfRevisionDocuments(context),
-                    CountOfDocumentsConflicts = Database.DocumentsStorage.ConflictsStorage.GetNumberOfDocumentsConflicts(context),
-                    CountOfTombstones = Database.DocumentsStorage.GetNumberOfTombstones(context),
-                    CountOfConflicts = Database.DocumentsStorage.ConflictsStorage.ConflictsCount,
-                    SizeOnDisk = new Size(sizeOnDiskInBytes),
-                    NumberOfTransactionMergerQueueOperations = Database.TxMerger.NumberOfQueuedOperations
-                };
+                stats.LastDocEtag = DocumentsStorage.ReadLastDocumentEtag(context.Transaction.InnerTransaction);
+                stats.CountOfDocuments = Database.DocumentsStorage.GetNumberOfDocuments(context);
+                stats.CountOfRevisionDocuments = Database.DocumentsStorage.RevisionsStorage.GetNumberOfRevisionDocuments(context);
+                stats.CountOfDocumentsConflicts = Database.DocumentsStorage.ConflictsStorage.GetNumberOfDocumentsConflicts(context);
+                stats.CountOfTombstones = Database.DocumentsStorage.GetNumberOfTombstones(context);
+                stats.CountOfConflicts = Database.DocumentsStorage.ConflictsStorage.ConflictsCount;
+                stats.SizeOnDisk = size.Data;
+                stats.NumberOfTransactionMergerQueueOperations = Database.TxMerger.NumberOfQueuedOperations;
+                stats.CountOfCounters = Database.DocumentsStorage.CountersStorage.GetNumberOfCounterEntries(context);
+                stats.TempBuffersSizeOnDisk = size.TempBuffers;
 
                 var attachments = Database.DocumentsStorage.AttachmentsStorage.GetNumberOfAttachments(context);
                 stats.CountOfAttachments = attachments.AttachmentCount;
                 stats.CountOfUniqueAttachments = attachments.StreamsCount;
+
                 stats.CountOfIndexes = indexes.Count;
                 var statsDatabaseChangeVector = DocumentsStorage.GetDatabaseChangeVector(context);
 
@@ -61,7 +96,7 @@ namespace Raven.Server.Documents.Handlers
                         // if the index has just been removed, let us consider it stale
                         // until it can be safely removed from the list of indexes in the
                         // database
-                        isStale = true; 
+                        isStale = true;
                     }
                     stats.Indexes[i] = new IndexInformation
                     {
@@ -79,11 +114,7 @@ namespace Raven.Server.Documents.Handlers
                     else
                         stats.LastIndexingTime = index.LastIndexingTime;
                 }
-
-                writer.WriteDatabaseStatistics(context, stats);
             }
-
-            return Task.CompletedTask;
         }
 
         [RavenAction("/databases/*/metrics", "GET", AuthorizationStatus.ValidUser)]
@@ -114,7 +145,11 @@ namespace Raven.Server.Documents.Handlers
                     },
                     [nameof(Database.Metrics.Attachments)] = new DynamicJsonValue
                     {
-                        [nameof(Database.Metrics.Attachments.PutsPerSec)] = Database.Metrics.Docs.PutsPerSec.CreateMeterData(true, empty)
+                        [nameof(Database.Metrics.Attachments.PutsPerSec)] = Database.Metrics.Attachments.PutsPerSec.CreateMeterData(true, empty)
+                    },
+                    [nameof(Database.Metrics.Counters)] = new DynamicJsonValue
+                    {
+                        [nameof(Database.Metrics.Counters.PutsPerSec)] = Database.Metrics.Counters.PutsPerSec.CreateMeterData(true, empty)
                     }
                 });
             }
@@ -138,7 +173,11 @@ namespace Raven.Server.Documents.Handlers
                     },
                     [nameof(Database.Metrics.Attachments)] = new DynamicJsonValue
                     {
-                        [nameof(Database.Metrics.Attachments.BytesPutsPerSec)] = Database.Metrics.Docs.BytesPutsPerSec.CreateMeterData(true, empty)
+                        [nameof(Database.Metrics.Attachments.BytesPutsPerSec)] = Database.Metrics.Attachments.BytesPutsPerSec.CreateMeterData(true, empty)
+                    },
+                    [nameof(Database.Metrics.Counters)] = new DynamicJsonValue
+                    {
+                        [nameof(Database.Metrics.Counters.BytesPutsPerSec)] = Database.Metrics.Counters.BytesPutsPerSec.CreateMeterData(true, empty)
                     }
                 });
             }

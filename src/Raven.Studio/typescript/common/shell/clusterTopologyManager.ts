@@ -3,6 +3,7 @@
 import clusterTopology = require("models/database/cluster/clusterTopology");
 import getClusterTopologyCommand = require("commands/database/cluster/getClusterTopologyCommand");
 import changesContext = require("common/changesContext");
+import licenseModel = require("models/auth/licenseModel");
 
 class clusterTopologyManager {
 
@@ -16,6 +17,8 @@ class clusterTopologyManager {
     currentTerm: KnockoutComputed<number>;
     votingInProgress: KnockoutComputed<boolean>;
     nodesCount: KnockoutComputed<number>;
+    
+    throttledLicenseUpdate = _.throttle(() => licenseModel.fetchLicenseStatus(), 5000);
     
     init(): JQueryPromise<clusterTopology> {
         return this.fetchTopology();
@@ -42,6 +45,7 @@ class clusterTopologyManager {
 
     private onTopologyUpdated(e: Raven.Server.NotificationCenter.Notifications.Server.ClusterTopologyChanged) {
         this.topology().updateWith(e);
+        this.throttledLicenseUpdate();
     }
 
     private initObservables() {

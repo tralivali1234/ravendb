@@ -1,42 +1,49 @@
 /// <reference path="../../../../typings/tsd.d.ts"/>
-
 import configuration = require("configuration");
+import restorePoint = require("models/resources/creation/restorePoint");
 import clusterNode = require("models/database/cluster/clusterNode");
 import getRestorePointsCommand = require("commands/resources/getRestorePointsCommand");
 import generalUtils = require("common/generalUtils");
 import recentError = require("common/notifications/models/recentError");
+import validateNameCommand = require("commands/resources/validateNameCommand");
 
 class databaseCreationModel {
-    
+    static unknownDatabaseName = "Unknown Database";
+
     readonly configurationSections: Array<availableConfigurationSection> = [
         {
             name: "Data source",
             id: "legacyMigration",
             alwaysEnabled: true,
+            disableToggle: ko.observable<boolean>(false),
             enabled: ko.observable<boolean>(true)
         },
         {
             name: "Backup source",
             id: "restore",
             alwaysEnabled: true,
+            disableToggle: ko.observable<boolean>(false),
             enabled: ko.observable<boolean>(true)
         },
         {
             name: "Encryption",
             id: "encryption",
             alwaysEnabled: false,
+            disableToggle: ko.observable<boolean>(false),
             enabled: ko.observable<boolean>(false)
         },
         {
             name: "Replication",
             id: "replication",
             alwaysEnabled: true,
+            disableToggle: ko.observable<boolean>(false),
             enabled: ko.observable<boolean>(true)
         },
         {
             name: "Path",
             id: "path",
             alwaysEnabled: true,
+            disableToggle: ko.observable<boolean>(false),
             enabled: ko.observable<boolean>(true)
         }
     ];
@@ -44,6 +51,8 @@ class databaseCreationModel {
     spinners = {
         fetchingRestorePoints: ko.observable<boolean>(false)
     };
+    
+    lockActiveTab = ko.observable<boolean>(false);
 
     name = ko.observable<string>("");
 
@@ -51,14 +60,25 @@ class databaseCreationModel {
     isFromBackupOrFromOfflineMigration: boolean;
 
     restore = {
-        backupDirectory: ko.observable<string>(),
+        backupDirectory: ko.observable<string>().extend({ throttle: 500 }),
         backupDirectoryError: ko.observable<string>(null),
         lastFailedBackupDirectory: null as string,
-        selectedRestorePoint: ko.observable<string>(),
-        restorePoints: ko.observableArray<Raven.Server.Documents.PeriodicBackup.RestorePoint>([]),
-        backupLocation: ko.observable<string>(),
-        lastFileNameToRestore: ko.observable<string>(),
-        isFocusOnBackupDirectory: ko.observable<boolean>()
+        selectedRestorePoint: ko.observable<restorePoint>(),
+        selectedRestorePointText: ko.pureComputed<string>(() => {
+            const restorePoint = this.restore.selectedRestorePoint();
+            if (!restorePoint) {
+                return null;
+            }
+
+            const text: string = `${restorePoint.dateTime}, ${restorePoint.backupType()} Backup`;
+            return text;
+        }),
+        restorePoints: ko.observable<Array<{ databaseName: string, databaseNameTitle: string, restorePoints: restorePoint[] }>>([]),
+        isFocusOnBackupDirectory: ko.observable<boolean>(),
+        restorePointsCount: ko.observable<number>(0),
+        disableOngoingTasks: ko.observable<boolean>(false),
+        skipIndexes: ko.observable<boolean>(false),
+        requiresEncryption: undefined as KnockoutComputed<boolean>
     };
     
     restoreValidationGroup = ko.validatedObservable({ 
@@ -160,6 +180,10 @@ class databaseCreationModel {
             }
         });
 
+        this.restore.backupDirectory.subscribe((backupDirectory) => {
+            this.fetchRestorePoints(backupDirectory, true);
+        });
+
         let isFirst = true;
         this.restore.isFocusOnBackupDirectory.subscribe(hasFocus => {
             if (isFirst) {
@@ -173,39 +197,88 @@ class databaseCreationModel {
             if (hasFocus)
                 return;
 
+            const backupDirectory = this.restore.backupDirectory();
             if (!this.restore.backupDirectory.isValid() &&
-                this.restore.backupDirectory() === this.restore.lastFailedBackupDirectory)
+                backupDirectory === this.restore.lastFailedBackupDirectory)
                 return;
 
-            if (!this.restore.backupDirectory())
+            if (!backupDirectory)
                 return;
 
-            this.spinners.fetchingRestorePoints(true);
-            new getRestorePointsCommand(this.restore.backupDirectory())
-                .execute()
-                .done((restorePoints: Raven.Server.Documents.PeriodicBackup.RestorePoints) => {
-                    this.restore.restorePoints(restorePoints.List.map(x => {
-                        const date = x.Key;
-                        const dateFormat = generalUtils.dateFormat;
-                        x.Key = moment(date).format(dateFormat);
-                        return x;
-                    }));
-                    this.restore.selectedRestorePoint(null);
-                    this.restore.backupLocation(null);
-                    this.restore.lastFileNameToRestore(null);
-                    this.restore.backupDirectoryError(null);
-                    this.restore.lastFailedBackupDirectory = null;
-                })
-                .fail((response: JQueryXHR) => {
-                    const messageAndOptionalException = recentError.tryExtractMessageAndException(response.responseText);
-                    this.restore.backupDirectoryError(generalUtils.trimMessage(messageAndOptionalException.message));
-                    this.restore.lastFailedBackupDirectory = this.restore.backupDirectory();
-                    this.restore.backupDirectory.valueHasMutated();
-                })
-                .always(() => this.spinners.fetchingRestorePoints(false));
+            this.fetchRestorePoints(backupDirectory, false);
+        });
+        
+        this.restore.selectedRestorePoint.subscribe(restorePoint => {
+            const encryptionSection = this.getEncryptionConfigSection();
+            this.lockActiveTab(true);
+            try {
+                if (restorePoint) {
+                    if (restorePoint.isEncrypted) {
+                        // turn on encryption
+                        encryptionSection.disableToggle(true);
+                        encryptionSection.enabled(true);
+                    } else if (restorePoint.isSnapshotRestore && !restorePoint.isEncrypted) {
+                        encryptionSection.disableToggle(true);
+                        encryptionSection.enabled(false);
+                    } else {
+                        encryptionSection.disableToggle(false);
+                        encryptionSection.enabled(false);
+                    }
+                } else {
+                    encryptionSection.disableToggle(false);
+                }
+            } finally {
+                this.lockActiveTab(false);    
+            }
         });
         
         _.bindAll(this, "useRestorePoint");
+    }
+
+    private fetchRestorePoints(backupDirectory: string, skipReportingError: boolean) {
+        if (!skipReportingError) {
+            this.spinners.fetchingRestorePoints(true);
+        }
+
+        new getRestorePointsCommand(backupDirectory, skipReportingError)
+            .execute()
+            .done((restorePoints: Raven.Server.Documents.PeriodicBackup.Restore.RestorePoints) => {
+                if (backupDirectory !== this.restore.backupDirectory()) {
+                    // the backup directory changed
+                    return;
+                }
+
+                const groups: Array<{ databaseName: string, databaseNameTitle: string, restorePoints: restorePoint[] }> = [];
+                restorePoints.List.forEach(rp => {
+                    const databaseName = rp.DatabaseName = rp.DatabaseName ? rp.DatabaseName : databaseCreationModel.unknownDatabaseName;
+                    if (!groups.find(x => x.databaseName === databaseName)) {
+                        const title = databaseName !== databaseCreationModel.unknownDatabaseName ? "Database Name" : "Unidentified folder format name";
+                        groups.push({ databaseName: databaseName, databaseNameTitle: title, restorePoints: [] });
+                    }
+
+                    const group = groups.find(x => x.databaseName === databaseName);
+                    group.restorePoints.push(new restorePoint(rp));
+                });
+
+                this.restore.restorePoints(groups);
+                this.restore.selectedRestorePoint(null);
+                this.restore.backupDirectoryError(null);
+                this.restore.lastFailedBackupDirectory = null;
+                this.restore.restorePointsCount(restorePoints.List.length);
+            })
+            .fail((response: JQueryXHR) => {
+                if (backupDirectory !== this.restore.backupDirectory()) {
+                    // the backup directory changed
+                    return;
+                }
+
+                const messageAndOptionalException = recentError.tryExtractMessageAndException(response.responseText);
+                this.restore.backupDirectoryError(generalUtils.trimMessage(messageAndOptionalException.message));
+                this.restore.lastFailedBackupDirectory = this.restore.backupDirectory();
+                this.restore.restorePoints([]);
+                this.restore.restorePointsCount(0);
+            })
+            .always(() => this.spinners.fetchingRestorePoints(false));
     }
 
     getEncryptionConfigSection() {
@@ -247,16 +320,31 @@ class databaseCreationModel {
     setupValidation(databaseDoesntExist: (name: string) => boolean, maxReplicationFactor: number) {
         this.setupPathValidation(this.path.dataPath, "Data");
 
+        const checkDatabaseName = (val: string,
+                                   params: any,
+                                   callback: (currentValue: string, result: string | boolean) => void) => {
+            new validateNameCommand('Database', val)
+                .execute()
+                .done((result) => {
+                    if (result.IsValid) {
+                        callback(this.name(), true);
+                    } else {
+                        callback(this.name(), result.ErrorMessage);
+                    }
+                })
+        };
+        
         this.name.extend({
             required: true,
-            validDatabaseName: true,
-
             validation: [
                 {
                     validator: (name: string) => databaseDoesntExist(name),
                     message: "Database already exists"
-                }
-            ]
+                },
+                {
+                    async: true,
+                    validator: generalUtils.debounceAndFunnel(checkDatabaseName)
+                }]
         });
         
         this.setupReplicationValidation(maxReplicationFactor);
@@ -285,7 +373,8 @@ class databaseCreationModel {
                     message: `Max available nodes: {0}`,
                     params: maxReplicationFactor
                 }
-            ]
+            ],
+            digit: true
         });
     }
     
@@ -374,16 +463,21 @@ class databaseCreationModel {
         return topology;
     }
 
-    useRestorePoint(restorePoint: Raven.Server.Documents.PeriodicBackup.RestorePoint) {
-        this.restore.selectedRestorePoint(restorePoint.Key);
-        this.restore.backupLocation(restorePoint.Details.Location);
-        this.restore.lastFileNameToRestore(restorePoint.Details.FileName);
+    useRestorePoint(restorePoint: restorePoint) {
+        this.restore.selectedRestorePoint(restorePoint);
+    }
+
+    getRestorePointTitle(restorePoint: restorePoint) {
+        return restorePoint.dateTime;
     }
 
     toDto(): Raven.Client.ServerWide.DatabaseRecord {
         const settings: dictionary<string> = {};
+        const dataDir = _.trim(this.path.dataPath());
 
-        settings[configuration.core.dataDirectory] = _.trim(this.path.dataPath()) || null;
+        if (dataDir) {
+            settings[configuration.core.dataDirectory] = dataDir;
+        }
 
         return {
             DatabaseName: this.name(),
@@ -399,15 +493,16 @@ class databaseCreationModel {
 
         return {
             DatabaseName: this.name(),
-            BackupLocation: this.restore.backupLocation(),
-            LastFileNameToRestore: this.restore.lastFileNameToRestore(),
+            BackupLocation: this.restore.selectedRestorePoint().location,
+            DisableOngoingTasks: this.restore.disableOngoingTasks(),
+            SkipIndexes: this.restore.skipIndexes(),
+            LastFileNameToRestore: this.restore.selectedRestorePoint().fileName,
             DataDirectory: dataDirectory,
             EncryptionKey: this.getEncryptionConfigSection().enabled() ? this.encryption.key() : null
         } as Raven.Client.Documents.Operations.Backups.RestoreBackupConfiguration;
     }
     
-    
-    toOfflineMigrationDto(): Raven.Server.Smuggler.Migration.OfflineMigrationConfiguration {
+    toOfflineMigrationDto(): Raven.Client.ServerWide.Operations.Migration.OfflineMigrationConfiguration {
         const migration = this.legacyMigration;
         return {
             DataDirectory: migration.dataDirectory(),
@@ -421,7 +516,7 @@ class databaseCreationModel {
             EncryptionAlgorithm: migration.isEncrypted() ? migration.encryptionAlgorithm() : undefined,
             EncryptionKeyBitsSize: migration.isEncrypted() ? migration.encryptionKeyBitsSize() : undefined,
             OutputFilePath: null
-        } as Raven.Server.Smuggler.Migration.OfflineMigrationConfiguration;
+        } as Raven.Client.ServerWide.Operations.Migration.OfflineMigrationConfiguration;
     }
 }
 

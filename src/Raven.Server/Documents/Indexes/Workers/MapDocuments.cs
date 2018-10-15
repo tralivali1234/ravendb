@@ -51,7 +51,7 @@ namespace Raven.Server.Documents.Indexes.Workers
                     var lastMappedEtag = _indexStorage.ReadLastIndexedEtag(indexContext.Transaction, collection);
 
                     if (_logger.IsInfoEnabled)
-                        _logger.Info($"Executing map for '{_index.Name}'. Collection: {collection} LastMappedEtag: {lastMappedEtag}.");
+                        _logger.Info($"Executing map for '{_index.Name}'. Collection: {collection} LastMappedEtag: {lastMappedEtag:#,#;;0}.");
 
                     var inMemoryStats = _index.GetStats(collection);
                     var lastEtag = lastMappedEtag;
@@ -74,7 +74,7 @@ namespace Raven.Server.Documents.Indexes.Workers
 
                             var documents = GetDocumentsEnumerator(databaseContext, collection, lastEtag, pageSize);
 
-                            using (var docsEnumerator = _index.GetMapEnumerator(documents, collection, indexContext, collectionStats))
+                            using (var docsEnumerator = _index.GetMapEnumerator(documents, collection, indexContext, collectionStats, _index.Type))
                             {
                                 while (true)
                                 {
@@ -96,14 +96,14 @@ namespace Raven.Server.Documents.Indexes.Workers
                                     collectionStats.RecordMapAttempt();
                                     stats.RecordDocumentSize(current.Data.Size);
                                     if (_logger.IsInfoEnabled && count % 8192 == 0)
-                                        _logger.Info($"Executing map for '{_index.Name}'. Proccessed count: {count:#,#;;0} etag: {lastEtag}.");
+                                        _logger.Info($"Executing map for '{_index.Name}'. Processed count: {count:#,#;;0} etag: {lastEtag:#,#;;0}.");
 
                                     lastEtag = current.Etag;
-                                    inMemoryStats.UpdateLastEtag(lastEtag, isTombsone: false);
+                                    inMemoryStats.UpdateLastEtag(lastEtag, isTombstone: false);
 
                                     try
                                     {
-                                        var numberOfResults = _index.HandleMap(current.LowerId, mapResults,
+                                        var numberOfResults = _index.HandleMap(current.LowerId, current.Id, mapResults,
                                             indexWriter, indexContext, collectionStats);
                                         _index.MapsPerSec.Mark(numberOfResults);
                                         resultsCount += numberOfResults;
@@ -139,7 +139,7 @@ namespace Raven.Server.Documents.Indexes.Workers
                                 }
 
                                 if (_logger.IsInfoEnabled)
-                                    _logger.Info($"Done executing map for '{_index.Name}'. Proccessed count: {count:#,#;;0} LastEtag {lastEtag}.");
+                                    _logger.Info($"Done executing map for '{_index.Name}'. Processed count: {count:#,#;;0} LastEtag {lastEtag}.");
                             }
                         }
                     }

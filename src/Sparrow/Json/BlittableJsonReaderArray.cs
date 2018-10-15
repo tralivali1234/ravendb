@@ -4,7 +4,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
 using System.Runtime.CompilerServices;
-using Sparrow.Collections;
 using Sparrow.Json.Parsing;
 
 namespace Sparrow.Json
@@ -26,8 +25,7 @@ namespace Sparrow.Json
         {
             _parent = parent;
 
-            byte arraySizeOffset;
-            _count = parent.ReadVariableSizeInt(pos, out arraySizeOffset);
+            _count = parent.ReadVariableSizeInt(pos, out byte arraySizeOffset);
 
             _dataStart = parent.BasePointer + pos;
             _metadataPtr = _dataStart + arraySizeOffset;
@@ -55,7 +53,49 @@ namespace Sparrow.Json
         {
             _parent?.BlittableValidation();
         }
-        
+
+        //Todo Fixing the clone implementation to support this situation or throw clear error
+        public BlittableJsonReaderArray Clone(JsonOperationContext context, BlittableJsonDocumentBuilder.UsageMode usageMode = BlittableJsonDocumentBuilder.UsageMode.None)
+        {
+            using (var builder = new ManualBlittableJsonDocumentBuilder<UnmanagedWriteBuffer>(context))
+            {
+                builder.Reset(usageMode);
+                builder.StartArrayDocument();
+                builder.StartWriteArray();
+                using (var itr = GetEnumerator())
+                {
+                    while (itr.MoveNext())
+                    {
+                        switch (itr.Current)
+                        {
+                            case BlittableJsonReaderObject item:
+                                var clone = item.CloneOnTheSameContext();
+                                builder.WriteEmbeddedBlittableDocument(clone.BasePointer, clone.Size);
+                                break;
+                            case LazyStringValue item:
+                                builder.WriteValue(item);
+                                break;
+                            case long item:
+                                builder.WriteValue(item);
+                                break;
+                            case LazyNumberValue item:
+                                builder.WriteValue(item);
+                                break;
+                            case LazyCompressedStringValue item:
+                                builder.WriteValue(item);
+                                break;
+                            default:
+                                throw new InvalidDataException($"Actual value type is {itr.Current.GetType()}. Should be known serialized type and should not happen. ");
+                        }
+                    }
+                }
+                builder.WriteArrayEnd();
+                builder.FinalizeDocument();
+
+                return builder.CreateArrayReader();
+            }
+        }
+
         public void Dispose()
         {            
             _parent?.Dispose();
@@ -70,11 +110,36 @@ namespace Sparrow.Json
 
         public object this[int index] => GetValueTokenTupleByIndex(index).Item1;
 
+        public int BinarySearch(string key, StringComparison comparison)
+        {
+            int min = 0;
+            int max = Length - 1;
+            
+            while (min <= max)
+            {
+                int mid = (min + max) >> 1;
+                var current = GetStringByIndex(mid);
+                var result = string.Compare(key, current, comparison);
+                if (result == 0)
+                {
+                    return mid;
+                }
+                else if (result < 0)
+                {
+                    max = mid - 1;
+                }
+                else
+                {
+                    min = mid + 1;
+                }
+            }
+            return ~(((min + max) >> 1) + 1);
+        }
+
         public T GetByIndex<T>(int index)
         {
             var obj = GetValueTokenTupleByIndex(index).Item1;
-            T result;
-            BlittableJsonReaderObject.ConvertType(obj, out result);
+            BlittableJsonReaderObject.ConvertType(obj, out T result);
             return result;
         }
 

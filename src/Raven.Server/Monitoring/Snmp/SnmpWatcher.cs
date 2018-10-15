@@ -29,7 +29,7 @@ namespace Raven.Server.Monitoring.Snmp
 
         private readonly SemaphoreSlim _locker = new SemaphoreSlim(1, 1);
 
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<RavenServer>(nameof(SnmpWatcher));
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<SnmpWatcher>("Server");
 
         private readonly RavenServer _server;
 
@@ -93,6 +93,16 @@ namespace Raven.Server.Monitoring.Snmp
             }
 
             AsyncHelpers.RunSync(AddDatabases);
+        }
+
+        public ISnmpData GetData(string oid)
+        {
+            if (oid == null)
+                throw new ArgumentNullException(nameof(oid));
+
+            var scalarObject = _objectStore.GetObject(new ObjectIdentifier(oid));
+
+            return scalarObject?.Data;
         }
 
         private void AddDatabaseIfNecessary(string databaseName)

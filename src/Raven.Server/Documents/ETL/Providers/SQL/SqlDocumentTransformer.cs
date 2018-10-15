@@ -1,11 +1,10 @@
 using System;
 using System.Collections.Generic;
 using System.Data;
-using System.IO;
+using System.Linq;
 using Jint.Native;
 using Jint.Runtime;
 using Jint.Runtime.Interop;
-using Raven.Client.Documents.Attachments;
 using Raven.Client.Documents.Operations.ETL;
 using Raven.Client.Documents.Operations.ETL.SQL;
 using Raven.Server.Documents.Patch;
@@ -21,33 +20,44 @@ namespace Raven.Server.Documents.ETL.Providers.SQL
         private readonly Transformation _transformation;
         private readonly SqlEtlConfiguration _config;
         private readonly Dictionary<string, SqlTableWithRecords> _tables;
+        private Dictionary<string, Queue<Attachment>> _loadedAttachments;
+        private readonly List<SqlEtlTable> _tablesForScript;
 
         public SqlDocumentTransformer(Transformation transformation, DocumentDatabase database, DocumentsOperationContext context, SqlEtlConfiguration config)
-            : base(database, context, new PatchRequest(transformation.Script, PatchRequestType.SqlEtl))
+            : base(database, context, new PatchRequest(transformation.Script, PatchRequestType.SqlEtl), null)
         {
             _transformation = transformation;
             _config = config;
-            _tables = new Dictionary<string, SqlTableWithRecords>(_config.SqlTables.Count);
 
-            var tables = new string[config.SqlTables.Count];
+            var destinationTables = transformation.GetCollectionsFromScript();
 
-            for (var i = 0; i < config.SqlTables.Count; i++)
+            LoadToDestinations = destinationTables;
+
+            _tables = new Dictionary<string, SqlTableWithRecords>(destinationTables.Length);
+            _tablesForScript = new List<SqlEtlTable>(destinationTables.Length);
+
+            // ReSharper disable once ForCanBeConvertedToForeach
+            for (var i = 0; i < _config.SqlTables.Count; i++)
             {
-                tables[i] = config.SqlTables[i].TableName;
+                var table = _config.SqlTables[i];
+
+                if (destinationTables.Contains(table.TableName, StringComparer.OrdinalIgnoreCase))
+                    _tablesForScript.Add(table);
             }
 
-            LoadToDestinations = tables;
+            if (_transformation.IsLoadingAttachments)
+               _loadedAttachments = new Dictionary<string, Queue<Attachment>>(StringComparer.OrdinalIgnoreCase);
         }
 
-        public override void Initalize()
+        public override void Initialize(bool debugMode)
         {
-            base.Initalize();
+            base.Initialize(debugMode);
+            
+            DocumentScript.ScriptEngine.SetValue("varchar",
+                new ClrFunctionInstance(DocumentScript.ScriptEngine, (value, values) => ToVarcharTranslator(VarcharFunctionCall.AnsiStringType, values)));
 
-            SingleRun.ScriptEngine.SetValue("varchar",
-                new ClrFunctionInstance(SingleRun.ScriptEngine, (value, values) => ToVarcharTranslator(VarcharFunctionCall.AnsiStringType, values)));
-
-            SingleRun.ScriptEngine.SetValue("nvarchar",
-                new ClrFunctionInstance(SingleRun.ScriptEngine, (value, values) => ToVarcharTranslator(VarcharFunctionCall.StringType, values)));
+            DocumentScript.ScriptEngine.SetValue("nvarchar",
+                new ClrFunctionInstance(DocumentScript.ScriptEngine, (value, values) => ToVarcharTranslator(VarcharFunctionCall.StringType, values)));
         }
 
         protected override string[] LoadToDestinations { get; }
@@ -72,16 +82,13 @@ namespace Raven.Server.Documents.ETL.Providers.SQL
                     Type = prop.Token
                 };
 
-
-                if (_transformation.HasLoadAttachment && 
+                if (_transformation.IsLoadingAttachments && 
                     prop.Token == BlittableJsonToken.String && IsLoadAttachment(prop.Value as LazyStringValue, out var attachmentName))
                 {
-                    var attachment = Database.DocumentsStorage.AttachmentsStorage.GetAttachment(Context, Current.DocumentId,
-                        attachmentName, AttachmentType.Document, Current.Document.ChangeVector);
-                    var attachmentStream = attachment?.Stream ?? Stream.Null;
+                    var attachment = _loadedAttachments[attachmentName].Dequeue();
 
                     sqlColumn.Type = 0;
-                    sqlColumn.Value = attachmentStream;
+                    sqlColumn.Value = attachment.Stream;
                 }
 
                 columns.Add(sqlColumn);
@@ -115,21 +122,46 @@ namespace Raven.Server.Documents.ETL.Providers.SQL
             return true;
         }
 
+        protected override void AddLoadedAttachment(JsValue reference, string name, Attachment attachment)
+        {
+            if (_loadedAttachments.TryGetValue(name, out var loadedAttachments) == false)
+            {
+                loadedAttachments = new Queue<Attachment>();
+                _loadedAttachments.Add(name, loadedAttachments);
+            }
+
+            loadedAttachments.Enqueue(attachment);
+        }
+
+        protected override void AddLoadedCounter(JsValue reference, string name, long value)
+        {
+            throw new NotSupportedException("Counters aren't supported by SQL ETL");
+        }
 
         private SqlTableWithRecords GetOrAdd(string tableName)
         {
             if (_tables.TryGetValue(tableName, out SqlTableWithRecords table) == false)
             {
+                var sqlEtlTable = _config.SqlTables.Find(x => x.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase));
+
+                if (sqlEtlTable == null)
+                    ThrowTableNotDefinedInConfig(tableName);
+
                 _tables[tableName] =
-                    table = new SqlTableWithRecords(_config.SqlTables.Find(x => x.TableName.Equals(tableName, StringComparison.OrdinalIgnoreCase)));
+                    table = new SqlTableWithRecords(sqlEtlTable);
             }
 
             return table;
         }
 
-        public override IEnumerable<SqlTableWithRecords> GetTransformedResults()
+        private static void ThrowTableNotDefinedInConfig(string tableName)
         {
-            return _tables.Values;
+            throw new InvalidOperationException($"Table '{tableName}' was not defined in the configuration of SQL ETL task");
+        }
+
+        public override List<SqlTableWithRecords> GetTransformedResults()
+        {
+            return _tables.Values.ToList();
         }
 
         public override void Transform(ToSqlItem item)
@@ -138,15 +170,15 @@ namespace Raven.Server.Documents.ETL.Providers.SQL
             {
                 Current = item;
 
-                SingleRun.Run(Context, Context, "execute", new object[] { Current.Document }).Dispose();
+                DocumentScript.Run(Context, Context, "execute", new object[] { Current.Document }).Dispose();
             }
 
             // ReSharper disable once ForCanBeConvertedToForeach
-            for (int i = 0; i < _config.SqlTables.Count; i++)
+            for (int i = 0; i < _tablesForScript.Count; i++)
             {
                 // delete all the rows that might already exist there
 
-                var sqlTable = _config.SqlTables[i];
+                var sqlTable = _tablesForScript[i];
 
                 if (sqlTable.InsertOnlyMode)
                     continue;
@@ -165,7 +197,7 @@ namespace Raven.Server.Documents.ETL.Providers.SQL
             if (sizeSpecified && args[1].IsNumber() == false)
                 throw new InvalidOperationException("varchar() / nvarchar(): second argument must be a number");
 
-            var item = SingleRun.ScriptEngine.Object.Construct(Arguments.Empty);
+            var item = DocumentScript.ScriptEngine.Object.Construct(Arguments.Empty);
 
             item.Put(nameof(VarcharFunctionCall.Type), type, true);
             item.Put(nameof(VarcharFunctionCall.Value), args[0], true);
@@ -176,8 +208,8 @@ namespace Raven.Server.Documents.ETL.Providers.SQL
 
         public class VarcharFunctionCall
         {
-            public static JsValue AnsiStringType = new JsValue(DbType.AnsiString.ToString());
-            public static JsValue StringType = new JsValue(DbType.String.ToString());
+            public static JsValue AnsiStringType = DbType.AnsiString.ToString();
+            public static JsValue StringType = DbType.String.ToString();
 
             public DbType Type { get; set; }
             public object Value { get; set; }

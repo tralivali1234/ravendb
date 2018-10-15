@@ -1,6 +1,8 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents;
@@ -18,10 +20,17 @@ namespace FastTests
 {
     public static class RavenTestHelper
     {
+        public static readonly bool IsRunningOnCI;
+
         public static readonly ParallelOptions DefaultParallelOptions = new ParallelOptions
         {
             MaxDegreeOfParallelism = ProcessorInfo.ProcessorCount * 2
         };
+
+        static RavenTestHelper()
+        {
+            bool.TryParse(Environment.GetEnvironmentVariable("RAVEN_IS_RUNNING_ON_CI"), out IsRunningOnCI);
+        }
 
         private static int _pathCount;
 
@@ -29,7 +38,7 @@ namespace FastTests
         {
             testName = testName?.Replace("<", "").Replace(">", "");
 
-            var newDataDir = Path.GetFullPath($".\\Databases\\{testName ?? "TestDatabase"}_{serverPort}-{DateTime.Now:yyyy-MM-dd-HH-mm-ss-fff}-{Interlocked.Increment(ref _pathCount)}");
+            var newDataDir = Path.GetFullPath($".\\Databases\\{testName ?? "TestDatabase"}.{serverPort}-{Interlocked.Increment(ref _pathCount)}");
 
             if (PlatformDetails.RunningOnPosix)
                 newDataDir = PosixHelper.FixLinuxPath(newDataDir);
@@ -86,6 +95,25 @@ namespace FastTests
             var errors = store.Maintenance.ForDatabase(databaseName).Send(new GetIndexErrorsOperation());
 
             Assert.Empty(errors.SelectMany(x => x.Errors));
+        }
+
+        public static void AssertEqualRespectingNewLines(string expected, string actual)
+        {
+            var regex = new Regex("\r*\n");
+            var converted = regex.Replace(expected, Environment.NewLine);
+
+            Assert.Equal(converted, actual);
+        }
+
+        public static void AreEquivalent<T>(IEnumerable<T> expected, IEnumerable<T> actual)
+        {
+            var forMonitor = actual.ToList();
+            Assert.All(expected, e =>
+            {
+                Assert.Contains(e, forMonitor);
+                forMonitor.Remove(e);
+            });
+            Assert.Empty(forMonitor);
         }
     }
 }

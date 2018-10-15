@@ -82,7 +82,7 @@ class taskNode extends layoutable {
         this.type = dto.TaskType;
         this.taskId = dto.TaskId;
         this.state = dto.TaskState;
-        this.name = ongoingTaskModel.generateTaskNameIfNeeded(dto);
+        this.name = dto.TaskName;
         this.responsibleNode = responsibleNode;
     }
 
@@ -695,8 +695,6 @@ class databaseGroupGraph {
 
         const tasksToDelete = this.data.tasks.filter(x => !_.includes(newTasksIds, x.taskId));
         _.pullAll(this.data.tasks, tasksToDelete);
-        
-        //TODO: process subscripitons - bundled for now
     }
      
     onResize() {

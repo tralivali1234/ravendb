@@ -3,6 +3,7 @@
 import clusterTopology = require("models/database/cluster/clusterTopology");
 import generalUtils = require("common/generalUtils");
 import license = require("models/auth/licenseModel");
+import popoverUtils = require("common/popoverUtils");
 
 class clusterNode {
     tag = ko.observable<string>();
@@ -18,9 +19,58 @@ class clusterNode {
     errorDetails = ko.observable<string>();
     isLeader = ko.observable<boolean>();
     isPassive: KnockoutComputed<boolean>;
-    
+    nodeServerVersion = ko.observable<string>();
+    osInfo = ko.observable<Raven.Client.ServerWide.Operations.OsInfo>();
+    osFullName: KnockoutComputed<string>;
+    osTitle: KnockoutComputed<string>;
+    osIcon: KnockoutComputed<string>;
+
     constructor() {
         this.isPassive = ko.pureComputed(() => this.tag() === "?");
+
+        this.osFullName = ko.pureComputed(() => {
+            const osInfo = this.osInfo();
+            if (!osInfo) {
+                return null;
+            }
+
+            let fullName = osInfo.FullName;
+            if (!osInfo.Is64Bit) {
+                fullName += ` 32-bit`;
+            }
+            return fullName;
+        });
+
+        this.osTitle = ko.pureComputed(() => {
+            const osInfo = this.osInfo();
+            if (!osInfo) {
+                return null;
+            }
+
+            let osTitle = `<div>OS Name: <strong>${this.osFullName()}</strong>`;
+
+            if (osInfo.Version) {
+                osTitle += `<br />Version: <strong>${osInfo.Version}</strong>`;
+            }
+            if (osInfo.BuildVersion) {
+                const type = osInfo.Type === "Linux" ? "Kernel" : "Build";
+                osTitle += `<br />${type} Version: <strong>${osInfo.BuildVersion}</strong>`;
+            }
+
+            osTitle += "</div>";
+            return osTitle;
+        });
+        
+        this.osIcon = ko.pureComputed(() => {
+            switch (this.osInfo().Type) {
+                case "Linux":
+                    return "icon-linux";
+                case "Windows":
+                    return "icon-windows";
+                case "MacOS":
+                    return "icon-apple";
+            }
+        })
     }
     
     errorDetailsShort = ko.pureComputed(() => {
@@ -72,6 +122,8 @@ class clusterNode {
         this.usableMemoryInGb(incoming.usableMemoryInGb());
         this.errorDetails(incoming.errorDetails());
         this.isLeader(incoming.isLeader());
+        this.nodeServerVersion(incoming.nodeServerVersion());
+        this.osInfo(incoming.osInfo());
     }
 
     static for(tag: string, serverUrl: string, type: clusterNodeType, connected: boolean, errorDetails?: string) {
@@ -107,7 +159,6 @@ class clusterNode {
     createStateObservable(topologyProvider: KnockoutObservable<clusterTopology>) {
         return ko.pureComputed(() => {
             const topology = topologyProvider();
-
             if (!topology.leader()) {
                 if (this.type() === "Watcher") {
                     return "Waiting";
@@ -118,16 +169,13 @@ class clusterNode {
                 }
             }
 
-            if (topology.nodeTag() !== topology.leader()) {
-                return "";
-            }
-
             return this.connected() ? "Active" : "Error";
         });
     }
 
     createStateClassObservable(topologyProvider: KnockoutObservable<clusterTopology>) {
         return ko.pureComputed(() => {
+            
             const topology = topologyProvider();
             if (!topology.leader()) {
                 if (this.type() === "Watcher") {
@@ -135,10 +183,6 @@ class clusterNode {
                 }
                 
                 return this.connected() ? "state-info" : "state-danger";
-            }
-
-            if (topology.nodeTag() !== topology.leader()) {
-                return "state-unknown";
             }
 
             return this.connected() ? "state-success" : "state-danger";

@@ -8,11 +8,14 @@ using System;
 using System.Globalization;
 using System.IO;
 using System.Net;
+using System.Text;
 using System.Threading.Tasks;
 using Raven.Client;
+using Raven.Client.Documents.Changes;
 using Raven.Client.Exceptions.Documents;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.TrafficWatch;
 using Sparrow;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
@@ -80,11 +83,13 @@ namespace Raven.Server.Documents.Handlers
                         ["ServerTag"] = ServerStore.NodeTag,
                         ["LastRangeAt"] = DateTime.UtcNow.ToString(DefaultFormat.DateTimeOffsetFormatsToWrite)
                     });
+                    if (TrafficWatchManager.HasRegisteredClients)
+                        AddStringToHttpContext(writer.ToString(), TrafficWatchChangeType.Hilo);
                 }
             }
         }
 
-        private class MergedNextHiLoCommand : TransactionOperationsMerger.MergedTransactionCommand
+        internal class MergedNextHiLoCommand : TransactionOperationsMerger.MergedTransactionCommand
         {
             public string Key;
             public DocumentDatabase Database;
@@ -94,7 +99,7 @@ namespace Raven.Server.Documents.Handlers
             public string Prefix;
             public long OldMax;
 
-            public override int Execute(DocumentsOperationContext context)
+            protected override int ExecuteCmd(DocumentsOperationContext context)
             {
                 var hiLoDocumentId = RavenHiloIdPrefix + Key;
                 var prefix = Key + Separator;
@@ -149,6 +154,19 @@ namespace Raven.Server.Documents.Handlers
                 }
                 return 1;
             }
+
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            {
+                return new MergedNextHiLoCommandDto
+                {
+                    Key = Key,
+                    Capacity = Capacity,
+                    Separator = Separator,
+                    LastRangeMax = LastRangeMax,
+                    Prefix = Prefix,
+                    OldMax = OldMax
+                };
+            }
         }
 
         [RavenAction("/databases/*/hilo/return", "PUT", AuthorizationStatus.ValidUser)]
@@ -171,14 +189,14 @@ namespace Raven.Server.Documents.Handlers
             NoContentStatus();
         }
 
-        private class MergedHiLoReturnCommand : TransactionOperationsMerger.MergedTransactionCommand
+        internal class MergedHiLoReturnCommand : TransactionOperationsMerger.MergedTransactionCommand
         {
             public string Key;
             public DocumentDatabase Database;
             public long End;
             public long Last;
 
-            public override int Execute(DocumentsOperationContext context)
+            protected override int ExecuteCmd(DocumentsOperationContext context)
             {
                 var hiLoDocumentId = RavenHiloIdPrefix + Key;
 
@@ -203,7 +221,59 @@ namespace Raven.Server.Documents.Handlers
 
                 return 1;
             }
+
+            public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+            {
+                return new MergedHiLoReturnCommandDto
+                {
+                    Key = Key,
+                    End = End,
+                    Last = Last
+                };
+            }
         }
 
+    }
+
+    internal class MergedHiLoReturnCommandDto : TransactionOperationsMerger.IReplayableCommandDto<HiLoHandler.MergedHiLoReturnCommand>
+    {
+        public string Key;
+        public long End;
+        public long Last;
+
+        public HiLoHandler.MergedHiLoReturnCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+        {
+            return new HiLoHandler.MergedHiLoReturnCommand()
+            {
+                Key = Key,
+                End = End,
+                Last = Last,
+                Database = database
+            };
+        }
+    }
+
+    internal class MergedNextHiLoCommandDto : TransactionOperationsMerger.IReplayableCommandDto<HiLoHandler.MergedNextHiLoCommand>
+    {
+        public string Key;
+        public long Capacity;
+        public string Separator;
+        public long LastRangeMax;
+        public string Prefix;
+        public long OldMax;
+
+        public HiLoHandler.MergedNextHiLoCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+        {
+            return new HiLoHandler.MergedNextHiLoCommand
+            {
+                Key = Key,
+                Capacity = Capacity,
+                Separator = Separator,
+                LastRangeMax = LastRangeMax,
+                Prefix = Prefix,
+                OldMax = OldMax,
+                Database = database
+            };
+        }
     }
 }

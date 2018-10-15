@@ -30,7 +30,7 @@ using Sparrow.Utils;
 
 namespace Raven.Server.Documents.Replication
 {
-    public class ReplicationLoader : IDisposable, IDocumentTombstoneAware
+    public class ReplicationLoader : IDisposable, ITombstoneAware
     {
         public event Action<IncomingReplicationHandler> IncomingReplicationAdded;
         public event Action<IncomingReplicationHandler> IncomingReplicationRemoved;
@@ -67,7 +67,7 @@ namespace Raven.Server.Documents.Replication
         private readonly ConcurrentSet<ConnectionShutdownInfo> _reconnectQueue =
             new ConcurrentSet<ConnectionShutdownInfo>();
 
-        private readonly List<ReplicationNode> _internalDestinations = new List<ReplicationNode>();
+        private readonly ConcurrentBag<ReplicationNode> _internalDestinations = new ConcurrentBag<ReplicationNode>();
         private readonly HashSet<ExternalReplication> _externalDestinations = new HashSet<ExternalReplication>();
 
         private class LastEtagPerDestination
@@ -136,7 +136,7 @@ namespace Raven.Server.Documents.Replication
             _reconnectAttemptTimer = new Timer(state => ForceTryReconnectAll(),
                 null, reconnectTime, reconnectTime);
             MinimalHeartbeatInterval = (int)config.ReplicationMinimalHeartbeat.AsTimeSpan.TotalMilliseconds;
-            database.DocumentTombstoneCleaner.Subscribe(this);
+            database.TombstoneCleaner.Subscribe(this);
         }
 
         public IReadOnlyDictionary<ReplicationNode, ConnectionShutdownInfo> OutgoingFailureInfo
@@ -220,7 +220,7 @@ namespace Raven.Server.Documents.Replication
                         _log.Info($"GetLastEtag response, last etag: {lastEtagFromSrc}");
                     var response = new DynamicJsonValue
                     {
-                        [nameof(ReplicationMessageReply.Type)] = "Ok",
+                        [nameof(ReplicationMessageReply.Type)] = nameof(ReplicationMessageReply.ReplyType.Ok),
                         [nameof(ReplicationMessageReply.MessageType)] = ReplicationMessageType.Heartbeat,
                         [nameof(ReplicationMessageReply.LastEtagAccepted)] = lastEtagFromSrc,
                         [nameof(ReplicationMessageReply.NodeTag)] = _server.NodeTag,
@@ -248,7 +248,7 @@ namespace Raven.Server.Documents.Replication
             var newIncoming = new IncomingReplicationHandler(
                 tcpConnectionOptions,
                 getLatestEtagMessage,
-                this, 
+                this,
                 buffer);
 
             newIncoming.Failed += OnIncomingReceiveFailed;
@@ -384,7 +384,7 @@ namespace Raven.Server.Documents.Replication
             {
                 return;
             }
-            
+
             var conflictSolverChanged = ConflictSolverConfig?.ConflictResolutionChanged(newRecord.ConflictSolverConfig) ?? true;
             if (conflictSolverChanged)
             {
@@ -405,7 +405,7 @@ namespace Raven.Server.Documents.Replication
                 DropOutgoingConnections(Destinations, instancesToDispose);
                 _internalDestinations.Clear();
                 _externalDestinations.Clear();
-                _destinations.Clear();                
+                _destinations.Clear();
                 DisposeConnections(instancesToDispose);
                 return;
             }
@@ -417,7 +417,7 @@ namespace Raven.Server.Documents.Replication
             var destinations = new List<ReplicationNode>();
             destinations.AddRange(_internalDestinations);
             destinations.AddRange(_externalDestinations);
-            _destinations = destinations;            
+            _destinations = destinations;
             _numberOfSiblings = _destinations.Select(x => x.Url).Intersect(_clusterTopology.AllNodes.Select(x => x.Value)).Count();
 
             DisposeConnections(instancesToDispose);
@@ -447,20 +447,20 @@ namespace Raven.Server.Documents.Replication
         {
             if (newDestinations == null)
                 newDestinations = new List<ExternalReplication>();
-           
+
             var addedDestinations = new List<ExternalReplication>();
-            var removedDestiantions = current.ToList();
+            var removedDestinations = current.ToList();
             foreach (var newDestination in newDestinations.ToArray())
             {
-                if(newDestination.Disabled)
+                if (newDestination.Disabled)
                     continue;
-                
-                removedDestiantions.Remove(newDestination);
+
+                removedDestinations.Remove(newDestination);
                 if (current.Contains(newDestination) == false)
                     addedDestinations.Add(newDestination);
             }
 
-            return (addedDestinations, removedDestiantions);
+            return (addedDestinations, removedDestinations);
         }
 
         private void HandleExternalReplication(DatabaseRecord newRecord, List<OutgoingReplicationHandler> instancesToDispose)
@@ -517,7 +517,7 @@ namespace Raven.Server.Documents.Replication
             }
         }
 
-        public void CompleteDeletionIfNeeded()
+        public void CompleteDeletionIfNeeded(CancellationTokenSource cts)
         {
             using (_server.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
             using (ctx.OpenReadTransaction())
@@ -525,11 +525,26 @@ namespace Raven.Server.Documents.Replication
                 var record = _server.Cluster.ReadDatabase(ctx, Database.Name, out var _);
                 if (record?.DeletionInProgress?.ContainsKey(_server.NodeTag) == true)
                 {
-                    _server.DatabasesLandlord.ShouldDeleteDatabase(Database.Name, record);
+                    try
+                    {
+                        cts.Cancel();
+                    }
+                    catch
+                    {
+                        // nothing that we can do about it.
+                        // probably the database is being deleted.
+                    }
+                    finally
+                    {
+                        TaskExecutor.Execute(state =>
+                        {
+                            _server.DatabasesLandlord.DeleteDatabase(Database.Name, record.DeletionInProgress[_server.NodeTag], record);
+                        }, null);
+                    }
                 }
             }
         }
-        
+
         private bool ValidateConnectionString(DatabaseRecord newRecord, ExternalReplication externalReplication, out RavenConnectionString connectionString)
         {
             connectionString = null;
@@ -575,11 +590,11 @@ namespace Raven.Server.Documents.Replication
         }
 
         private void HandleInternalReplication(DatabaseRecord newRecord, List<OutgoingReplicationHandler> instancesToDispose)
-        { 
+        {
             var newInternalDestinations =
                 newRecord.Topology?.GetDestinations(_server.NodeTag, Database.Name, newRecord.DeletionInProgress, _clusterTopology, _server.Engine.CurrentState);
             var internalConnections = DatabaseTopology.FindChanges(_internalDestinations, newInternalDestinations);
-           
+
             if (internalConnections.RemovedDestiantions.Count > 0)
             {
                 var removed = internalConnections.RemovedDestiantions.Select(r => new InternalReplication
@@ -602,7 +617,10 @@ namespace Raven.Server.Documents.Replication
                 StartOutgoingConnections(added.ToList());
             }
             _internalDestinations.Clear();
-            _internalDestinations.AddRange(newInternalDestinations);
+            foreach (var item in newInternalDestinations)
+            {
+                _internalDestinations.Add(item);
+            }
         }
 
         private void StartOutgoingConnections(IReadOnlyCollection<ReplicationNode> connectionsToAdd, bool external = false)
@@ -679,7 +697,7 @@ namespace Raven.Server.Documents.Replication
             outgoingReplication.Failed += OnOutgoingSendingFailed;
             outgoingReplication.SuccessfulTwoWaysCommunication += OnOutgoingSendingSucceeded;
             _outgoing.TryAdd(outgoingReplication); // can't fail, this is a brand new instance
-            
+
             outgoingReplication.Start();
 
             OutgoingReplicationAdded?.Invoke(outgoingReplication);
@@ -697,13 +715,11 @@ namespace Raven.Server.Documents.Replication
             {
                 if (node is ExternalReplication exNode)
                 {
-                    using (var requestExecutor = RequestExecutor.Create(exNode.ConnectionString.TopologyDiscoveryUrls, exNode.ConnectionString.Database,
-                        _server.Server.Certificate.Certificate,
-                        DocumentConventions.Default))
+                    using (var requestExecutor = RequestExecutor.Create(exNode.ConnectionString.TopologyDiscoveryUrls, exNode.ConnectionString.Database, _server.Server.Certificate.Certificate, DocumentConventions.Default))
                     using (_server.ContextPool.AllocateOperationContext(out TransactionOperationContext ctx))
                     {
                         var database = exNode.ConnectionString.Database;
-                        var cmd = new GetTcpInfoCommand("extrenal-replication", database);
+                        var cmd = new GetTcpInfoCommand("external-replication", database);
                         requestExecutor.Execute(cmd, ctx);
                         node.Database = database;
                         node.Url = requestExecutor.Url;
@@ -807,7 +823,7 @@ namespace Raven.Server.Documents.Replication
             if (_outgoingFailureInfo.TryGetValue(instance.Node, out ConnectionShutdownInfo failureInfo))
                 failureInfo.Reset();
 
-            
+
             while (_waitForReplicationTasks.TryDequeue(out TaskCompletionSource<object> result))
             {
                 TaskExecutor.Complete(result);
@@ -853,12 +869,12 @@ namespace Raven.Server.Documents.Replication
             foreach (var outgoing in _outgoing)
                 ea.Execute(outgoing.Dispose);
 
-            Database.DocumentTombstoneCleaner?.Unsubscribe(this);
+            Database.TombstoneCleaner?.Unsubscribe(this);
 
             ea.ThrowIfNeeded();
         }
 
-        public Dictionary<string, long> GetLastProcessedDocumentTombstonesPerCollection()
+        public Dictionary<string, long> GetLastProcessedTombstonesPerCollection()
         {
             var minEtag = MinimalEtagForReplication;
             var result = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase)
@@ -892,20 +908,20 @@ namespace Raven.Server.Documents.Replication
                 tooManyTombstones = Database.DocumentsStorage.HasMoreOfTombstonesAfter(context, minEtag, maxTombstones);
             }
 
-            if (!tooManyTombstones)
-                return result;
-
-            Database.NotificationCenter.Add(
-                PerformanceHint.Create(
-                    database: Database.Name,
-                    title: "Large number of tombstones because of disabled replication destination",
-                    msg:
+            if (tooManyTombstones)
+            {
+                Database.NotificationCenter.Add(
+                    PerformanceHint.Create(
+                        database: Database.Name,
+                        title: "Large number of tombstones because of disabled replication destination",
+                        msg:
                         $"The disabled replication destination {disabledReplicationNode.FromString()} prevents from cleaning large number of tombstones.",
 
-                    type: PerformanceHintType.Replication,
-                    notificationSeverity: NotificationSeverity.Warning,
-                    source: disabledReplicationNode.FromString()
-                ));
+                        type: PerformanceHintType.Replication,
+                        notificationSeverity: NotificationSeverity.Warning,
+                        source: disabledReplicationNode.FromString()
+                    ));
+            }
 
             return result;
         }
@@ -952,12 +968,12 @@ namespace Raven.Server.Documents.Replication
         }
 
         public int GetSizeOfMajority()
-        {            
-            return (_numberOfSiblings+1) / 2 + 1;
+        {
+            return (_numberOfSiblings + 1) / 2 + 1;
         }
 
         public async Task<int> WaitForReplicationAsync(int numberOfReplicasToWaitFor, TimeSpan waitForReplicasTimeout, string lastChangeVector)
-        {            
+        {
             var sp = Stopwatch.StartNew();
             while (true)
             {
@@ -983,7 +999,7 @@ namespace Raven.Server.Documents.Replication
                         _log.Info($"Get exception while trying to get write assurance on a database with {numberOfReplicasToWaitFor} servers. " +
                                   $"Written so far to {past} servers only. " +
                                   $"LastChangeVector is: {lastChangeVector}.", e);
-                    return ReplicatedPastInternalDestinations(internalDestinations,lastChangeVector);
+                    return ReplicatedPastInternalDestinations(internalDestinations, lastChangeVector);
                 }
             }
         }
@@ -1010,7 +1026,7 @@ namespace Raven.Server.Documents.Replication
             return count;
         }
 
-        private int ReplicatedPastInternalDestinations(HashSet<string> internalUrls,string changeVector)
+        private int ReplicatedPastInternalDestinations(HashSet<string> internalUrls, string changeVector)
         {
             var count = 0;
             foreach (var destination in _outgoing)

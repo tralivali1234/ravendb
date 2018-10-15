@@ -1,11 +1,16 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using Jint.Native;
+using System.Runtime.Serialization;
+using Esprima.Ast;
+using System.Linq;using Jint.Native;
+using Raven.Client;
 using Raven.Client.Documents.Operations;
+using Raven.Client.Exceptions;
+using Raven.Client.Extensions;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
-using Voron.Exceptions;
+using Sparrow.Json.Parsing;
 
 namespace Raven.Server.Documents.Patch
 {
@@ -25,8 +30,9 @@ namespace Raven.Server.Documents.Patch
         private readonly ScriptRunner.SingleRun _runIfMissing;
         private ScriptRunner.ReturnRun _returnRun;
         private ScriptRunner.ReturnRun _returnRunIfMissing;
-        private readonly BlittableJsonReaderObject _patchIfMissingArgs;
-        private readonly BlittableJsonReaderObject _patchArgs;
+
+        private readonly (PatchRequest Run, BlittableJsonReaderObject Args) _patchIfMissing;
+        private readonly (PatchRequest Run, BlittableJsonReaderObject Args) _patch;
 
         public List<string> DebugOutput => _run.DebugOutput;
 
@@ -37,32 +43,37 @@ namespace Raven.Server.Documents.Patch
             string id,
             LazyStringValue expectedChangeVector,
             bool skipPatchIfChangeVectorMismatch,
-            (PatchRequest run, BlittableJsonReaderObject args) patch,
-            (PatchRequest run, BlittableJsonReaderObject args) patchIfMissing,
+            (PatchRequest Run, BlittableJsonReaderObject Args) patch,
+            (PatchRequest Run, BlittableJsonReaderObject Args) patchIfMissing,
             DocumentDatabase database,
             bool isTest,
             bool debugMode,
             bool collectResultsNeeded)
         {
             _externalContext = collectResultsNeeded ? context : null;
-            _patchIfMissingArgs = patchIfMissing.args;
-            _patchArgs = patch.args;
-            _returnRun = database.Scripts.GetScriptRunner(patch.run, false, out _run);
+            _patchIfMissing = patchIfMissing;
+            _patch = patch;
+            _returnRun = database.Scripts.GetScriptRunner(patch.Run, false, out _run);
             _run.DebugMode = debugMode;
             if (_runIfMissing != null)
                 _runIfMissing.DebugMode = debugMode;
-            _returnRunIfMissing = database.Scripts.GetScriptRunner(patchIfMissing.run, false, out _runIfMissing);
+            _returnRunIfMissing = database.Scripts.GetScriptRunner(patchIfMissing.Run, false, out _runIfMissing);
             _id = id;
             _expectedChangeVector = expectedChangeVector;
             _skipPatchIfChangeVectorMismatch = skipPatchIfChangeVectorMismatch;
             _database = database;
             _isTest = isTest;
             _debugMode = debugMode;
+
+            if (string.IsNullOrEmpty(id) || id.EndsWith('/') || id.EndsWith('|'))
+            {
+                throw new ArgumentException("The id argument has invalid value: '" + id + "'", "id");
+            }
         }
 
         public PatchResult PatchResult { get; private set; }
 
-        public override int Execute(DocumentsOperationContext context)
+        protected override int ExecuteCmd(DocumentsOperationContext context)
         {
             var originalDocument = _database.DocumentsStorage.Get(context, _id);
             _run.DebugMode = _debugMode;
@@ -115,29 +126,24 @@ namespace Raven.Server.Documents.Patch
             }
 
             object documentInstance;
-            var args = _patchArgs;
+            var args = _patch.Args;
             BlittableJsonReaderObject originalDoc;
             if (originalDocument == null)
             {
                 _run = _runIfMissing;
-                args = _patchIfMissingArgs;
+                args = _patchIfMissing.Args;
                 documentInstance = _runIfMissing.CreateEmptyObject();
                 originalDoc = null;
             }
             else
             {
-                var translated = (BlittableObjectInstance)((JsValue)_run.Translate(context, originalDocument)).AsObject();
-                // here we need to use the _cloned_ version of the document, since the patch may
-                // change it
-                originalDoc = translated.Blittable;
-                originalDocument.Data = null; // prevent access to this by accident
-                documentInstance = translated;
+                documentInstance = UpdateOriginalDocument();
             }
 
-            // we will to acccess this value, and the original document data may be changed by
+            // we will to access this value, and the original document data may be changed by
             // the actions of the script, so we translate (which will create a clone) then use
             // that clone later
-            using (var scriptResult = _run.Run(context, context, "execute", new[] { documentInstance, args }))
+            using (var scriptResult = _run.Run(context, context, "execute", _id, new[] { documentInstance, args }))
             {
                 var modifiedDocument = scriptResult.TranslateToObject(_externalContext ?? context, usageMode: BlittableJsonDocumentBuilder.UsageMode.ToDisk);
 
@@ -156,6 +162,34 @@ namespace Raven.Server.Documents.Patch
                     return 1;
                 }
 
+                if (_run.RefreshOriginalDocument)
+                {
+                    originalDocument = _database.DocumentsStorage.Get(context, _id);
+                    documentInstance = UpdateOriginalDocument();
+                }
+
+                if (_run.UpdatedDocumentCounterIds != null)
+                {
+                    foreach (var docId in _run.UpdatedDocumentCounterIds)
+                    {
+                        if (docId.Equals(_id, StringComparison.OrdinalIgnoreCase))
+                        {
+                            Debug.Assert(originalDocument != null);
+                            modifiedDocument = UpdateCountersInMetadata(context, modifiedDocument, docId, ref originalDocument.Flags);
+                        }
+                        else
+                        {
+                            var docToUpdate = _database.DocumentsStorage.Get(context, docId);
+                            var docBlittableToUpdate = UpdateCountersInMetadata(context, docToUpdate.Data, docId, ref docToUpdate.Flags);
+                            if (_isTest == false)
+                            {
+                                _database.DocumentsStorage.Put(context, docId,
+                                    docToUpdate.ChangeVector, docBlittableToUpdate, null, null, docToUpdate.Flags);
+                            }
+                        }
+                    }
+                }
+
                 DocumentsStorage.PutOperationResults? putResult = null;
 
                 if (originalDoc == null)
@@ -166,12 +200,14 @@ namespace Raven.Server.Documents.Patch
                     result.Status = PatchStatus.Created;
                 }
                 else if (DocumentCompare.IsEqualTo(originalDoc, modifiedDocument,
-                    tryMergeAttachmentsConflict: true) == DocumentCompareResult.NotEqual)
+                    tryMergeMetadataConflicts: true) != DocumentCompareResult.Equal)
                 {
                     Debug.Assert(originalDocument != null);
                     if (_isTest == false || _run.PutOrDeleteCalled)
+                    {
                         putResult = _database.DocumentsStorage.Put(context, originalDocument.Id,
                             originalDocument.ChangeVector, modifiedDocument, null, null, originalDocument.Flags);
+                    }
 
                     result.Status = PatchStatus.Patched;
                 }
@@ -180,11 +216,58 @@ namespace Raven.Server.Documents.Patch
                 {
                     result.ChangeVector = putResult.Value.ChangeVector;
                     result.Collection = putResult.Value.Collection.Name;
+                    result.LastModified = putResult.Value.LastModified;
                 }
 
                 PatchResult = result;
                 return 1;
             }
+
+            BlittableObjectInstance UpdateOriginalDocument()
+            {
+                originalDoc = null;
+
+                if (originalDocument != null)
+                {
+                    var translated = (BlittableObjectInstance)((JsValue)_run.Translate(context, originalDocument)).AsObject();
+                    // here we need to use the _cloned_ version of the document, since the patch may
+                    // change it
+                    originalDoc = translated.Blittable;
+                    originalDocument.Data = null; // prevent access to this by accident
+
+                    return translated;
+                }
+
+                return null;
+            }
+        }
+
+        private static BlittableJsonReaderObject UpdateCountersInMetadata(
+            DocumentsOperationContext context,
+            BlittableJsonReaderObject modifiedDocument,
+            string id, ref DocumentFlags flags)
+        {
+            var metadata = modifiedDocument.GetMetadata();
+            if (metadata.Modifications == null)
+                metadata.Modifications = new DynamicJsonValue(metadata);
+
+            var countersFromStorage = context.DocumentDatabase.DocumentsStorage.CountersStorage.GetCountersForDocument(context, id).ToList();
+            if (countersFromStorage.Count == 0)
+            {
+                metadata.Modifications.Remove(Constants.Documents.Metadata.Counters);
+                flags &= ~DocumentFlags.HasCounters;
+            }
+            else
+            {
+                metadata.Modifications[Constants.Documents.Metadata.Counters] = new DynamicJsonArray(countersFromStorage);
+                flags |= DocumentFlags.HasCounters;
+            }
+
+            modifiedDocument.Modifications = new DynamicJsonValue(modifiedDocument)
+                {[Constants.Documents.Metadata.Key] = metadata};
+
+            modifiedDocument = context.ReadObject(modifiedDocument, id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
+            return modifiedDocument;
         }
 
         public void Dispose()
@@ -192,5 +275,48 @@ namespace Raven.Server.Documents.Patch
             _returnRun.Dispose();
             _returnRunIfMissing.Dispose();
         }
+
+        public override TransactionOperationsMerger.IReplayableCommandDto<TransactionOperationsMerger.MergedTransactionCommand> ToDto(JsonOperationContext context)
+        {
+            return new PatchDocumentCommandDto
+            {
+                Id = _id,
+                ExpectedChangeVector = _expectedChangeVector,
+                SkipPatchIfChangeVectorMismatch = _skipPatchIfChangeVectorMismatch,
+                Patch = _patch,
+                PatchIfMissing = _patchIfMissing,
+                IsTest = _isTest,
+                DebugMode = _debugMode,
+                CollectResultsNeeded = _externalContext != null
+            };
+    }
+    }
+
+    public class PatchDocumentCommandDto : TransactionOperationsMerger.IReplayableCommandDto<PatchDocumentCommand>
+    {
+        public string Id;
+        public LazyStringValue ExpectedChangeVector;
+        public bool SkipPatchIfChangeVectorMismatch;
+        public (PatchRequest run, BlittableJsonReaderObject args) Patch;
+        public (PatchRequest run, BlittableJsonReaderObject args) PatchIfMissing;
+        public bool IsTest;
+        public bool DebugMode;
+        public bool CollectResultsNeeded;
+
+        public PatchDocumentCommand ToCommand(DocumentsOperationContext context, DocumentDatabase database)
+        {
+            return new PatchDocumentCommand(
+                context,
+                Id,
+                ExpectedChangeVector,
+                SkipPatchIfChangeVectorMismatch,
+                Patch,
+                PatchIfMissing,
+                database,
+                IsTest,
+                DebugMode,
+                CollectResultsNeeded);
+        }
     }
 }
+

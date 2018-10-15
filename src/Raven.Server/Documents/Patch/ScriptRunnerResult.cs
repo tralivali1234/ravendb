@@ -1,4 +1,5 @@
 using System;
+using Jint;
 using Jint.Native;
 using Jint.Native.Object;
 using Sparrow.Json;
@@ -16,9 +17,11 @@ namespace Raven.Server.Documents.Patch
             _instance = instance;
         }
 
+        public JsValue Instance => _instance;
+
         public void Set(string name, string value)
         {
-            ((BlittableObjectInstance)_instance.AsObject()).Put(name, new JsValue(value), false);
+            ((BlittableObjectInstance)_instance.AsObject()).Put(name, value, false);
         }
 
         public ObjectInstance GetOrCreate(string name)

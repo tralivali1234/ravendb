@@ -25,11 +25,12 @@ namespace FastTests.Issues
         {
             var alreadyHandledInStudio = new HashSet<Operations.OperationType>
             {
-                Operations.OperationType.UpdateByIndex,
-                Operations.OperationType.DeleteByIndex,
+                Operations.OperationType.UpdateByQuery,
+                Operations.OperationType.DeleteByQuery,
                 Operations.OperationType.DeleteByCollection,
                 Operations.OperationType.DatabaseExport,
                 Operations.OperationType.DatabaseImport,
+                Operations.OperationType.DatabaseMigrationRavenDb,
                 Operations.OperationType.DatabaseMigration,
                 Operations.OperationType.DatabaseRestore,
                 Operations.OperationType.BulkInsert,
@@ -37,7 +38,10 @@ namespace FastTests.Issues
                 Operations.OperationType.DatabaseCompact,
                 Operations.OperationType.CertificateGeneration,
                 Operations.OperationType.MigrationFromLegacyData,
-                Operations.OperationType.CollectionImportFromCsv
+                Operations.OperationType.CollectionImportFromCsv,
+                Operations.OperationType.DatabaseBackup,
+                Operations.OperationType.MigrationFromSql,
+                Operations.OperationType.ReplayTransactionCommands
             };
 
             var operationWithoutDetails = new HashSet<Operations.OperationType>

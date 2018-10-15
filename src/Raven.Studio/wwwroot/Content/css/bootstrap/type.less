@@ -102,6 +102,13 @@ mark,
 .text-muted {
   color: @text-muted;
 }
+.text-black {
+    .text-emphasis-variant(@gray-base);
+}
+
+.text-gray {
+  .text-emphasis-variant(@gray);
+}
 .text-primary {
   .text-emphasis-variant(@brand-primary);
 }

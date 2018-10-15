@@ -1,7 +1,9 @@
 ﻿using System;
 using System.Collections.Generic;
 using Raven.Client.Documents.Indexes;
+using Raven.Server.Documents.Indexes.Persistence.Lucene.Documents;
 using Raven.Server.Documents.Indexes.Static.Spatial;
+using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Sparrow.Json;
 using Sparrow.Utils;
@@ -15,6 +17,9 @@ namespace Raven.Server.Documents.Indexes.Static
         private IndexingStatsScope _loadDocumentStats;
         private readonly DocumentsStorage _documentsStorage;
         private readonly DocumentsOperationContext _documentsContext;
+
+        public UnmanagedBuffersPoolWithLowMemoryHandling UnmanagedBuffersPool { get; }
+
         private readonly Func<string, SpatialField> _getSpatialField;
 
         /// [collection: [key: [referenceKeys]]]
@@ -39,10 +44,13 @@ namespace Raven.Server.Documents.Indexes.Static
 
         public readonly IndexDefinitionBase IndexDefinition;
 
-        public CurrentIndexingScope(DocumentsStorage documentsStorage, DocumentsOperationContext documentsContext, IndexDefinitionBase indexDefinition, TransactionOperationContext indexContext, Func<string, SpatialField> getSpatialField)
+        public LuceneDocumentConverter CreateFieldConverter;
+
+        public CurrentIndexingScope(DocumentsStorage documentsStorage, DocumentsOperationContext documentsContext, IndexDefinitionBase indexDefinition, TransactionOperationContext indexContext, Func<string, SpatialField> getSpatialField, UnmanagedBuffersPoolWithLowMemoryHandling _unmanagedBuffersPool)
         {
             _documentsStorage = documentsStorage;
             _documentsContext = documentsContext;
+            UnmanagedBuffersPool = _unmanagedBuffersPool;
             IndexDefinition = indexDefinition;
             IndexContext = indexContext;
             _getSpatialField = getSpatialField;

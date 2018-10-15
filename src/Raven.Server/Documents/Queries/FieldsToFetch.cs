@@ -79,6 +79,18 @@ namespace Raven.Server.Documents.Queries
                 return fieldToFetch;
             }
 
+            if (selectField.IsCounter)
+            {
+                var fieldToFetch = new FieldToFetch(selectField.Name, selectField, selectField.Alias ?? selectField.Name,
+                    canExtractFromIndex: false, isDocumentId: false);
+                if (selectField.FunctionArgs != null)
+                {
+                    fieldToFetch.FunctionArgs = new FieldToFetch[0];
+                }
+
+                return fieldToFetch;
+            }
+
             if (selectFieldName == null)
             {
                 if (selectField.IsGroupByKey == false)
@@ -135,11 +147,30 @@ namespace Raven.Server.Documents.Queries
                 }
             }
 
-            var extract = indexDefinition.MapFields.TryGetValue(selectFieldName, out var value) && value.Storage == FieldStorage.Yes;
+            var bySourceAlias = ShouldTryToExtractBySourceAliasName(selectFieldName.Value, selectField);
+            var key = bySourceAlias
+                    ? selectField.SourceAlias
+                    : selectFieldName;
+
+            var extract = indexDefinition.MapFields.TryGetValue(key, out var value) && 
+                          value.Storage == FieldStorage.Yes;
+
             if (extract)
                 anyExtractableFromIndex = true;
 
-            return new FieldToFetch(selectFieldName, selectField, selectField.Alias, extract | indexDefinition.HasDynamicFields, isDocumentId: false);
+            if (bySourceAlias == false)
+            {
+                extract |= indexDefinition.HasDynamicFields;
+            }
+
+            return new FieldToFetch(selectFieldName, selectField, selectField.Alias, extract, isDocumentId: false);
+        }
+
+        private static bool ShouldTryToExtractBySourceAliasName(string selectFieldName, SelectField selectField)
+        {
+            return selectFieldName.Length == 0 &&
+                   selectField.HasSourceAlias &&
+                   selectField.SourceAlias != null;
         }
 
         private static void ThrowInvalidFetchAllStoredDocuments()
@@ -165,8 +196,8 @@ namespace Raven.Server.Documents.Queries
             singleFieldNoAlias = selectFields.Length == 1 &&
                                  ((selectFields[0].Alias == null &&
                                    selectFields[0].Function != null) ||
-                                   (selectFields[0].Name == string.Empty &&
-                                    selectFields[0].Function == null)
+                                  (selectFields[0].Name == string.Empty &&
+                                   selectFields[0].Function == null)
                                  );
             for (var i = 0; i < selectFields.Length; i++)
             {

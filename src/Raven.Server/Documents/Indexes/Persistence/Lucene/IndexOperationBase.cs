@@ -1,12 +1,10 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 using Lucene.Net.Analysis;
 using Lucene.Net.Search;
-using NetTopologySuite.Index.Bintree;
 using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Persistence.Lucene.Analyzers;
@@ -42,35 +40,39 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
             if (indexDefinition.IndexFields.ContainsKey(Constants.Documents.Indexing.Fields.AllFields))
                 throw new InvalidOperationException($"Detected '{Constants.Documents.Indexing.Fields.AllFields}'. This field should not be present here, because inheritance is done elsewhere.");
 
-            Analyzer defaultAnalyzer = null;
+            var hasDefaultFieldOptions = false;
+            Analyzer defaultAnalyzerToUse = null;
             RavenStandardAnalyzer standardAnalyzer = null;
             KeywordAnalyzer keywordAnalyzer = null;
+            Analyzer defaultAnalyzer = null;
             if (indexDefinition is MapIndexDefinition mid)
             {
                 if (mid.IndexDefinition.Fields.TryGetValue(Constants.Documents.Indexing.Fields.AllFields, out var value))
                 {
-                    switch (value.Indexing )
+                    hasDefaultFieldOptions = true;
+
+                    switch (value.Indexing)
                     {
-                            case FieldIndexing.Exact:
-                                defaultAnalyzer = keywordAnalyzer = new KeywordAnalyzer();
-                                break;
-                            case FieldIndexing.Search:
-                                if (value.Analyzer != null)
-                                    defaultAnalyzer = GetAnalyzer(Constants.Documents.Indexing.Fields.AllFields, value.Analyzer, forQuerying);
-                                if(defaultAnalyzer == null)
-                                    defaultAnalyzer = standardAnalyzer = new RavenStandardAnalyzer(Version.LUCENE_29);
-                                break;
-                            default:
-                                // explictly ignore all other values
-                                break;
+                        case FieldIndexing.Exact:
+                            defaultAnalyzerToUse = keywordAnalyzer = new KeywordAnalyzer();
+                            break;
+                        case FieldIndexing.Search:
+                            if (value.Analyzer != null)
+                                defaultAnalyzerToUse = GetAnalyzer(Constants.Documents.Indexing.Fields.AllFields, value.Analyzer, forQuerying);
+                            if (defaultAnalyzerToUse == null)
+                                defaultAnalyzerToUse = standardAnalyzer = new RavenStandardAnalyzer(Version.LUCENE_29);
+                            break;
+                        default:
+                            // explicitly ignore all other values
+                            break;
                     }
                 }
             }
 
-            defaultAnalyzer = defaultAnalyzer ?? createDefaultAnalyzer();
+            if (defaultAnalyzerToUse == null)
+                defaultAnalyzerToUse = defaultAnalyzer = createDefaultAnalyzer();
 
-            
-            var perFieldAnalyzerWrapper = new RavenPerFieldAnalyzerWrapper(defaultAnalyzer);
+            var perFieldAnalyzerWrapper = new RavenPerFieldAnalyzerWrapper(defaultAnalyzerToUse);
             foreach (var field in indexDefinition.IndexFields)
             {
                 var fieldName = field.Value.Name;
@@ -91,7 +93,18 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                             continue;
                         }
                         AddStandardAnalyzer(fieldName);
+                        break;
+                    case FieldIndexing.Default:
+                        if (hasDefaultFieldOptions)
+                        {
+                            // if we have default field options then we need to take into account overrides for regular fields
 
+                            if (defaultAnalyzer == null)
+                                defaultAnalyzer = createDefaultAnalyzer();
+
+                            perFieldAnalyzerWrapper.AddAnalyzer(fieldName, defaultAnalyzer);
+                            continue;
+                        }
                         break;
                 }
             }
@@ -154,7 +167,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                 // RavenPerFieldAnalyzerWrapper searchAnalyzer = null;
                 try
                 {
-                    //_persistance._a
+                    //_persistence._a
                     //searchAnalyzer = parent.CreateAnalyzer(new LowerCaseKeywordAnalyzer(), toDispose, true);
                     //searchAnalyzer = parent.AnalyzerGenerators.Aggregate(searchAnalyzer, (currentAnalyzer, generator) =>
                     //{
@@ -179,7 +192,7 @@ namespace Raven.Server.Documents.Indexes.Persistence.Lucene
                         }
 
                         using (closeServerTransaction)
-                            documentQuery = QueryBuilder.BuildQuery(serverContext, context, metadata, whereExpression, parameters, analyzer, factories);
+                            documentQuery = QueryBuilder.BuildQuery(serverContext, context, metadata, whereExpression, _index.Definition, parameters, analyzer, factories);
                     }
                     finally
                     {

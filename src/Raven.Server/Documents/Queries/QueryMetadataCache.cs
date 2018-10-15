@@ -1,4 +1,7 @@
-﻿using Raven.Client.Documents.Queries;
+﻿using System;
+using System.Collections;
+using System.Collections.Generic;
+using Raven.Client.Documents.Queries;
 using Sparrow;
 using Sparrow.Json;
 
@@ -10,12 +13,12 @@ namespace Raven.Server.Documents.Queries
 
         private readonly QueryMetadata[] _cache = new QueryMetadata[CacheSize];
 
-        public bool TryGetMetadata(IndexQueryBase<BlittableJsonReaderObject> query, JsonOperationContext context, out ulong metadataHash, out QueryMetadata metadata)
+        public bool TryGetMetadata(IndexQueryBase<BlittableJsonReaderObject> query, out ulong metadataHash, out QueryMetadata metadata)
         {
             metadataHash = 0;
             metadata = null;
 
-            if (query == null || query.Query == null || query.QueryParameters == null || query.QueryParameters.Count == 0)
+            if (query == null || query.Query == null)
                 return false;
 
             metadataHash = GetQueryMetadataHash(query);
@@ -36,7 +39,16 @@ namespace Raven.Server.Documents.Queries
             // for the query plan that we use, at any rate, they will either error
             // if the query uses them and it is missing or they are there and will
             // noop because they aren't being used
-            return (query.Query == metadata.QueryText);
+            var shouldUseCachedItem = (query.Query == metadata.QueryText);
+
+            if (shouldUseCachedItem)
+            {
+                metadata.LastQueriedAt = DateTime.UtcNow;
+            }
+            return shouldUseCachedItem;
+
+
+            
         }
 
         public void MaybeAddToCache(QueryMetadata metadata, string indexName)
@@ -73,9 +85,14 @@ namespace Raven.Server.Documents.Queries
         private static ulong GetQueryMetadataHash(IndexQueryBase<BlittableJsonReaderObject> query)
         {
             var hash = Hashing.XXHash64.CalculateRaw(query.Query);
-            if (query.QueryParameters == null)
+            if (query.QueryParameters == null || query.QueryParameters.Count == 0)
                 return hash;
             return Hashing.Combine(hash, query.QueryParameters.GetHashOfPropertyNames());
+        }
+
+        public QueryMetadata[] GetQueryCache()
+        {
+            return _cache;
         }
     }
 }

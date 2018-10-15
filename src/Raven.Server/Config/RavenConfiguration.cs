@@ -1,21 +1,26 @@
 ﻿using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.IO;
 using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.CommandLine;
 using Microsoft.Extensions.Configuration.Memory;
 using Raven.Client.Documents.Conventions;
+using Raven.Client.ServerWide;
 using Raven.Server.Config.Attributes;
 using Raven.Server.Config.Categories;
 using Raven.Server.Config.Settings;
 using Raven.Server.Extensions;
 using Raven.Server.ServerWide;
+using Raven.Server.Utils;
 using Voron.Util.Settings;
 
 namespace Raven.Server.Config
@@ -54,7 +59,7 @@ namespace Raven.Server.Config
 
         public ServerConfiguration Server { get; }
 
-        public TestingConfiguration Testing { get; }
+        public EmbeddedConfiguration Embedded { get; }
 
         public MemoryConfiguration Memory { get; }
 
@@ -110,7 +115,7 @@ namespace Raven.Server.Config
             Patching = new PatchingConfiguration();
             Logs = new LogsConfiguration();
             Server = new ServerConfiguration();
-            Testing = new TestingConfiguration();
+            Embedded = new EmbeddedConfiguration();
             Databases = new DatabaseConfiguration();
             Memory = new MemoryConfiguration();
             Studio = new StudioConfiguration();
@@ -149,7 +154,7 @@ namespace Raven.Server.Config
         public RavenConfiguration Initialize()
         {
             Http.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
-            Testing.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
+            Embedded.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
             Server.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
             Core.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
             Replication.Initialize(Settings, ServerWideSettings, ResourceType, ResourceName);
@@ -181,8 +186,6 @@ namespace Raven.Server.Config
 
         public void PostInit()
         {
-            CheckDirectoryPermissions();
-
             if (ResourceType != ResourceType.Server)
                 return;
 
@@ -220,16 +223,16 @@ namespace Raven.Server.Config
 
                 foreach (var property in propertyType.GetProperties(BindingFlags.Instance | BindingFlags.Public))
                 {
-                    var attribute = property.GetCustomAttribute<ConfigurationEntryAttribute>();
-                    if (attribute == null)
-                        continue;
-
-                    results.Add(attribute.Key);
+                    foreach (var configurationEntryAttribute in property.GetCustomAttributes<ConfigurationEntryAttribute>())
+                    {
+                        results.Add(configurationEntryAttribute.Key);
+                    }
                 }
             }
 
             return results;
         });
+        
 
         public static bool ContainsKey(string key)
         {
@@ -254,6 +257,45 @@ namespace Raven.Server.Config
         {
             var prop = getKey.ToProperty();
             return prop.GetCustomAttributes<DefaultValueAttribute>().FirstOrDefault()?.Value;
+        }
+
+        public static object GetValue<T>(Expression<Func<RavenConfiguration, T>> getKey, RavenConfiguration serverConfiguration, Dictionary<string, string> settings)
+        {
+            TimeUnitAttribute timeUnit = null;
+
+            var property = (PropertyInfo)getKey.ToProperty();
+            if (property.PropertyType == typeof(TimeSetting) ||
+                property.PropertyType == typeof(TimeSetting?))
+            {
+                timeUnit = property.GetCustomAttribute<TimeUnitAttribute>();
+                Debug.Assert(timeUnit != null);
+            }
+
+            object value = null;
+            foreach (var entry in property
+                .GetCustomAttributes<ConfigurationEntryAttribute>()
+                .OrderBy(x => x.Order))
+            {
+                if (settings.TryGetValue(entry.Key, out var valueAsString) == false)
+                    value = serverConfiguration.GetSetting(entry.Key);
+
+                if (valueAsString != null)
+                {
+                    value = valueAsString;
+                    break;
+                }
+            }
+
+            if (value == null)
+                value = GetDefaultValue(getKey);
+
+            if (value == null)
+                return null;
+
+            if (timeUnit != null)
+                return new TimeSetting(Convert.ToInt64(value), timeUnit.Unit);
+
+            throw new NotSupportedException("Cannot get value of a property of type: " + property.PropertyType.Name);
         }
 
         public static string GetDataDirectoryPath(CoreConfiguration coreConfiguration, string name, ResourceType type)
@@ -292,8 +334,10 @@ namespace Raven.Server.Config
             _configBuilder.AddCommandLine(args);
             Settings = _configBuilder.Build();
         }
+        
+        private static int _pathCounter = 0;
 
-        private void CheckDirectoryPermissions()
+        public void CheckDirectoryPermissions()
         {
             if (Core.RunInMemory)
                 return;
@@ -320,28 +364,61 @@ namespace Raven.Server.Config
                         continue;
 
                     var fileName = Guid.NewGuid().ToString("N");
+                    
+                    
                     var path = pathSettingValue.ToFullPath();
                     var fullPath = Path.Combine(path, fileName);
-                    var configurationKey = categoryProperty.GetCustomAttributes<ConfigurationEntryAttribute>()
-                        .OrderBy(x => x.Order)
-                        .First()
-                        .Key;
 
+                    var configEntry = categoryProperty.GetCustomAttributes<ConfigurationEntryAttribute>()
+                        .OrderBy(x => x.Order)
+                        .First();
+
+                    if (configEntry.Scope == ConfigurationEntryScope.ServerWideOnly &&
+                        ResourceType == ResourceType.Database)
+                        continue;
+
+                    var configurationKey = configEntry.Key;
+
+                    string createdDirectory = null;
                     try
                     {
+                        // if there is no 'path' directory, we are going to create a directory with a similar name, in order to avoid deleting a directory in use afterwards,
+                        // and write a sample file inside it, in order to check write permissions.
                         if (Directory.Exists(path) == false)
-                            Directory.CreateDirectory(path);
-
-                        File.WriteAllText(fullPath, string.Empty);
-                        File.Delete(fullPath);
+                        {
+                            var curPathCounterVal = Interlocked.Increment(ref _pathCounter);
+                            // test that we can create the directory, but
+                            // not actually create it
+                            createdDirectory = path + "$" + curPathCounterVal.ToString();
+                            Directory.CreateDirectory(createdDirectory);
+                            var createdFile = Path.Combine(createdDirectory, "test.file");
+                            File.WriteAllText(createdFile, string.Empty);
+                            File.Delete(createdFile);
+                        }
+                        // in case there is a 'path' directory, we are going to try and write to it some file, in order to check write permissions
+                        else
+                        {
+                            File.WriteAllText(fullPath, string.Empty);
+                            File.Delete(fullPath);
+                        }
                     }
                     catch (Exception e)
                     {
                         if (results == null)
                             results = new Dictionary<string, KeyValuePair<string, string>>();
 
-                        results[configurationKey] = new KeyValuePair<string, string>(path, e.Message);
+                        var errorousDirPath = createdDirectory ?? path;
+                        results[configurationKey] = new KeyValuePair<string, string>(errorousDirPath, e.Message);
                     }
+                    finally
+                    {
+                        if (createdDirectory != null)
+                        {
+                            Interlocked.Decrement(ref _pathCounter);
+                            IOExtensions.DeleteDirectory(createdDirectory);
+                        }
+                    }
+                    
                 }
             }
 

@@ -8,12 +8,13 @@ class exportDatabaseModel {
     includeIndexes = ko.observable(true);
     includeIdentities = ko.observable(true);
     includeCompareExchange = ko.observable(true);
+    includeCounters = ko.observable(true);
     includeRevisionDocuments = ko.observable(true);
     revisionsAreConfigured: KnockoutComputed<boolean>;
 
     exportFileName = ko.observable<string>();
 
-    includeExpiredDocuments = ko.observable(false);
+    includeExpiredDocuments = ko.observable(true);
     removeAnalyzers = ko.observable(false);
 
     includeAllCollections = ko.observable(true);
@@ -51,6 +52,9 @@ class exportDatabaseModel {
         if (this.includeCompareExchange()) {
             operateOnTypes.push("CompareExchange");
         }
+        if (this.includeCounters()) {
+            operateOnTypes.push("Counters");
+        }
 
         return {
             Collections: this.includeAllCollections() ? null : this.includedCollections(),
@@ -66,7 +70,7 @@ class exportDatabaseModel {
     private initValidation() {
         this.exportDefinitionHasIncludes = ko.pureComputed(() => {
             return this.includeDatabaseRecord() || this.includeDocuments() || (this.includeRevisionDocuments() && this.revisionsAreConfigured()) || this.includeConflicts() ||
-                this.includeIndexes() || this.includeIdentities() || this.includeCompareExchange();
+                this.includeIndexes() || this.includeIdentities() || this.includeCompareExchange() || this.includeCounters();
         });
 
         this.transformScript.extend({

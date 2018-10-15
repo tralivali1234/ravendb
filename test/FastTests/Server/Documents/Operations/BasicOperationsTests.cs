@@ -50,7 +50,7 @@ namespace FastTests.Server.Documents.Operations
                         {
                             Message = "I'm done"
                         };
-                    }), operationId, token);
+                    }), operationId, token: token);
 
                 OperationStatusChange change;
                 Assert.True(notifications.TryTake(out change, TimeSpan.FromSeconds(1)));
@@ -101,11 +101,11 @@ namespace FastTests.Server.Documents.Operations
                     onProgress => Task.Factory.StartNew<IOperationResult>(() =>
                     {
                        throw new Exception("Something bad happened");
-                    }), operationId, OperationCancelToken.None);
+                    }), operationId, token: OperationCancelToken.None);
 
                 OperationStatusChange change;
 
-                Assert.True(notifications.TryTake(out change, TimeSpan.FromSeconds(1)));
+                Assert.True(notifications.TryTake(out change, TimeSpan.FromSeconds(30)));
                 Assert.NotNull(change.OperationId);
                 Assert.Equal(OperationStatus.Faulted, change.State.Status);
                 Assert.NotNull(change.State.Result);
@@ -136,7 +136,7 @@ namespace FastTests.Server.Documents.Operations
                     {
                         token.Token.ThrowIfCancellationRequested();
                         return null;
-                    }, token.Token), operationId, token);
+                    }, token.Token), operationId, token: token);
 
                 OperationStatusChange change;
 

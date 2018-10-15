@@ -95,22 +95,22 @@ namespace Raven.Server.Documents.Patch
                         }
                         else
                         {
-							var filterProperties = isRoot && string.Equals(propertyName, Constants.Documents.Metadata.Key, StringComparison.Ordinal);
+                            var filterProperties = isRoot && string.Equals(propertyName, Constants.Documents.Metadata.Key, StringComparison.Ordinal);
 
-		                    WriteNestedObject(js.AsObject(), filterProperties);
+                            WriteNestedObject(js.AsObject(), filterProperties);
                         }
                     }
                     else
                     {
                         var filterProperties = isRoot && string.Equals(propertyName, Constants.Documents.Metadata.Key, StringComparison.Ordinal);
 
-        	            WriteNestedObject(js.AsObject(), filterProperties);
+                        WriteNestedObject(js.AsObject(), filterProperties);
                     }
                     
                 }
                 else
                 {
-                    throw new InvalidOperationException("Unknonw type: " + js.Type);
+                    throw new InvalidOperationException("Unknown type: " + js.Type);
                 }
                 return;
             }
@@ -124,7 +124,11 @@ namespace Raven.Server.Documents.Patch
             {
                 if (property.Key == "length")
                     continue;
-                WriteJsonValue(arrayInstance, false, property.Key, SafelyGetJsValue(property.Value));
+
+                JsValue propertyValue = SafelyGetJsValue(property.Value);
+                                
+                WriteJsonValue(arrayInstance, false, property.Key, propertyValue);
+                
             }
             _writer.WriteArrayEnd();
         }
@@ -318,15 +322,19 @@ namespace Raven.Server.Documents.Patch
             foreach (var property in properties)
             {
                 var propertyName = property.Key;
+
+                
                 if (ShouldFilterProperty(filterProperties, propertyName))
                     continue;
 
                 var value = property.Value;
                 if (value == null)
                     continue;
+                JsValue safeValue = SafelyGetJsValue(value);                
 
                 _writer.WritePropertyName(propertyName);
-                WriteJsonValue(obj, isRoot, propertyName, SafelyGetJsValue(value));
+                
+                WriteJsonValue(obj, isRoot, propertyName, safeValue);
             }
         }
 
@@ -392,12 +400,13 @@ namespace Raven.Server.Documents.Patch
             }
             catch (Exception e)
             {
-                return new JsValue(e.ToString());
+                return e.ToString();
             }
         }
 
         private void WriteBlittableInstance(BlittableObjectInstance obj, bool isRoot, bool filterProperties)
         {
+            HashSet<string> modifiedProperties = null;
             if (obj.DocumentId != null &&
                 _usageMode == BlittableJsonDocumentBuilder.UsageMode.None)
             {
@@ -411,11 +420,21 @@ namespace Raven.Server.Documents.Patch
                     var prop = new BlittableJsonReaderObject.PropertyDetails();
 
                     obj.Blittable.GetPropertyByIndex(propertyIndex, ref prop);
-
-                    var existInObject = obj.OwnValues.Remove(prop.Name, out var modifiedValue);
+                    
+                    var existInObject = obj.OwnValues.TryGetValue(prop.Name, out var modifiedValue);
 
                     if (existInObject == false && obj.Deletes?.Contains(prop.Name) == true)
                         continue;
+
+                    if (existInObject)
+                    {
+                        if (modifiedProperties == null)
+                        {
+                            modifiedProperties = new HashSet<string>();
+                        }
+
+                        modifiedProperties.Add(prop.Name);
+                    }
 
                     if (ShouldFilterProperty(filterProperties, prop.Name))
                         continue;
@@ -435,8 +454,15 @@ namespace Raven.Server.Documents.Patch
 
             foreach (var modificationKvp in obj.OwnValues)
             {
+                //We already iterated through those properties while iterating the original properties set.
+                if(modifiedProperties != null && modifiedProperties.Contains(modificationKvp.Key))
+                    continue;
+
                 var propertyName = modificationKvp.Key;
                 if (ShouldFilterProperty(filterProperties, propertyName))
+                    continue;
+
+                if (modificationKvp.Value.Changed == false)
                     continue;
 
                 _writer.WritePropertyName(propertyName);

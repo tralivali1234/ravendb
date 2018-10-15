@@ -1,10 +1,13 @@
-<section data-bind="if: stats" class="stats content-margin">
-
-    <h1>
-        General Stats
-        <a target="_blank" href="#" title="Show raw output" data-bind="attr: { href: rawJsonUrl }"><i class="icon-json"></i></a>
+<section data-bind="if: stats" class="stats content-margin">    
+    <h1>General Stats
+        <a target="_blank" href="#" title="Show raw output" data-bind="attr: { href: rawJsonUrl }"><i class="icon-link"></i></a>
     </h1>
-
+    <div id="storage-report" title="Base path for database data files">
+        <div class="base-path">
+            <i class="icon-folder"></i>
+            <span class="small" data-bind="text: dataLocation"></span>
+        </div>
+    </div>
     <div class="stats-list margin-bottom">
         <div class="row flex-row" data-bind="with: stats">
             <div class="col-sm-6 col-lg-4 col-xl-3">
@@ -73,23 +76,33 @@
                 </div>
             </div>
             <div class="col-sm-6 col-lg-4 col-xl-3">
-                <div class="stats-item">
+                <div class="stats-item js-size-tooltip"> 
                     <div class="name"><i class="icon-storage"></i><span>Size On Disk</span></div>
-                    <div class="value"><span data-bind="text: sizeOnDisk"></span></div>
+                    <div class="value"><span data-bind="text: totalSizeOnDisk"></span></div>
+                </div>
+            </div>
+            <div class="col-sm-6 col-lg-4 col-xl-3">
+                <div class="stats-item">
+                    <div class="name"><i class="icon-identities"></i><span>Identities Count</span></div>
+                    <div class="value"><span data-bind="text: countOfIdentities"></span></div>
+                </div>
+            </div>
+            <div class="col-sm-6 col-lg-4 col-xl-3">
+                <div class="stats-item">
+                    <div class="name"><i class="icon-cmp-xchg"></i><span>Compare Exchange Count</span></div>
+                    <div class="value"><span data-bind="text: countOfCompareExchange"></span></div>
                 </div>
             </div>
         </div>
     </div>
-
-    <h1>Indexes Stats by Type</h1>
-
+    <h1>Indexes Stats by Type
+    </h1>
     <div class="row" data-bind="visible: stats().indexesByType().length === 0">
         <div class="col-sm-8 col-sm-offset-2 col-lg-6 col-lg-offset-3">
             <i class="icon-xl icon-empty-set text-muted"></i>
             <h2 class="text-center">No indexes have been created for this database.</h2>
         </div>
     </div>
-
     <div data-bind="foreach: stats().indexesByType">
         <hr />
         <h2 data-bind="text: indexType"></h2>
@@ -108,7 +121,6 @@
                             Stale
                         </a>
                     </div>
-
                     <div class="stats-item" data-bind="visible: !isFaultyIndex, if: !isFaultyIndex">
                         <div class="name">Entries Count:</div>
                         <div class="value" data-bind="text: entriesCount"></div>

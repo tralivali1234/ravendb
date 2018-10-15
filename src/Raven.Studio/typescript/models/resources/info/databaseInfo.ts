@@ -13,7 +13,8 @@ class databaseInfo {
     name: string;
 
     uptime = ko.observable<string>();
-    totalSize = ko.observable<string>();
+    totalSize = ko.observable<number>();
+    totalTempBuffersSize = ko.observable<number>();
     bundles = ko.observableArray<string>();
     backupStatus = ko.observable<string>();
     lastFullOrIncrementalBackup = ko.observable<string>();
@@ -25,7 +26,6 @@ class databaseInfo {
     isAdmin = ko.observable<boolean>();
     disabled = ko.observable<boolean>();
 
-    licensed = ko.observable<boolean>(true); //TODO: bind this value  
     filteredOut = ko.observable<boolean>(false);
     isBeingDeleted = ko.observable<boolean>(false);
 
@@ -111,10 +111,6 @@ class databaseInfo {
                 return "state-danger";
             }
 
-            if (!this.licensed()) {
-                return "state-danger";
-            }
-
             if (this.disabled()) {
                 return "state-warning";
             }
@@ -131,9 +127,6 @@ class databaseInfo {
                 return "Error";
             }
 
-            if (!this.licensed()) {
-                return "Unlicensed";
-            }
             if (this.disabled()) {
                 return "Disabled";
             }
@@ -145,10 +138,9 @@ class databaseInfo {
         });
 
         this.canNavigateToDatabase = ko.pureComputed(() => {
-            const hasLicense = this.licensed();
             const enabled = !this.disabled();
             const hasLoadError = this.hasLoadError();
-            return hasLicense && enabled && !hasLoadError;
+            return enabled && !hasLoadError;
         });
 
         this.isCurrentlyActiveDatabase = ko.pureComputed(() => {
@@ -173,7 +165,8 @@ class databaseInfo {
         this.disabled(dto.Disabled);
         this.isAdmin(dto.IsAdmin);
         this.isEncrypted(dto.IsEncrypted);
-        this.totalSize(dto.TotalSize ? dto.TotalSize.HumaneSize : null);
+        this.totalSize(dto.TotalSize ? dto.TotalSize.SizeInBytes : 0);
+        this.totalTempBuffersSize(dto.TempBuffersSize ? dto.TempBuffersSize.SizeInBytes : 0);
         this.indexingErrors(dto.IndexingErrors);
         this.alerts(dto.Alerts);
         this.loadError(dto.LoadError);
@@ -205,8 +198,6 @@ class databaseInfo {
 
             this.nodes(joinedNodes);
         }
-        
-        //TODO: consider in place update? of nodes?
     }
 
     private applyNodesStatuses(nodes: databaseGroupNode[], statuses: { [key: string]: Raven.Client.ServerWide.Operations.DatabaseGroupNodeStatus;}) {

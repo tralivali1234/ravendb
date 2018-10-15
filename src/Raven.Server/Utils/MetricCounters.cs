@@ -20,6 +20,8 @@ namespace Raven.Server.Utils
 
         public readonly AttachmentCounters Attachments = new AttachmentCounters();
 
+        public readonly CounterCounters Counters = new CounterCounters();
+
         public readonly MapIndexCounters MapIndexes = new MapIndexCounters();
 
         public readonly MapReduceIndexCounters MapReduceIndexes = new MapReduceIndexCounters();
@@ -48,6 +50,8 @@ namespace Raven.Server.Utils
             SqlReplications.BatchSize = new MeterMetric();
             Attachments.PutsPerSec = new MeterMetric();
             Attachments.BytesPutsPerSec = new MeterMetric();
+            Counters.PutsPerSec = new MeterMetric();
+            Counters.BytesPutsPerSec = new MeterMetric();
         }
 
         public class RequestCounters
@@ -64,6 +68,12 @@ namespace Raven.Server.Utils
         }
 
         public class AttachmentCounters
+        {
+            public MeterMetric PutsPerSec { get; internal set; }
+            public MeterMetric BytesPutsPerSec { get; internal set; }
+        }
+
+        public class CounterCounters
         {
             public MeterMetric PutsPerSec { get; internal set; }
             public MeterMetric BytesPutsPerSec { get; internal set; }
@@ -104,6 +114,11 @@ namespace Raven.Server.Utils
                     [nameof(Attachments.BytesPutsPerSec)] = Attachments.BytesPutsPerSec.CreateMeterData(),
                     [nameof(Attachments.PutsPerSec)] = Attachments.PutsPerSec.CreateMeterData()
                 },
+                [nameof(Counters)] = new DynamicJsonValue
+                {
+                    [nameof(Counters.BytesPutsPerSec)] = Counters.BytesPutsPerSec.CreateMeterData(),
+                    [nameof(Counters.PutsPerSec)] = Counters.PutsPerSec.CreateMeterData()
+                },
                 [nameof(MapIndexes)] = new DynamicJsonValue
                 {
                     [nameof(MapIndexes.IndexedPerSec)] = MapIndexes.IndexedPerSec.CreateMeterData()
@@ -117,7 +132,7 @@ namespace Raven.Server.Utils
         }
     }
 
-    public static class MetricsExtentions
+    public static class MetricsExtensions
     {
         public static void SetMinimalHumaneMeterData(this MeterMetric self, string name, DynamicJsonValue obj)
         {

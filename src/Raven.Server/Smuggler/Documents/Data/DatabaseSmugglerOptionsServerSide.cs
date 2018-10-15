@@ -19,6 +19,8 @@ namespace Raven.Server.Smuggler.Documents.Data
 
         public AuthorizationStatus AuthorizationStatus { get; set; } = AuthorizationStatus.ValidUser;
 
+        public bool ExecutePendingClusterTransactions = false;
+
         public static DatabaseSmugglerOptionsServerSide Create(HttpContext httpContext)
         {
             var result = new DatabaseSmugglerOptionsServerSide();
@@ -40,6 +42,8 @@ namespace Raven.Server.Smuggler.Documents.Data
                         result.MaxStepsForTransformScript = int.Parse(item.Value[0]);
                     else if (string.Equals(key, "collection", StringComparison.OrdinalIgnoreCase))
                         result.Collections.AddRange(item.Value);
+                    else if (string.Equals(key, nameof(SkipRevisionCreation), StringComparison.OrdinalIgnoreCase))
+                        result.SkipRevisionCreation = bool.Parse(item.Value[0]);
                 }
                 catch (Exception e)
                 {

@@ -275,6 +275,10 @@ namespace Raven.Client.Documents.Indexes
         /// </summary>
         public void RemoveDefaultValues()
         {
+            // do not remove default values if we have default field options specified
+            if (Fields.ContainsKey(Constants.Documents.Indexing.Fields.AllFields))
+                return;
+
             var toRemove = new List<string>();
             foreach (var kvp in Fields)
             {
@@ -352,7 +356,7 @@ namespace Raven.Client.Documents.Indexes
 
             if (firstMap.StartsWith("from") || firstMap.StartsWith("docs"))
             {
-                // C# indexes must start with "from" for query synatx or
+                // C# indexes must start with "from" for query syntax or
                 // "docs" for method syntax
                 if (string.IsNullOrWhiteSpace(Reduce))
                     return IndexType.Map;
@@ -444,7 +448,8 @@ namespace Raven.Client.Documents.Indexes
         Configuration = 1 << 6,
         LockMode = 1 << 7,
         Priority = 1 << 8,
+        State = 1 << 9,
 
-        All = Maps | MapsFormatting | Reduce | ReduceFormatting | Fields | Configuration | LockMode | Priority
+        All = Maps | MapsFormatting | Reduce | ReduceFormatting | Fields | Configuration | LockMode | Priority | State
     }
 }

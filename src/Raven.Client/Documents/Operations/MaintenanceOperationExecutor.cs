@@ -15,7 +15,7 @@ namespace Raven.Client.Documents.Operations
         private RequestExecutor _requestExecutor;
         private ServerOperationExecutor _serverOperationExecutor;
 
-        private RequestExecutor RequestExecutor => _requestExecutor ?? (_requestExecutor = _store.GetRequestExecutor(_databaseName));
+        private RequestExecutor RequestExecutor => _requestExecutor ?? (_databaseName != null ? _requestExecutor = _store.GetRequestExecutor(_databaseName) : null);
 
         public MaintenanceOperationExecutor(DocumentStoreBase store, string databaseName = null)
         {
@@ -43,24 +43,22 @@ namespace Raven.Client.Documents.Operations
             return AsyncHelpers.RunSync(() => SendAsync(operation));
         }
 
-        public async Task SendAsync(IMaintenanceOperation operation, CancellationToken token = default(CancellationToken))
+        public async Task SendAsync(IMaintenanceOperation operation, CancellationToken token = default)
         {
-            JsonOperationContext context;
-            using (RequestExecutor.ContextPool.AllocateOperationContext(out context))
+            using (GetContext(out JsonOperationContext context))
             {
                 var command = operation.GetCommand(_requestExecutor.Conventions, context);
-                await RequestExecutor.ExecuteAsync(command, context, token: token).ConfigureAwait(false);
+                await RequestExecutor.ExecuteAsync(command, context, sessionInfo: null, token: token).ConfigureAwait(false);
             }
         }
 
-        public async Task<TResult> SendAsync<TResult>(IMaintenanceOperation<TResult> operation, CancellationToken token = default(CancellationToken))
+        public async Task<TResult> SendAsync<TResult>(IMaintenanceOperation<TResult> operation, CancellationToken token = default)
         {
-            JsonOperationContext context;
-            using (RequestExecutor.ContextPool.AllocateOperationContext(out context))
+            using (GetContext(out JsonOperationContext context))
             {
                 var command = operation.GetCommand(_requestExecutor.Conventions, context);
 
-                await RequestExecutor.ExecuteAsync(command, context, token: token).ConfigureAwait(false);
+                await RequestExecutor.ExecuteAsync(command, context, sessionInfo: null, token: token).ConfigureAwait(false);
                 return command.Result;
             }
         }
@@ -70,15 +68,22 @@ namespace Raven.Client.Documents.Operations
             return AsyncHelpers.RunSync(() => SendAsync(operation));
         }
 
-        public async Task<Operation> SendAsync(IMaintenanceOperation<OperationIdResult> operation, CancellationToken token = default(CancellationToken))
+        public async Task<Operation> SendAsync(IMaintenanceOperation<OperationIdResult> operation, CancellationToken token = default)
         {
-            using (RequestExecutor.ContextPool.AllocateOperationContext(out var context))
+            using (GetContext(out JsonOperationContext context))
             {
-                var command = operation.GetCommand(_requestExecutor.Conventions, context);
+                var command = operation.GetCommand(RequestExecutor.Conventions, context);
 
-                await _requestExecutor.ExecuteAsync(command, context, token: token).ConfigureAwait(false);
-                return new Operation(_requestExecutor, () => _store.Changes(_databaseName), _requestExecutor.Conventions, command.Result.OperationId);
+                await RequestExecutor.ExecuteAsync(command, context, sessionInfo: null, token: token).ConfigureAwait(false);
+                return new Operation(RequestExecutor, () => _store.Changes(_databaseName), RequestExecutor.Conventions, command.Result.OperationId);
             }
+        }
+
+        private IDisposable GetContext(out JsonOperationContext context)
+        {
+            if (RequestExecutor == null)
+                throw new InvalidOperationException("Cannot use Maintenance without a database defined, did you forget to call ForDatabase?");
+            return RequestExecutor.ContextPool.AllocateOperationContext(out context);
         }
     }
 }

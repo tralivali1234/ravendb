@@ -5,6 +5,8 @@ using System.Linq;
 using System.Net;
 using System.Net.WebSockets;
 using System.Threading.Tasks;
+using Jint.Native;
+using Jint.Native.Object;
 using Raven.Client;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Exceptions;
@@ -15,12 +17,17 @@ using Raven.Server.Documents.Indexes.Debugging;
 using Raven.Server.Documents.Indexes.Errors;
 using Raven.Server.Documents.Indexes.MapReduce.Static;
 using Raven.Server.Documents.Indexes.Static;
+using Raven.Server.Documents.Patch;
+using Raven.Server.Documents.Queries;
+using Raven.Server.Documents.Queries.Dynamic;
 using Raven.Server.Json;
 using Raven.Server.Routing;
+using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
+using Sparrow.Logging;
 
 namespace Raven.Server.Documents.Handlers
 {
@@ -116,7 +123,7 @@ namespace Raven.Server.Documents.Handlers
                 }
             }
 
-            return NoContent();
+            return Task.CompletedTask;
         }
 
         [RavenAction("/databases/*/indexes/debug", "GET", AuthorizationStatus.ValidUser)]
@@ -410,6 +417,14 @@ namespace Raven.Server.Documents.Handlers
         {
             var name = GetQueryStringValueAndAssertIfSingleAndNotEmpty("name");
 
+            if (LoggingSource.AuditLog.IsInfoEnabled)
+            {
+                var clientCert = GetCurrentCertificate();
+
+                var auditLog = LoggingSource.AuditLog.GetLogger(Database.Name, "Audit");
+                auditLog.Info($"Index {name} DELETE by {clientCert?.Subject} {clientCert?.Thumbprint}");
+            }
+
             HttpContext.Response.StatusCode = await Database.IndexStore.TryDeleteIndexIfExists(name)
                 ? (int)HttpStatusCode.NoContent
                 : (int)HttpStatusCode.NotFound;
@@ -490,6 +505,15 @@ namespace Raven.Server.Documents.Handlers
             {
                 var json = await context.ReadForMemoryAsync(RequestBodyStream(), "index/set-lock");
                 var parameters = JsonDeserializationServer.Parameters.SetIndexLockParameters(json);
+
+                if (parameters.IndexNames == null || parameters.IndexNames.Length == 0)
+                    throw new ArgumentNullException(nameof(parameters.IndexNames));
+
+                // Check for auto-indexes - we do not set lock for auto-indexes
+                if (parameters.IndexNames.Any(indexName => indexName.StartsWith("Auto/", StringComparison.OrdinalIgnoreCase)))
+                {
+                    throw new InvalidOperationException("'Indexes list contains Auto-Indexes. Lock Mode' is not set for Auto-Indexes.");
+                }
 
                 foreach (var name in parameters.IndexNames)
                 {
@@ -577,19 +601,18 @@ namespace Raven.Server.Documents.Handlers
         [RavenAction("/databases/*/indexes/terms", "GET", AuthorizationStatus.ValidUser)]
         public Task Terms()
         {
-            var name = GetQueryStringValueAndAssertIfSingleAndNotEmpty("name");
             var field = GetQueryStringValueAndAssertIfSingleAndNotEmpty("field");
-            var fromValue = GetStringQueryString("fromValue", required: false);
 
             using (var token = CreateTimeLimitedOperationToken())
             using (Database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             using (context.OpenReadTransaction())
             {
+                var name = GetIndexNameFromCollectionAndField(field, context) ?? GetQueryStringValueAndAssertIfSingleAndNotEmpty("name");
+
+                var fromValue = GetStringQueryString("fromValue", required: false);
                 var existingResultEtag = GetLongFromHeaders("If-None-Match");
 
-                var index = Database.QueryRunner.GetIndex(name);
-
-                var result = Database.QueryRunner.ExecuteGetTermsQuery(index, field, fromValue, existingResultEtag, GetPageSize(), context, token);
+                var result = Database.QueryRunner.ExecuteGetTermsQuery(name, field, fromValue, existingResultEtag, GetPageSize(), context, token, out var index);
 
                 if (result.NotModified)
                 {
@@ -601,34 +624,49 @@ namespace Raven.Server.Documents.Handlers
 
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
-                    if(field.EndsWith("__minX") ||
+                    if (field.EndsWith("__minX") ||
                         field.EndsWith("__minY") ||
                         field.EndsWith("__maxX") ||
                         field.EndsWith("__maxY"))
                     {
                         if (index.Definition.IndexFields != null &&
-                        index.Definition.IndexFields.TryGetValue(field.Substring(0, name.Length - 6), out var indexField) == true)
+                            index.Definition.IndexFields.TryGetValue(field.Substring(0, field.Length - 6), out var indexField) == true)
                         {
                             if (indexField.Spatial?.Strategy == Client.Documents.Indexes.Spatial.SpatialSearchStrategy.BoundingBox)
                             {
-                                // here we need to convert these to numbers, otherwise the studio
-                                // can't display them in the studio
+                                // Term-values for 'Spatial Index Fields' with 'BoundingBox' are encoded in Lucene as 'prefixCoded bytes'
+                                // Need to convert to numbers for the Studio
                                 var readableTerms = new HashSet<string>();
                                 foreach (var item in result.Terms)
                                 {
                                     var num = Lucene.Net.Util.NumericUtils.PrefixCodedToDouble(item);
                                     readableTerms.Add(NumberUtil.NumberToString(num));
                                 }
+
                                 result.Terms = readableTerms;
                             }
                         }
                     }
-                    
+
                     writer.WriteTermsQueryResult(context, result);
                 }
 
                 return Task.CompletedTask;
             }
+        }
+
+        private string GetIndexNameFromCollectionAndField(string field, DocumentsOperationContext context)
+        {
+            var collection = GetStringQueryString("collection", false);
+            if (string.IsNullOrEmpty(collection))
+                return null;
+            var query = new IndexQueryServerSide(new QueryMetadata($"from {collection} select {field}", null, 0));
+            var dynamicQueryToIndex = new DynamicQueryToIndexMatcher(Database.IndexStore);
+            var match = dynamicQueryToIndex.Match(DynamicQueryMapping.Create(query), context);
+            if (match.MatchType == DynamicQueryMatchType.Complete ||
+                match.MatchType == DynamicQueryMatchType.CompleteButIdle)
+                return match.IndexName;
+            throw new IndexDoesNotExistException($"There is no index to answer the following query: from {collection} select {field}");
         }
 
         [RavenAction("/databases/*/indexes/total-time", "GET", AuthorizationStatus.ValidUser)]
@@ -711,7 +749,7 @@ namespace Raven.Server.Documents.Handlers
                 using (var ms = new MemoryStream())
                 using (var collector = new LiveIndexingPerformanceCollector(Database, Database.DatabaseShutdown, indexes))
                 {
-                    // 1. Send data to webSocket without making UI wait upon openning webSocket
+                    // 1. Send data to webSocket without making UI wait upon opening webSocket
                     await SendDataOrHeartbeatToWebSocket(receive, webSocket, collector, ms, 100);
 
                     // 2. Send data to webSocket when available
@@ -741,6 +779,139 @@ namespace Raven.Server.Documents.Handlers
             return Task.CompletedTask;
 
         }
+
+        [RavenAction("/databases/*/indexes/try", "POST", AuthorizationStatus.ValidUser)]
+        public async Task TestJavaScriptIndex()
+        {
+            using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+            {
+                var input = await context.ReadForMemoryAsync(RequestBodyStream(), "TestJavaScriptIndex");
+                if (input.TryGet("Definition", out BlittableJsonReaderObject index) == false)
+                    ThrowRequiredPropertyNameInRequest("Definition");
+
+                input.TryGet("Ids", out BlittableJsonReaderArray ids);
+
+                var indexDefinition = JsonDeserializationServer.IndexDefinition(index);
+
+                if (indexDefinition.Maps == null || indexDefinition.Maps.Count == 0)
+                    throw new ArgumentException("Index must have a 'Maps' fields");
+
+                indexDefinition.Type = indexDefinition.DetectStaticIndexType();
+
+                if (indexDefinition.Type.IsJavaScript() == false)
+                    throw new UnauthorizedAccessException("Testing indexes is only allowed for JavaScript indexes.");
+
+                var compiledIndex = new JavaScriptIndex(indexDefinition, Database.Configuration);
+
+                var inputSize = GetIntValueQueryString("inputSize", false) ?? defaultInputSizeForTestingJavaScriptIndex;
+                var collections = new HashSet<string>(compiledIndex.Maps.Keys);
+                var docsPerCollection = new Dictionary<string, List<DynamicBlittableJson>>();
+                using (context.OpenReadTransaction())
+                {
+                    if (ids == null)
+                    {
+                        foreach (var collection in collections)
+                        {
+                            docsPerCollection.Add(collection,
+                                Database.DocumentsStorage.GetDocumentsFrom(context, collection, 0, 0, inputSize).Select(d => new DynamicBlittableJson(d)).ToList());
+                        }
+                    }
+                    else
+                    {
+                        var listOfIds = ids.Select(x => x.ToString());
+                        var _ = new Reference<int>
+                        {
+                            Value = 0
+                        };
+                        var docs = Database.DocumentsStorage.GetDocuments(context, listOfIds, 0, int.MaxValue, _);
+                        foreach (var doc in docs)
+                        {
+                            if (doc.TryGetMetadata(out var metadata) && metadata.TryGet(Constants.Documents.Metadata.Collection, out string collectionStr))
+                            {
+                                if (docsPerCollection.TryGetValue(collectionStr, out var listOfDocs) == false)
+                                {
+                                    listOfDocs = docsPerCollection[collectionStr] = new List<DynamicBlittableJson>();
+                                }
+                                listOfDocs.Add(new DynamicBlittableJson(doc));
+                            }                            
+                        }
+                    }
+
+                    var mapRes = new List<ObjectInstance>();
+                    //all maps
+                    foreach (var ListOfFunctions in compiledIndex.Maps)
+                    {
+                        //multi maps per collection
+                        foreach (var mapFunc in ListOfFunctions.Value)
+                        {
+                            if (docsPerCollection.TryGetValue(ListOfFunctions.Key, out var docs))
+                            {
+                                foreach (var res in mapFunc(docs))
+                                {
+                                    mapRes.Add((ObjectInstance)res);
+                                }
+                            }                                                                                 
+                        }
+                    }
+                    var first = true;
+                    using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+                    {
+
+                            writer.WriteStartObject();
+                            writer.WritePropertyName("MapResults");
+                            writer.WriteStartArray();
+                            foreach (var mapResult in mapRes)
+                            {
+                                if (JavaScriptIndexUtils.StringifyObject(mapResult) is JsString jsStr)
+                                {
+                                    if (first == false)
+                                    {
+                                        writer.WriteComma();
+                                    }
+                                    writer.WriteString(jsStr.ToString());
+                                    first = false;
+                                }
+                                
+                            }
+                            writer.WriteEndArray();
+                        if (indexDefinition.Reduce != null)
+                        {
+                            using (var bufferPool = new UnmanagedBuffersPoolWithLowMemoryHandling("JavaScriptIndexTest", Database.Name))
+                            {
+                                compiledIndex.SetBufferPoolForTestingPurposes(bufferPool);
+                                compiledIndex.SetAllocatorForTestingPurposes(context.Allocator);
+                                first = true;
+                                writer.WritePropertyName("ReduceResults");
+                                writer.WriteStartArray();
+                                
+                                var reduceResults = compiledIndex.Reduce(mapRes.Select(mr => new DynamicBlittableJson(JsBlittableBridge.Translate(context, mr.Engine,mr))));
+                                
+                                foreach (JsValue reduceResult in reduceResults)
+                                {
+                                    if (JavaScriptIndexUtils.StringifyObject(reduceResult) is JsString jsStr)
+                                    {
+                                        if (first == false)
+                                        {
+                                            writer.WriteComma();
+                                        }
+
+                                        writer.WriteString(jsStr.ToString());
+                                        first = false;
+                                    }
+
+                                }
+                            }
+
+                            writer.WriteEndArray();
+                        }
+                        writer.WriteEndObject();
+                    }                    
+
+                }
+            }
+        }
+
+        private static readonly int defaultInputSizeForTestingJavaScriptIndex = 10;
 
         private async Task<bool> SendDataOrHeartbeatToWebSocket(Task<WebSocketReceiveResult> receive, WebSocket webSocket, LiveIndexingPerformanceCollector collector, MemoryStream ms, int timeToWait)
         {

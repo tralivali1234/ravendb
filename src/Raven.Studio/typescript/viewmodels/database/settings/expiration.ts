@@ -49,15 +49,16 @@ class expiration extends viewModelBase {
     }
     
     canActivate(args: any) {
-        super.canActivate(args);
+        return $.when<any>(super.canActivate(args))
+            .then(() => {
+                const deferred = $.Deferred<canActivateResultDto>();
 
-        const deferred = $.Deferred<canActivateResultDto>();
+                this.fetchConfiguration(this.activeDatabase())
+                    .done(() => deferred.resolve({ can: true }))
+                    .fail(() => deferred.resolve({ redirect: appUrl.forDatabaseRecord(this.activeDatabase()) }));
 
-        this.fetchConfiguration(this.activeDatabase())
-            .done(() => deferred.resolve({ can: true }))
-            .fail(() => deferred.resolve({ redirect: appUrl.forDatabaseRecord(this.activeDatabase()) }));
-
-        return deferred;
+                return deferred;
+            });
     }
 
     activate(args: any) {
@@ -78,7 +79,7 @@ class expiration extends viewModelBase {
             required: {
                 onlyIf: () => this.specifyDeleteFrequency()
             },
-            min: 0      
+            digit: true
         });
 
         this.validationGroup = ko.validatedObservable({

@@ -1,4 +1,5 @@
 ﻿using Raven.Client.Documents.Conventions;
+using Raven.Client.Documents.Session;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
 
@@ -15,6 +16,8 @@ namespace Raven.Client.Documents.Commands.Batches
         CommandType Type { get; }
 
         DynamicJsonValue ToJson(DocumentConventions conventions, JsonOperationContext context);
+
+        void OnBeforeSaveChanges(InMemoryDocumentSessionOperations session);
     }
 
     public enum CommandType
@@ -25,6 +28,12 @@ namespace Raven.Client.Documents.Commands.Batches
         DELETE,
         AttachmentPUT,
         AttachmentDELETE,
+        AttachmentMOVE,
+        AttachmentCOPY,
+        CompareExchangePUT,
+        CompareExchangeDELETE,
+
+        Counters,
 
         // NOTE: When you add anything here, such as additional 
         // operation relating to a document but not operating on it 
@@ -33,6 +42,6 @@ namespace Raven.Client.Documents.Commands.Batches
         // AttachmentDELETE
 
         ClientAnyCommand,
-        ClientNotAttachment
+        ClientModifyDocumentCommand
     }
 }

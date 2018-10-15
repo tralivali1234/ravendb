@@ -1,3 +1,30 @@
+<div class="browser-alert" data-bind="visible: browserAlert">
+    <div class="browser-message">
+        <i class="icon-unsupported-browser icon-xl"></i>
+        <p class="lead margin-bottom">This browser is not supported and some features may not work correctly</p>
+        <p class="margin-bottom">To ensure best experience please use</p>
+        <div class="browser-links">
+            <a class="chrome" href="https://www.google.com/chrome/" target="_blank">
+                <i class="icon-chrome icon-lg"></i>
+                Google Chrome
+            </a>
+            <a class="firefox" href="https://www.mozilla.org/firefox/" target="_blank">
+                <i class="icon-firefox icon-lg"></i>
+                Mozilla Firefox
+            </a>
+        </div>
+        
+        <button class="btn btn-default" data-bind="click: browserAlertContinue">Continue</button>
+
+        <div class="checkbox">
+            <input id="dontShowAgainBrowser" class="styled" type="checkbox" data-bind="checked: dontShowBrowserAlertAgain">
+            <label for="dontShowAgainBrowser">
+                Don't show again
+            </label>
+        </div>
+    </div>
+    <div class="backdrop show"></div>
+</div>
 <aside class="top-alert" data-bind="visible: developerLicense">
     Developer License - Not for Production Use
  </aside>
@@ -6,10 +33,15 @@
         <a class="navbar-brand hidden-xs" data-bind="attr: { href: appUrls.serverDashboard }"><i class="icon-logo"></i></a>
     </div>
     <div id="navbar">
+        <div class="server-environment" data-bind="if: serverEnvironment, visible: serverEnvironment">
+            <small>Server environment</small>
+            <div><strong data-bind="text: serverEnvironment, attr: { class: 'text-uppercase ' + serverEnvironmentClass() }"></strong></div>
+        </div>
         <div class="inputs-container hidden-xs hidden-sm">
             <div class="database-switcher-container" data-bind="with: databaseSwitcher">
                 <div class="form-control btn-toggle database-switcher">
                     <span class="database" data-bind="text: $root.activeDatabase() ? $root.activeDatabase().name:''"></span>
+                    <span data-bind="visible: $root.activeDatabase() ? $root.activeDatabase().environment() : false, text: $root.activeDatabase() ? $root.activeDatabase().environment(): '', attr: { class: 'label text-uppercase ' + ($root.activeDatabase() ? $root.activeDatabase().environmentClass() : '') }"></span>
                 </div>
                 <a data-bind="attr: { href: $root.appUrls.databases }" title="View all databases" class="resources-link"><i class="icon-resources"></i></a>
                 <div class="box-container">
@@ -23,6 +55,7 @@
                                 <li data-bind="visible: !disabled() && relevant()">
                                     <a href="#" data-bind="click: $parent.selectDatabase.bind($parent)" class="database">
                                         <span data-bind="text: name"></span>
+                                        <span data-bind="text: environment, visible: environment, attr: { class: 'label text-uppercase ' + environmentClass() }"></span>
                                         <span data-bind="visible: errored" class="badge badge-danger">Errored</span>
                                     </a>
                                 </li>
@@ -31,6 +64,7 @@
                                 <li data-bind="visible: !relevant()">
                                     <a class="database non-relevant">
                                         <span data-bind="text: name"></span>
+                                        <span data-bind="text: environment, visible: environment, attr: { class: 'label text-uppercase ' + environmentClass() }"></span>
                                         <span class="label label-default">Non-relevant</span>
                                         <span data-bind="visible: errored" class="label label-danger">Errored</span>
                                     </a>
@@ -40,6 +74,7 @@
                                 <li data-bind="visible: disabled">
                                     <a class="database disabled">
                                         <span data-bind="text: name"></span>
+                                        <span data-bind="text: environment, visible: environment, attr: { class: 'label text-uppercase ' + environmentClass() }"></span>
                                         <span class="label label-default">Disabled</span>
                                         <span data-bind="visible: errored" class="label label-danger">Errored</span>
                                     </a>
@@ -192,7 +227,7 @@
 
 <script type="text/html" id="intermediateMenuItem">
     <li class="arrow-right">
-        <a data-bind="click: menu.handleIntermediateItemClick.bind(menu), css: { 'active': item.isOpen }">
+        <a data-bind="click: menu.handleIntermediateItemClick.bind(menu), css: { 'active': item.isOpen }, visible: item.nav">
             <i data-bind="css: item.css"></i>
             <span data-bind="text: item.title"></span>
         </a>
@@ -275,6 +310,11 @@
         </div>
         <div class="footer-item bg-info" data-bind="visible: $root.clusterManager.votingInProgress">
             <a title="Voting in progress"><i class="icon-cluster-node"></i><span>Voting in progress</span></a>
+        </div>
+        <div class="footer-item" data-bind="visible: !$root.clientCertificate()">
+            <a class="btn btn-danger btn-sm js-client-cert" data-bind="attr: { href: $root.urlForCertificates() }">
+                <i class="icon-unsecure"></i>
+            </a>
         </div>
         <div class="footer-item" data-bind="visible: $root.clientCertificate(), with: $root.clientCertificate()">
             <a class="btn btn-success btn-sm js-client-cert" data-bind="attr: { href: $root.urlForCertificates() }">

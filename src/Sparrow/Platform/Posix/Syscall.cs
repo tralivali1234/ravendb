@@ -1,7 +1,10 @@
 ﻿using System;
+using System.Buffers;
 using System.IO;
 using System.Runtime.InteropServices;
 using System.Security;
+using System.Text;
+using System.Threading;
 using Voron.Platform.Posix;
 
 namespace Sparrow.Platform.Posix
@@ -164,6 +167,11 @@ namespace Sparrow.Platform.Posix
         [DllImport(LIBC_6, SetLastError = true)]
         private static extern int fsync(int fd);
 
+        [DllImport(LIBC_6, SetLastError = true)]
+        private static extern int readlink(string path, byte* buf, UIntPtr bufsiz);
+
+        [DllImport(LIBC_6, SetLastError = true)]
+        public static extern int access(string pathFullPath, int mode);
 
         // read(2)
         //    ssize_t read(int fd, void *buf, size_t count);
@@ -179,22 +187,39 @@ namespace Sparrow.Platform.Posix
         // pwrite(2)
         //    ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
         [DllImport(LIBC_6, SetLastError = true)]
-        public static extern IntPtr pwrite(int fd, IntPtr buf, UIntPtr count, IntPtr offset);
+        private static extern IntPtr pwrite64(int fd, IntPtr buf, UIntPtr count, long offset);
+
+        // pwrite(2)
+        //    ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
+        [DllImport(LIBC_6, SetLastError = true)]
+        private static extern IntPtr pwrite(int fd, IntPtr buf, UIntPtr count, IntPtr offset);
+
+        [DllImport(LIBC_6, SetLastError = true)]
+        private static extern IntPtr pwrite(int fd, IntPtr buf, UIntPtr count, long offset);
 
         public static long pwrite(int fd, void* buf, ulong count, long offset)
         {
-            return (long)pwrite(fd, (IntPtr)buf, (UIntPtr)count, (IntPtr)offset);
+            if (PlatformDetails.Is32Bits)
+            {
+                var rc = (long)pwrite64(fd, (IntPtr)buf, (UIntPtr)count, (long)offset);
+                return rc;
+            }
+
+            if (PlatformDetails.RunningOnMacOsx)
+                return (long)pwrite(fd, (IntPtr)buf, (UIntPtr)count, (IntPtr)offset);
+
+            return (long)pwrite64(fd, (IntPtr)buf, (UIntPtr)count, offset);
         }
 
 
         // write(2)
         //    ssize_t write(int fd, const void *buf, size_t count);
         [DllImport(LIBC_6, SetLastError = true)]
-        public static extern IntPtr write(int fd, IntPtr buf, UIntPtr count);
+        public static extern IntPtr write(int fd, IntPtr buf, ulong count);
 
         public static long write(int fd, void* buf, ulong count)
         {
-            return (long)write(fd, (IntPtr)buf, (UIntPtr)count);
+            return (long)write(fd, (IntPtr)buf, count);
         }
 
 
@@ -232,6 +257,44 @@ namespace Sparrow.Platform.Posix
         [DllImport(LIBC_6, SetLastError = true)]
         public static extern int mprotect(IntPtr start, ulong size, ProtFlag protFlag);
 
+        public static void PwriteOrThrow(int fd, byte *buffer, ulong count, long offset, string file, string debug)
+        {
+            Errno err = Errno.NONE;
+            bool cifsRetryOccured = false;
+            var actuallyWritten = 0L;
+            do
+            {
+                for (var cifsRetries = 0; cifsRetries < 3; cifsRetries++)
+                {
+                    var result = pwrite(fd, buffer, count - (ulong)actuallyWritten, offset + actuallyWritten);
+                    if (result < 0) // we assume zero cannot be returned at any case as defined in POSIX
+                    {
+                        err = (Errno)Marshal.GetLastWin32Error();
+                        if (err == Errno.EINVAL && CheckSyncDirectoryAllowed(file) == false)
+                        {
+                            // cifs/nfs mount can sometimes fail on EINVAL after file creation
+                            // lets give it few retries with short pauses between them - RavenDB-11954
+                            Thread.Sleep(10 * ((cifsRetries + 1) ^ 3)); // wait upto 3 time in intervals of : 10mSec, 80mSec, 270mSec
+                            cifsRetryOccured = true; // for exception message purpose
+                            continue; // retry                            
+                        }
+
+                        ThrowLastError((int)err,
+                            $"Failed to ${debug} {file} with count={count}, offset={offset}, actuallyWritten={actuallyWritten} (regular mount, not a cifs/nfs mount)");
+                    }
+
+                    actuallyWritten += result;
+                    break; // successfully written
+                }                
+            } while (actuallyWritten < (long)count);
+
+            if (actuallyWritten != (long)count)
+            {
+                ThrowLastError((int)err,
+                    $"Failed to pwrite {file} with count={count}, offset={offset}, actuallyWritten={actuallyWritten}" + (cifsRetryOccured ? " (in cifs/nfs mount)" : ""));
+            }
+        }
+
         public static int AllocateFileSpace(int fd, long size, string file, out bool usingWrite)
         {
             usingWrite = false;
@@ -243,26 +306,23 @@ namespace Sparrow.Platform.Posix
                 result = (int)Errno.EINVAL;
                 if (RuntimeInformation.IsOSPlatform(OSPlatform.OSX) == false)
                     result = posix_fallocate64(fd, len, (size - len));
+
                 switch (result)
                 {
                     case (int)Errno.EINVAL:
+                    case (int)Errno.EFBIG: // can occure on >4GB allocation on fs such as ntfs-3g, W95 FAT32, etc.
                         // fallocate is not supported, we'll use lseek instead
                         usingWrite = true;
                         byte b = 0;
-                        if (pwrite(fd, &b, 1, size - 1) != 1)
-                        {
-                            var err = Marshal.GetLastWin32Error();
-                            ThrowLastError(err, "Failed to pwrite in order to fallocate where fallocate is not supported for " + file);
-                        }
-                        return 0;
+                        PwriteOrThrow(fd, &b, 1L, size - 1, file, "pwrite in order to fallocate where fallocate is not supported");                        
+                        return 0;                        
                 }
 
                 if (result != (int)Errno.EINTR)
                     break;
-                if (retries-- > 0)
+                if (retries-- < 0)
                     throw new IOException($"Tried too many times to call posix_fallocate {file}, but always got EINTR, cannot retry again");
             }
-
             return result;
         }
 
@@ -287,11 +347,12 @@ namespace Sparrow.Platform.Posix
             {
                 case Errno.ENOMEM:
                     throw new OutOfMemoryException("ENOMEM on " + msg);
+                case Errno.ENOENT:
+                    throw new FileNotFoundException("ENOENT on " + msg);
                 default:
                     throw new InvalidOperationException(error + " " + msg);
             }
         }
-
 
         public static void FsyncDirectoryFor(string file)
         {
@@ -333,16 +394,88 @@ namespace Sparrow.Platform.Posix
             return syncAllowed;
         }
 
-        public static int SyncDirectory(string file)
+        private static int ReadLinkOrThrow(string path, byte *pBuff, int buffSize)
         {
-            var dir = Path.GetDirectoryName(file);
+            var numOfBytes = readlink(path, pBuff, (UIntPtr)buffSize);
+            var err = Marshal.GetLastWin32Error();
+            if (numOfBytes == -1)
+            {
+                if (err == (int)Errno.EINVAL) // EINVAL when applied on non symlink according to readlink's man page 
+                    return 0;
+                ThrowLastError(err, "failed to readlink symlink directory " + path);
+            }
+
+            return numOfBytes;
+        }
+
+        public static int SyncDirectory(string file, bool isRealPath = false)
+        {
+            var dir = isRealPath == false ? Path.GetDirectoryName(file) : file;
             var fd = open(dir, 0, 0);
             if (fd == -1)
-                return -1;
+            {
+                var err = Marshal.GetLastWin32Error();
+                ThrowLastError(err, "failed to open directory " + dir + " in order to sync for file " + file);
+            }
             var fsyncRc = FSync(fd);
             if (fsyncRc == -1)
-                return -1;
-            return close(fd);
+            {
+                var err = Marshal.GetLastWin32Error();
+                ThrowLastError(err, "failed to FSync directory " + dir + " with fd=" + fd + " in order to sync for file " + file);
+            }
+
+            if (close(fd) == -1)
+            {
+                var err = Marshal.GetLastWin32Error();
+                ThrowLastError(err, "failed to close directory " + dir + " with fd=" + fd + " in order to sync for file " + file);
+            }
+
+            if (isRealPath)
+                return 0;
+
+            // now sync the real path if the above is a symlink
+            var buffSize = 64;
+            var realpathToDir = ArrayPool<byte>.Shared.Rent(buffSize);
+            try
+            {
+                // determine buffSize passed to readlink should be using lstat (but this is not available right now)
+                // so we try with rented array of 64 bytes and if readlink needs more we will try again with 8K and fail otherwise
+                // (TODO: change it to lstat / FileInfo(path).Target in the future when https://github.com/dotnet/corefx/issues/26310 is fixed)
+                int numOfBytes;
+                fixed (byte* pBuff = realpathToDir)
+                {
+                    numOfBytes = ReadLinkOrThrow(dir, pBuff, buffSize);
+                    if (numOfBytes == 0)
+                        return 0; // non symlink dir
+ 
+                    if (numOfBytes >= buffSize) // 64 bytes are not enough for path legnth. lets try with 8192
+                    {
+                        buffSize = 8192; // usually PATH_MAX is 4096
+                        ArrayPool<byte>.Shared.Return(realpathToDir);
+                        realpathToDir = ArrayPool<byte>.Shared.Rent(buffSize);
+                        
+                        fixed (byte* pBuff8K = realpathToDir)
+                        {
+                            numOfBytes = ReadLinkOrThrow(dir, pBuff8K, buffSize);
+                            if (numOfBytes == 0)
+                                return 0; // non symlink dir
+                            
+                            if (numOfBytes >= buffSize)
+                            {
+                                throw new InvalidOperationException("readlink to " + dir +
+                                                                    " failed due to the need of more then 8192 bytes for path legnth. Failed to sync directory");
+                            }
+                        }
+                    }
+                }
+
+                var realpathString = Encoding.UTF8.GetString(realpathToDir,0, numOfBytes);
+                return SyncDirectory(realpathString, isRealPath: true);
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(realpathToDir);
+            }
         }
 
         public static string GetRootMountString(DriveInfo[] drivesInfo, string filePath)
@@ -388,5 +521,14 @@ namespace Sparrow.Platform.Posix
         public ulong f_flag;     /* mount flags */
         public ulong f_namemax;  /* maximum filename length */
         public fixed int f_spare[6];
+    }
+
+    [Flags]
+    public enum AccessMode
+    {
+        F_OK = 0,
+        X_OK = 1,
+        W_OK = 2,
+        R_OK = 4
     }
 }

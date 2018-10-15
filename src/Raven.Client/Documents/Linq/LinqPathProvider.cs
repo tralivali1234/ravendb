@@ -15,6 +15,7 @@ using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Queries;
 using Raven.Client.Documents.Session;
 using Raven.Client.Extensions;
+using Raven.Client.Util;
 
 namespace Raven.Client.Documents.Linq
 {
@@ -26,6 +27,7 @@ namespace Raven.Client.Documents.Linq
             public string Path;
             public bool IsNestedPath;
             public PropertyInfo MaybeProperty;
+            public string[] Args;
         }
 
         private readonly DocumentConventions _conventions;
@@ -91,6 +93,11 @@ namespace Raven.Client.Documents.Linq
                     };
                 }
 
+                if (IsCounterCall(callExpression))
+                {
+                    return CreateCounterResult(callExpression);
+                }
+
                 throw new InvalidOperationException("Cannot understand how to translate " + callExpression);
             }
 
@@ -121,6 +128,36 @@ namespace Raven.Client.Documents.Linq
             result.Path = HandlePropertyRenames(memberExpression.Member, result.Path);
 
             return result;
+        }
+
+        internal static Result CreateCounterResult(MethodCallExpression callExpression)
+        {
+            var counterName = (callExpression.Arguments[callExpression.Arguments.Count - 1] as ConstantExpression)?.Value.ToString();
+
+            string[] args;
+            if (callExpression.Method.DeclaringType != typeof(RavenQuery))
+            {
+                // session.CountersFor().Get()
+                var path = (callExpression.Object as MethodCallExpression)?.Arguments[0].ToString();
+                args = new[] {RemoveTransparentIdentifiersIfNeeded(path), counterName};
+            }
+            else if (callExpression.Arguments.Count == 2)
+            {                
+                var path = callExpression.Arguments[0].ToString();
+                args = new[] {RemoveTransparentIdentifiersIfNeeded(path), counterName};               
+            }
+            else
+            {
+                args = new[] { counterName };
+            }
+
+            return new Result
+            {
+                MemberType = typeof(long?),
+                IsNestedPath = false,
+                Path = "counter",
+                Args = args
+            };
         }
 
         public static string HandlePropertyRenames(MemberInfo member, string name)
@@ -159,6 +196,8 @@ namespace Raven.Client.Documents.Linq
             {
                 switch (expression.NodeType)
                 {
+                    case ExpressionType.Convert:
+                    case ExpressionType.ConvertChecked:
                     case ExpressionType.Quote:
                         expression = ((UnaryExpression)expression).Operand;
                         break;
@@ -410,5 +449,24 @@ namespace Raven.Client.Documents.Linq
                 cur = cur.Expression as MemberExpression;
             }
         }
+
+        internal static string RemoveTransparentIdentifiersIfNeeded(string path)
+        {
+            while (path.StartsWith(JavascriptConversionExtensions.TransparentIdentifier))
+            {
+                var indexOf = path.IndexOf(".", StringComparison.Ordinal);
+                path = path.Substring(indexOf + 1);
+            }
+
+            return path;
+        }
+
+        public static bool IsCounterCall(MethodCallExpression mce)
+        {
+            return mce.Method.DeclaringType == typeof(RavenQuery) && mce.Method.Name == "Counter"
+                   || mce.Object?.Type == typeof(ISessionDocumentCounters) && mce.Method.Name == "Get";
+        }
+
     }
 }
+

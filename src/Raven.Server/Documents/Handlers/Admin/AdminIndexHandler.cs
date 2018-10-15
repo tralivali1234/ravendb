@@ -2,12 +2,16 @@
 using System.Collections.Generic;
 using System.Net;
 using System.Threading.Tasks;
+using Raven.Client;
+using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Exceptions.Documents.Indexes;
 using Raven.Server.Json;
 using Raven.Server.Routing;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.TrafficWatch;
 using Sparrow.Json;
+using Sparrow.Logging;
 
 namespace Raven.Server.Documents.Handlers.Admin
 {
@@ -15,6 +19,17 @@ namespace Raven.Server.Documents.Handlers.Admin
     {
         [RavenAction("/databases/*/admin/indexes", "PUT", AuthorizationStatus.DatabaseAdmin)]
         public async Task Put()
+        {
+            await PutInternal(validatedAsAdmin:true);
+        }
+
+        [RavenAction("/databases/*/indexes", "PUT", AuthorizationStatus.ValidUser)]
+        public async Task PutJavaScript()
+        {
+            await PutInternal(validatedAsAdmin: false);
+        }
+
+        private async Task PutInternal(bool validatedAsAdmin)
         {
             using (ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
             {
@@ -26,14 +41,39 @@ namespace Raven.Server.Documents.Handlers.Admin
                 foreach (var indexToAdd in indexes)
                 {
                     var indexDefinition = JsonDeserializationServer.IndexDefinition((BlittableJsonReaderObject)indexToAdd);
+                    indexDefinition.Name = indexDefinition.Name?.Trim();
+
+                    if (LoggingSource.AuditLog.IsInfoEnabled)
+                    {
+                        var clientCert = GetCurrentCertificate();
+
+                        var auditLog = LoggingSource.AuditLog.GetLogger(Database.Name, "Audit");
+                        auditLog.Info($"Index {indexDefinition.Name} PUT by {clientCert?.Subject} {clientCert?.Thumbprint} with definition: {indexToAdd}");
+                    }
+
                     if (indexDefinition.Maps == null || indexDefinition.Maps.Count == 0)
                         throw new ArgumentException("Index must have a 'Maps' fields");
 
                     indexDefinition.Type = indexDefinition.DetectStaticIndexType();
-                   
+
+                    // C# index using a non-admin endpoint
+                    if (indexDefinition.Type.IsJavaScript() == false && validatedAsAdmin == false)
+                    {
+                        throw new UnauthorizedAccessException($"Index {indexDefinition.Name} is a C# index but was sent through a non-admin endpoint using REST api, this is not allowed.");
+                    }
+
+                    if (indexDefinition.Name.StartsWith(Constants.Documents.Indexing.SideBySideIndexNamePrefix, StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new ArgumentException(
+                            $"Index name must not start with '{Constants.Documents.Indexing.SideBySideIndexNamePrefix}'. Provided index name: '{indexDefinition.Name}'");
+                    }
+
                     var index = await Database.IndexStore.CreateIndex(indexDefinition);
                     createdIndexes.Add(index.Name);
                 }
+                if (TrafficWatchManager.HasRegisteredClients)
+                    AddStringToHttpContext(indexes.ToString(), TrafficWatchChangeType.Index);
+
 
                 HttpContext.Response.StatusCode = (int)HttpStatusCode.Created;
 
@@ -53,7 +93,7 @@ namespace Raven.Server.Documents.Handlers.Admin
                 }
             }
         }
-        
+
         [RavenAction("/databases/*/admin/indexes/stop", "POST", AuthorizationStatus.DatabaseAdmin)]
         public Task Stop()
         {

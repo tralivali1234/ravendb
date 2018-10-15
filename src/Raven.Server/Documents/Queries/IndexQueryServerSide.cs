@@ -1,7 +1,10 @@
 ﻿using System;
+using System.IO;
+using System.Text;
 using Microsoft.AspNetCore.Http;
 using Raven.Client.Documents.Queries;
 using Raven.Server.Documents.Queries.AST;
+using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.Json;
 using Raven.Server.Web;
 using Sparrow.Json;
@@ -12,7 +15,10 @@ namespace Raven.Server.Documents.Queries
     {
         [JsonDeserializationIgnore]
         public QueryMetadata Metadata { get; private set; }
-        
+
+        [JsonDeserializationIgnore]
+        public QueryTimingsScope Timings { get; private set; }
+
         private IndexQueryServerSide()
         {
             // for deserialization
@@ -31,8 +37,7 @@ namespace Raven.Server.Documents.Queries
         }
 
         public static IndexQueryServerSide Create(
-            BlittableJsonReaderObject json, 
-            JsonOperationContext context, 
+            BlittableJsonReaderObject json,
             QueryMetadataCache cache,
             QueryType queryType = QueryType.Select)
         {
@@ -44,13 +49,16 @@ namespace Raven.Server.Documents.Queries
             if (string.IsNullOrWhiteSpace(result.Query))
                 throw new InvalidOperationException($"Index query does not contain '{nameof(Query)}' field.");
 
-            if (cache.TryGetMetadata(result, context, out var metadataHash, out var metadata))
+            if (cache.TryGetMetadata(result, out var metadataHash, out var metadata))
             {
                 result.Metadata = metadata;
                 return result;
             }
 
             result.Metadata = new QueryMetadata(result.Query, result.QueryParameters, metadataHash, queryType);
+            if (result.Metadata.HasTimings)
+                result.Timings = new QueryTimingsScope(start: false);
+
             return result;
         }
 
@@ -60,15 +68,15 @@ namespace Raven.Server.Documents.Queries
             if ((httpContext.Request.Query.TryGetValue("query", out var query) == false || query.Count == 0 || string.IsNullOrWhiteSpace(query[0])) && isQueryOverwritten == false)
                 throw new InvalidOperationException("Missing mandatory query string parameter 'query'.");
 
-            var actualQuery = isQueryOverwritten ? overrideQuery: query[0] ;
+            var actualQuery = isQueryOverwritten ? overrideQuery : query[0];
             var result = new IndexQueryServerSide
             {
                 Query = Uri.UnescapeDataString(actualQuery),
                 // all defaults which need to have custom value
                 Start = start,
-                PageSize = pageSize
+                PageSize = pageSize,
             };
-
+            
             foreach (var item in httpContext.Request.Query)
             {
                 try
@@ -76,6 +84,12 @@ namespace Raven.Server.Documents.Queries
                     switch (item.Key)
                     {
                         case "query":
+                            continue;
+                        case "parameters":
+                            using (var stream = new MemoryStream(Encoding.UTF8.GetBytes(item.Value[0])))
+                            {
+                                result.QueryParameters = context.Read(stream, "query parameters");
+                            }
                             continue;
                         case RequestHandler.StartParameter:
                         case RequestHandler.PageSizeParameter:
@@ -98,6 +112,9 @@ namespace Raven.Server.Documents.Queries
             }
 
             result.Metadata = new QueryMetadata(result.Query, null, 0);
+
+            if (result.Metadata.HasTimings)
+                result.Timings = new QueryTimingsScope(start: false);
             return result;
         }
     }

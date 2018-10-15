@@ -3,6 +3,8 @@ using System.Collections.Generic;
 using System.Linq;
 using System.Threading.Tasks;
 using Raven.Server.Routing;
+using Raven.Server.ServerWide.Commands;
+using Raven.Server.ServerWide.Context;
 using Sparrow.Extensions;
 using Sparrow.Json;
 using Sparrow.Json.Parsing;
@@ -45,6 +47,25 @@ namespace Raven.Server.Documents.Handlers.Debugging
             return Task.CompletedTask;
         }
 
+        [RavenAction("/databases/*/admin/debug/cluster/txinfo", "GET", AuthorizationStatus.DatabaseAdmin, IsDebugInformationEndpoint = true)]
+        public Task ClusterTxInfo()
+        {
+            var from = GetLongQueryString("from", false);
+            var take = GetIntValueQueryString("take", false) ?? int.MaxValue;
+
+            using (ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+            using (context.OpenReadTransaction())
+            using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
+            {
+                context.Write(writer, new DynamicJsonValue
+                {
+                    ["Results"] = new DynamicJsonArray(ClusterTransactionCommand.ReadCommandsBatch(context, Database.Name, from, take))
+                });
+            }
+
+            return Task.CompletedTask;
+        }
+
         private DynamicJsonArray ToJson(List<TransactionInfo> txInfos)
         {
             return new DynamicJsonArray(txInfos.Select(ToJson));
@@ -66,8 +87,8 @@ namespace Raven.Server.Documents.Handlers.Debugging
                 [nameof(TxInfoResult.TransactionId)] = lowLevelTransaction.Id,
                 [nameof(TxInfoResult.ThreadId)] = lowLevelTransaction.CurrentTransactionHolder?.Id,
                 [nameof(TxInfoResult.ThreadName)] = lowLevelTransaction.CurrentTransactionHolder?.Name,
-                [nameof(TxInfoResult.StartTime)] = lowLevelTransaction.TxStartTime.GetDefaultRavenFormat(),
-                [nameof(TxInfoResult.TotalTime)] = $"{(DateTime.UtcNow - lowLevelTransaction.TxStartTime).Milliseconds} mSecs",
+                [nameof(TxInfoResult.StartTime)] = lowLevelTransaction.TxStartTime.GetDefaultRavenFormat(isUtc: true),
+                [nameof(TxInfoResult.TotalTime)] = $"{(DateTime.UtcNow - lowLevelTransaction.TxStartTime).TotalMilliseconds} mSecs",
                 [nameof(TxInfoResult.FlushInProgressLockTaken)] = lowLevelTransaction.FlushInProgressLockTaken,
                 [nameof(TxInfoResult.Flags)] = lowLevelTransaction.Flags,
                 [nameof(TxInfoResult.IsLazyTransaction)] = lowLevelTransaction.IsLazyTransaction,

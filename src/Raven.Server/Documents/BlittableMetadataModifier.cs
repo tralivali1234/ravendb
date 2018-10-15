@@ -47,11 +47,16 @@ namespace Raven.Server.Documents
         private const string LegacyRevisionState = "Historical";
         private const string LegacyHasRevisionsDocumentState = "Current";
 
-        private DocumentFlags ReadFlags(JsonParserState state, IJsonParser reader)
+        private DocumentFlags ReadFlags(JsonParserState state)
         {
-            var str = CreateLazyStringValueFromParserState(state);
-            if (Enum.TryParse(str, true, out DocumentFlags flags) == false)
-                ThrowInvalidFlagsProperty(str, reader);
+            var split = CreateLazyStringValueFromParserState(state).Split(',');
+            var flags = DocumentFlags.None;
+            for (var i = 0; i < split.Length; i++)
+            {
+                if (Enum.TryParse(split[i], true, out DocumentFlags flag) == false)
+                    continue;
+                flags |= flag;
+            }
             return flags;
         }
 
@@ -81,6 +86,11 @@ namespace Raven.Server.Documents
             {
                 lazyStringValueFromParserState.EscapePositions = state.EscapePositions.ToArray();
             }
+            else
+            {
+                lazyStringValueFromParserState.EscapePositions = Array.Empty<int>();
+            }
+
             return lazyStringValueFromParserState;
         }
 
@@ -330,7 +340,7 @@ namespace Raven.Server.Documents
                     }
                     if (state.CurrentTokenType != JsonParserToken.String)
                         ThrowExpectedFieldTypeOfString(Constants.Documents.Metadata.Flags, state, reader);
-                    Flags = ReadFlags(state, reader);
+                    Flags = ReadFlags(state);
                     break;
 
                 case 12: // @index-score
@@ -662,7 +672,7 @@ namespace Raven.Server.Documents
 
                     if (state.CurrentTokenType != JsonParserToken.String)
                         ThrowExpectedFieldTypeOfString(Constants.Documents.Metadata.Flags, state, reader);
-                    Flags = ReadFlags(state, reader);
+                    Flags = ReadFlags(state);
                     break;
                 case State.ReadingLastModified:
                 case State.ReadingLegacyLastModified:
@@ -706,7 +716,7 @@ namespace Raven.Server.Documents
 
         private void ThrowInvalidMetadataProperty(JsonParserState state, IJsonParser reader)
         {
-            throw new InvalidDataException($"Expected property @metadata to be a simpel type, but was {state.CurrentTokenType}. Id: '{Id ?? "N/A"}'. Around {reader.GenerateErrorState()}");
+            throw new InvalidDataException($"Expected property @metadata to be a simple type, but was {state.CurrentTokenType}. Id: '{Id ?? "N/A"}'. Around {reader.GenerateErrorState()}");
         }
 
         private void ThrowExpectedFieldTypeOfString(string field, JsonParserState state, IJsonParser reader)

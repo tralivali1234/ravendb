@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>netcoreapp2.0</TargetFramework>
-    <RuntimeFrameworkVersion>2.0.6</RuntimeFrameworkVersion>
+    <TargetFramework>netcoreapp2.1</TargetFramework>
+    <RuntimeFrameworkVersion>2.1.5</RuntimeFrameworkVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>SlowTests</AssemblyName>
     <PackageId>SlowTests</PackageId>
@@ -22,14 +22,23 @@
     <Content Include="..\xunit.runner.json" Link="xunit.runner.json">
       <CopyToOutputDirectory>Always</CopyToOutputDirectory>
     </Content>
-    <EmbeddedResource Include="Data\create.sql" />
-    <EmbeddedResource Include="Data\insert.sql" />
+    <EmbeddedResource Include="Data\RavenDB_10958.txt" />
+    <EmbeddedResource Include="Data\RavenDB_10958.json" />
+    <EmbeddedResource Include="Data\mssql.northwind.create.sql" />
+    <EmbeddedResource Include="Data\mssql.northwind.insert.sql" />
+    <EmbeddedResource Include="Data\mysql.northwind.create.sql" />
+    <EmbeddedResource Include="Data\mysql.northwind.insert.sql" />
+    <EmbeddedResource Include="Data\mssql.basic.create.sql" />
+    <EmbeddedResource Include="Data\mssql.basic.insert.sql" />
+    <EmbeddedResource Include="Data\mysql.basic.create.sql" />
+    <EmbeddedResource Include="Data\mysql.basic.insert.sql" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Data\non-leaf-page-seq-id-large-values-2.txt" />
     <EmbeddedResource Include="Data\non-leaf-page-seq-id-large-values.txt" />
     <EmbeddedResource Include="Data\places.txt" />
     <EmbeddedResource Include="Data\RavenDB_10404\northwind.4.0.0.ravendb-snapshot" />
+    <EmbeddedResource Include="Data\RavenDB_11664\1.ravendbdump" />
     <EmbeddedResource Include="Data\RavenDB_9912\1.ravendbdump" />
     <EmbeddedResource Include="Data\RavenDB_9912\2.ravendbdump" />
     <EmbeddedResource Include="Data\testing.ravendbdump" />
@@ -44,14 +53,15 @@
     <ProjectReference Include="..\..\src\Raven.TestDriver\Raven.TestDriver.csproj" />
     <ProjectReference Include="..\..\src\Sparrow\Sparrow.csproj" />
     <ProjectReference Include="..\..\src\Voron\Voron.csproj" />
+    <ProjectReference Include="..\..\tools\Voron.Recovery\Voron.Recovery.csproj" />
     <ProjectReference Include="..\FastTests\FastTests.csproj" />
     <ProjectReference Include="..\Tests.Infrastructure\Tests.Infrastructure.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.6.1" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.0-beta.1.build3958" />
-    <PackageReference Include="xunit" Version="2.4.0-beta.1.build3958" />
-    <DotNetCliToolReference Include="dotnet-xunit" Version="2.4.0-beta.1.build3958" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.9.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.0" />
+    <PackageReference Include="xunit" Version="2.4.0" />
+    <DotNetCliToolReference Include="dotnet-xunit" Version="2.4.0-beta.1.build9999" />
   </ItemGroup>
   <ItemGroup>
     <Service Include="{82a7f48d-3b50-4b1e-b82e-3ada8210c358}" />

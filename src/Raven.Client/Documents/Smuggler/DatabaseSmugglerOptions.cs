@@ -5,10 +5,11 @@ namespace Raven.Client.Documents.Smuggler
     public class DatabaseSmugglerOptions : IDatabaseSmugglerOptions
     {
         public const DatabaseItemType DefaultOperateOnTypes = DatabaseItemType.Indexes |
-                                                               DatabaseItemType.Documents | DatabaseItemType.RevisionDocuments |
-                                                               DatabaseItemType.Conflicts |
-                                                               DatabaseItemType.DatabaseRecord |
-                                                               DatabaseItemType.Identities | DatabaseItemType.CompareExchange;
+                                                              DatabaseItemType.Documents | DatabaseItemType.RevisionDocuments |
+                                                              DatabaseItemType.Conflicts |
+                                                              DatabaseItemType.DatabaseRecord |
+                                                              DatabaseItemType.Identities | DatabaseItemType.CompareExchange |
+                                                              DatabaseItemType.Counters;
 
         private const int DefaultMaxStepsForTransformScript = 10 * 1000;
 
@@ -28,6 +29,8 @@ namespace Raven.Client.Documents.Smuggler
         public string TransformScript { get; set; }
 
         public int MaxStepsForTransformScript { get; set; }
+
+        public bool SkipRevisionCreation { get; set; }
 
         [Obsolete("Not used. Will be removed in next major version of the product.")]
         public bool ReadLegacyEtag { get; set; }

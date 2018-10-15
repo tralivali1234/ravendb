@@ -10,8 +10,10 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
 using System.Runtime.CompilerServices;
+using Newtonsoft.Json;
 using Newtonsoft.Json.Linq;
 using Newtonsoft.Json.Serialization;
+using Sparrow.Json;
 
 namespace Raven.Client.Documents.Conventions
 {
@@ -72,7 +74,7 @@ namespace Raven.Client.Documents.Conventions
                 {
                     _currentExtensionGetter -= _getter;
                 }
-                
+
             }
         }
 
@@ -81,8 +83,8 @@ namespace Raven.Client.Documents.Conventions
             _currentExtensionSetter += setter;
             return new ClearExtensionData(setter, null);
         }
-        
-        
+
+
         public static ClearExtensionData RegisterExtensionDataGetter(ExtensionDataGetter getter)
         {
             _currentExtensionGetter += getter;
@@ -91,7 +93,12 @@ namespace Raven.Client.Documents.Conventions
 
         protected override JsonObjectContract CreateObjectContract(Type objectType)
         {
-            var jsonObjectContract = base.CreateObjectContract(objectType);
+            var jsonObjectContract =
+                objectType == typeof(LazyStringValue) ||
+                objectType == typeof(BlittableJsonReaderObject)
+                ? new JsonObjectContract(objectType)
+                : base.CreateObjectContract(objectType);
+
             jsonObjectContract.ExtensionDataValueType = typeof(JToken);
             jsonObjectContract.ExtensionDataSetter += (o, key, value) =>
             {

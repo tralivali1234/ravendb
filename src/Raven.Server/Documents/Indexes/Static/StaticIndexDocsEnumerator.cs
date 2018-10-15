@@ -17,25 +17,27 @@ namespace Raven.Server.Documents.Indexes.Static
             _docsEnumerator = docs.GetEnumerator();
         }
 
-        public StaticIndexDocsEnumerator(IEnumerable<Document> docs, List<IndexingFunc> funcs, string collection, IndexingStatsScope stats)
+        public StaticIndexDocsEnumerator(IEnumerable<Document> docs, List<IndexingFunc> funcs, string collection, IndexingStatsScope stats, IndexType type)
             : this(docs)
         {
             _documentReadStats = stats?.For(IndexingOperation.Map.DocumentRead, start: false);
 
-            var linqStats = stats?.For(IndexingOperation.Map.Linq, start: false);
+            var indexingFunctionType = type.IsJavaScript() ? IndexingOperation.Map.Jint : IndexingOperation.Map.Linq;
+
+            var mapFuncStats = stats?.For(indexingFunctionType , start: false);
 
             if (funcs.Count == 1)
             {
                 _resultsOfCurrentDocument =
-                    new TimeCountingEnumerable(funcs[0](new DynamicIteratonOfCurrentDocumentWrapper(this)), linqStats);
+                    new TimeCountingEnumerable(funcs[0](new DynamicIteratorOfCurrentDocumentWrapper(this)), mapFuncStats);
             }
             else
             {
-                _multipleIndexingFunctionsEnumerator = new MultipleIndexingFunctionsEnumerator(funcs, new DynamicIteratonOfCurrentDocumentWrapper(this));
-                _resultsOfCurrentDocument = new TimeCountingEnumerable(_multipleIndexingFunctionsEnumerator, linqStats);
+                _multipleIndexingFunctionsEnumerator = new MultipleIndexingFunctionsEnumerator(funcs, new DynamicIteratorOfCurrentDocumentWrapper(this));
+                _resultsOfCurrentDocument = new TimeCountingEnumerable(_multipleIndexingFunctionsEnumerator, mapFuncStats);
             }
 
-            CurrentIndexingScope.Current.SetSourceCollection(collection, linqStats);
+            CurrentIndexingScope.Current.SetSourceCollection(collection, mapFuncStats);
         }
 
         public bool MoveNext(out IEnumerable resultsOfCurrentDocument)
@@ -72,12 +74,12 @@ namespace Raven.Server.Documents.Indexes.Static
             Current?.Data?.Dispose();
         }
 
-        protected class DynamicIteratonOfCurrentDocumentWrapper : IEnumerable<DynamicBlittableJson>
+        protected class DynamicIteratorOfCurrentDocumentWrapper : IEnumerable<DynamicBlittableJson>
         {
             private readonly StaticIndexDocsEnumerator _indexingEnumerator;
             private Enumerator _enumerator;
 
-            public DynamicIteratonOfCurrentDocumentWrapper(StaticIndexDocsEnumerator indexingEnumerator)
+            public DynamicIteratorOfCurrentDocumentWrapper(StaticIndexDocsEnumerator indexingEnumerator)
             {
                 _indexingEnumerator = indexingEnumerator;
             }
@@ -141,7 +143,7 @@ namespace Raven.Server.Documents.Indexes.Static
         {
             private readonly Enumerator _enumerator;
 
-            public MultipleIndexingFunctionsEnumerator(List<IndexingFunc> funcs, DynamicIteratonOfCurrentDocumentWrapper iterationOfCurrentDocument)
+            public MultipleIndexingFunctionsEnumerator(List<IndexingFunc> funcs, DynamicIteratorOfCurrentDocumentWrapper iterationOfCurrentDocument)
             {
                 _enumerator = new Enumerator(funcs, iterationOfCurrentDocument.GetEnumerator());
             }

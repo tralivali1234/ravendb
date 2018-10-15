@@ -8,6 +8,7 @@ using Raven.Client.Exceptions;
 using Raven.Server.Documents.Includes;
 using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Queries.Results;
+using Raven.Server.Documents.Queries.Timings;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow;
@@ -27,10 +28,11 @@ namespace Raven.Server.Documents.Queries
         private readonly Reference<int> _totalResults;
         private readonly string _collection;
         private readonly IndexQueryServerSide _query;
+        private readonly QueryTimingsScope _queryTimings;
         private readonly bool _isAllDocsCollection;
 
         public CollectionQueryEnumerable(DocumentDatabase database, DocumentsStorage documents, FieldsToFetch fieldsToFetch, string collection,
-            IndexQueryServerSide query, DocumentsOperationContext context, IncludeDocumentsCommand includeDocumentsCommand, Reference<int> totalResults)
+            IndexQueryServerSide query, QueryTimingsScope queryTimings, DocumentsOperationContext context, IncludeDocumentsCommand includeDocumentsCommand, Reference<int> totalResults)
         {
             _database = database;
             _documents = documents;
@@ -38,6 +40,7 @@ namespace Raven.Server.Documents.Queries
             _collection = collection;
             _isAllDocsCollection = collection == Constants.Documents.Collections.AllDocumentsCollection;
             _query = query;
+            _queryTimings = queryTimings;
             _context = context;
             _includeDocumentsCommand = includeDocumentsCommand;
             _totalResults = totalResults;
@@ -45,7 +48,7 @@ namespace Raven.Server.Documents.Queries
 
         public IEnumerator<Document> GetEnumerator()
         {
-            return new Enumerator(_database, _documents, _fieldsToFetch, _collection, _isAllDocsCollection, _query, _context, _includeDocumentsCommand, _totalResults);
+            return new Enumerator(_database, _documents, _fieldsToFetch, _collection, _isAllDocsCollection, _query, _queryTimings, _context, _includeDocumentsCommand, _totalResults);
         }
 
         IEnumerator IEnumerable.GetEnumerator()
@@ -72,12 +75,11 @@ namespace Raven.Server.Documents.Queries
             private IEnumerator<Document> _inner;
             private int _innerCount;
             private readonly List<Slice> _ids;
-            private readonly Sort _sort;
             private readonly MapQueryResultRetriever _resultsRetriever;
-            private string _startsWith;
+            private readonly string _startsWith;
 
             public Enumerator(DocumentDatabase database, DocumentsStorage documents, FieldsToFetch fieldsToFetch, string collection, bool isAllDocsCollection,
-                IndexQueryServerSide query, DocumentsOperationContext context, IncludeDocumentsCommand includeDocumentsCommand, Reference<int> totalResults)
+                IndexQueryServerSide query, QueryTimingsScope queryTimings, DocumentsOperationContext context, IncludeDocumentsCommand includeDocumentsCommand, Reference<int> totalResults)
             {
                 _documents = documents;
                 _fieldsToFetch = fieldsToFetch;
@@ -91,31 +93,9 @@ namespace Raven.Server.Documents.Queries
                 if (_fieldsToFetch.IsDistinct)
                     _alreadySeenProjections = new HashSet<ulong>();
 
-                _resultsRetriever = new MapQueryResultRetriever(database, query, documents, context, fieldsToFetch, includeDocumentsCommand);
+                _resultsRetriever = new MapQueryResultRetriever(database, query, queryTimings, documents, context, fieldsToFetch, includeDocumentsCommand);
 
                 (_ids, _startsWith) = ExtractIdsFromQuery(query, context);
-
-                _sort = ExtractSortFromQuery(query);
-
-            }
-
-            private static Sort ExtractSortFromQuery(IndexQueryServerSide query)
-            {
-                if (query.Metadata.OrderBy == null)
-                    return null;
-
-                Debug.Assert(query.Metadata.OrderBy.Length == 1);
-
-                var randomField = query.Metadata.OrderBy[0];
-
-                Debug.Assert(randomField.OrderingType == OrderByFieldType.Random);
-
-                var customFieldName = randomField.Name;
-
-                if (string.IsNullOrEmpty(customFieldName))
-                    return new Sort(null);
-
-                return new Sort(customFieldName);
             }
 
             private (List<Slice>, string) ExtractIdsFromQuery(IndexQueryServerSide query, DocumentsOperationContext context)
@@ -229,8 +209,8 @@ namespace Raven.Server.Documents.Queries
                         documents = Enumerable.Empty<Document>();
                     else
                     {
-                        documents = _isAllDocsCollection 
-                            ? _documents.GetDocuments(_context, _ids, _start, _query.PageSize, _totalResults) 
+                        documents = _isAllDocsCollection
+                            ? _documents.GetDocuments(_context, _ids, _start, _query.PageSize, _totalResults)
                             : _documents.GetDocuments(_context, _ids, _collection, _start, _query.PageSize, _totalResults);
                     }
                 }
@@ -244,16 +224,8 @@ namespace Raven.Server.Documents.Queries
                     documents = _documents.GetDocumentsFrom(_context, _collection, 0, _start, _query.PageSize);
                     _totalResults.Value = (int)_documents.GetCollection(_collection, _context).Count;
                 }
-                return ApplySorting(documents);
-            }
 
-            private IEnumerable<Document> ApplySorting(IEnumerable<Document> documents)
-            {
-                if (_sort == null)
-                    return documents;
-
-                return documents
-                    .OrderBy(x => _sort.Next());
+                return documents;
             }
 
             private int Initialize()
@@ -273,7 +245,7 @@ namespace Raven.Server.Documents.Queries
                 while (true)
                 {
                     var count = 0;
-                    foreach (var document in ApplySorting(_documents.GetDocumentsFrom(_context, _collection, 0, start, _query.PageSize)))
+                    foreach (var document in _documents.GetDocumentsFrom(_context, _collection, 0, start, _query.PageSize))
                     {
                         count++;
 
@@ -320,23 +292,6 @@ namespace Raven.Server.Documents.Queries
                 }
             }
 
-            private class Sort
-            {
-                private readonly Random _random;
-
-                public Sort(string field)
-                {
-                    _random = field == null ?
-                        new Random() :
-                        new Random(field.GetHashCode());
-                }
-
-                public int Next()
-                {
-                    return _random.Next();
-                }
-            }
-
             private class RetrieveDocumentIdsVisitor : WhereExpressionVisitor
             {
                 private readonly Query _query;
@@ -346,7 +301,7 @@ namespace Raven.Server.Documents.Queries
                 private readonly ByteStringContext _allocator;
                 public string StartsWith;
 
-                public List<Slice> Ids { get; private set; }
+                public HashSet<Slice> Ids { get; private set; }
 
                 public RetrieveDocumentIdsVisitor(TransactionOperationContext serverContext, DocumentsOperationContext context, QueryMetadata metadata, ByteStringContext allocator) : base(metadata.Query.QueryText)
                 {
@@ -401,7 +356,7 @@ namespace Raven.Server.Documents.Queries
                 public override void VisitIn(QueryExpression fieldName, List<QueryExpression> values, BlittableJsonReaderObject parameters)
                 {
                     if (Ids == null)
-                        Ids = new List<Slice>(); // this handles a case where IN is used with empty list
+                        Ids = new HashSet<Slice>(SliceComparer.Instance); // this handles a case where IN is used with empty list
 
                     if (fieldName is MethodExpression me && string.Equals("id", me.Name, StringComparison.OrdinalIgnoreCase))
                     {
@@ -460,7 +415,7 @@ namespace Raven.Server.Documents.Queries
                         key = Slices.Empty;
 
                     if (Ids == null)
-                        Ids = new List<Slice>();
+                        Ids = new HashSet<Slice>(SliceComparer.Instance);
 
                     Ids.Add(key);
                 }

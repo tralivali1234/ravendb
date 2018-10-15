@@ -1,4 +1,5 @@
 /// <reference path="../../../../typings/tsd.d.ts"/>
+import jsonUtil = require("common/jsonUtil");
 
 class spatialOptions {
     maxTreeLevel = ko.observable<number>();
@@ -11,12 +12,15 @@ class spatialOptions {
     units = ko.observable<Raven.Client.Documents.Indexes.Spatial.SpatialUnits>();
     
     precision: KnockoutComputed<string>;
+    showPrecision: KnockoutComputed<boolean>;
+    
     availableStrategies = ko.observableArray<string>();
     canSpecifyUnits: KnockoutComputed<boolean>;
     canSpecifyTreeLevel: KnockoutComputed<boolean>;
     canSpecifyCoordinates: KnockoutComputed<boolean>;
 
     validationGroup: KnockoutValidationGroup;
+    dirtyFlag: () => DirtyFlag;
 
     constructor(dto: Raven.Client.Documents.Indexes.Spatial.SpatialOptions) {
         this.type(dto.Type);
@@ -51,6 +55,22 @@ class spatialOptions {
         this.validationGroup = ko.validatedObservable({
             maxTreeLevel: this.maxTreeLevel
         });
+  
+        
+        this.showPrecision = ko.pureComputed(() => {
+            return this.strategy() !== 'BoundingBox';
+        });
+
+        this.dirtyFlag = new ko.DirtyFlag([
+            this.type,
+            this.strategy,
+            this.maxTreeLevel,
+            this.minX,
+            this.maxX,
+            this.minY,
+            this.maxY,
+            this.units
+        ], false, jsonUtil.newLineNormalizingHashFunction);
     }
 
     toDto(): Raven.Client.Documents.Indexes.Spatial.SpatialOptions {
@@ -104,20 +124,25 @@ class spatialOptions {
 
         let x = maxX - minX;
         let y = maxY - minY;
-        for (let i = 0; i < maxTreeLevel; i++) {
-            if (strategy === "GeohashPrefixTree") {
-                if (i % 2 == 0) {
-                    x /= 8;
-                    y /= 4;
+
+        if (maxTreeLevel > 100) {
+            // prevent from iterating on very huge values - which will lead to 0 anyway
+            x = 0;
+            y = 0;
+        } else {
+            for (let i = 0; i < maxTreeLevel; i++) {
+                if (strategy === "GeohashPrefixTree") {
+                    if (i % 2 == 0) {
+                        x /= 8;
+                        y /= 4;
+                    } else {
+                        x /= 4;
+                        y /= 8;
+                    }
+                } else if (strategy === "QuadPrefixTree") {
+                    x /= 2;
+                    y /= 2;
                 }
-                else {
-                    x /= 4;
-                    y /= 8;
-                }
-            }
-            else if (strategy === "QuadPrefixTree") {
-                x /= 2;
-                y /= 2;
             }
         }
 
