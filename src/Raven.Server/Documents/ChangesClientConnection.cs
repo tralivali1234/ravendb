@@ -57,8 +57,9 @@ namespace Raven.Server.Documents
             public bool AllowSkip;
         }
 
-        public ChangesClientConnection(WebSocket webSocket, DocumentDatabase documentDatabase)
+        public ChangesClientConnection(WebSocket webSocket, DocumentDatabase documentDatabase, bool fromStudio)
         {
+            IsChangesConnectionOriginatedFromStudio = fromStudio;
             _webSocket = webSocket;
             _documentDatabase = documentDatabase;
             _startedAt = SystemTime.UtcNow;
@@ -194,14 +195,7 @@ namespace Raven.Server.Documents
                 return;
             }
 
-            var hasType = change.TypeName != null && HasItemEqualsTo(_matchingDocumentsOfType, change.TypeName);
-            if (hasType)
-            {
-                Send(change);
-                return;
-            }
-
-            if (change.Id == null && change.CollectionName == null && change.TypeName == null)
+            if (change.Id == null && change.CollectionName == null)
             {
                 Send(change);
             }
@@ -383,7 +377,10 @@ namespace Raven.Server.Documents
             }
         }
 
+        public bool IsChangesConnectionOriginatedFromStudio { get; }
+
         private SingleUseFlag _isDisposed = new SingleUseFlag();
+
         public bool IsDisposed => _isDisposed.IsRaised();
 
         public void Dispose()

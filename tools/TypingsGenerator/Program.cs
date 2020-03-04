@@ -29,6 +29,7 @@ using Raven.Client.Http;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Certificates;
+using Raven.Client.ServerWide.Operations.Migration;
 using Raven.Server.Commercial;
 using Raven.Server.Dashboard;
 using Raven.Server.Documents;
@@ -37,11 +38,11 @@ using Raven.Server.Documents.ETL.Providers.SQL.RelationalWriters;
 using Raven.Server.Documents.Handlers;
 using Raven.Server.Documents.Handlers.Admin;
 using Raven.Server.Documents.Handlers.Debugging;
-using Raven.Server.Documents.Indexes;
 using Raven.Server.Documents.Indexes.Debugging;
 using Raven.Server.Documents.Operations;
 using Raven.Server.Documents.Patch;
 using Raven.Server.Documents.PeriodicBackup;
+using Raven.Server.Documents.PeriodicBackup.Restore;
 using Raven.Server.Documents.Studio;
 using Raven.Server.Documents.Subscriptions;
 using Raven.Server.Documents.Replication;
@@ -50,6 +51,7 @@ using Raven.Server.Web.System;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.NotificationCenter.Notifications.Server;
+using Raven.Server.ServerWide.BackgroundTasks;
 using Raven.Server.ServerWide.Maintenance;
 using Raven.Server.Smuggler.Documents.Data;
 using Raven.Server.Smuggler.Migration;
@@ -68,7 +70,6 @@ namespace TypingsGenerator
 {
     public class Program
     {
-
         public const string TargetDirectory = "../../src/Raven.Studio/typings/server/";
         public static void Main(string[] args)
         {
@@ -123,16 +124,21 @@ namespace TypingsGenerator
 
             scripter.UsingTypeFilter(type => ignoredTypes.Contains(type) == false);
             scripter.UsingTypeReader(new TypeReaderWithIgnoreMethods());
+            
             scripter.AddType(typeof(CollectionStatistics));
-
             scripter.AddType(typeof(BatchRequestParser.CommandData));
+            
+            // name validation
+            scripter.AddType(typeof(StudioTasksHandler.ItemType));
+            scripter.AddType(typeof(NameValidation));
 
+            // database
             scripter.AddType(typeof(DatabasePutResult));
             scripter.AddType(typeof(DatabaseRecord));
             scripter.AddType(typeof(DatabaseStatistics));
+            
+            // footer
             scripter.AddType(typeof(FooterStatistics));
-            scripter.AddType(typeof(IndexDefinition));
-            scripter.AddType(typeof(PutIndexResult));
 
             // attachments
             scripter.AddType(typeof(AttachmentName));
@@ -171,8 +177,11 @@ namespace TypingsGenerator
             // alerts
             scripter.AddType(typeof(EtlErrorsDetails));
             scripter.AddType(typeof(SlowSqlDetails));
+            scripter.AddType(typeof(SlowWritesDetails));
 
             // indexes
+            scripter.AddType(typeof(IndexDefinition));
+            scripter.AddType(typeof(PutIndexResult));
             scripter.AddType(typeof(IndexStats));
             scripter.AddType(typeof(IndexingStatus));
             scripter.AddType(typeof(IndexPerformanceStats));
@@ -281,6 +290,8 @@ namespace TypingsGenerator
             scripter.AddType(typeof(RestoreProgress));
             scripter.AddType(typeof(NextBackupOccurrence));
             scripter.AddType(typeof(OfflineMigrationConfiguration));
+            scripter.AddType(typeof(BackupProgress));
+            scripter.AddType(typeof(StartBackupOperationResult));
 
             // ongoing tasks - subscription
             scripter.AddType(typeof(OngoingTaskSubscription));
@@ -359,6 +370,9 @@ namespace TypingsGenerator
             // debug
             scripter.AddType(typeof(ThreadsHandler.ThreadInfo));
             scripter.AddType(typeof(MemoryStatsHandler.MemoryInfo));
+
+            // version info
+            scripter.AddType(typeof(LatestVersionCheck.VersionInfo));
 
             return scripter;
         }

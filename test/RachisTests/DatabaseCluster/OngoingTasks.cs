@@ -18,11 +18,11 @@ namespace RachisTests.DatabaseCluster
 {
     public class OngoingTasks : ReplicationTestBase
     {
-        [NightlyBuildFact]
+        [Fact]
         public async Task CanGetTaskInfo()
         {
             var clusterSize = 3;
-            var databaseName = "TestDB";
+            var databaseName = GetDatabaseName();
             var leader = await CreateRaftClusterAndGetLeader(clusterSize);
             ModifyOngoingTaskResult addWatcherRes;
             UpdatePeriodicBackupOperationResult updateBackupResult;
@@ -189,7 +189,7 @@ loadToOrders(orderData);
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task CanToggleTaskState()
         {
             var clusterSize = 3;

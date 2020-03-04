@@ -3,7 +3,7 @@
     <Version></Version>
     <Description>RavenDB Client is the client library for accessing RavenDB</Description>
     <Authors>Hibernating Rhinos</Authors>
-    <TargetFrameworks>netstandard1.3;netstandard2.0</TargetFrameworks>
+    <TargetFrameworks>netstandard1.3;netstandard2.0;netcoreapp2.1</TargetFrameworks>
     <DefineConstants>$(DefineConstants);PORTABLE</DefineConstants>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>Raven.Client</AssemblyName>
@@ -28,21 +28,6 @@
     <Compile Include="..\CommonAssemblyInfo.cs" Link="Properties\CommonAssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
-    <Reference Include="Lambda2Js.Signed.Custom">
-      <HintPath>..\..\libs\Lambda2Js.Signed.Custom.dll</HintPath>
-    </Reference>
-    <!-- this is required for the nuget build to properly include the right files -->
-    <Content Include="..\..\libs\Lambda2Js.Signed.Custom.dll">
-      <PackagePath>lib/netstandard1.3/</PackagePath>
-      <Pack>true</Pack>
-    </Content>
-    <!-- this is required for the nuget build to properly include the right files -->
-    <Content Include="..\..\libs\Lambda2Js.Signed.Custom.dll">
-      <PackagePath>lib/netstandard2.0/</PackagePath>
-      <Pack>true</Pack>
-    </Content>
-  </ItemGroup>
-  <ItemGroup>
     <!-- this is required for the nuget build to properly include the right files -->
     <Content Include="..\Sparrow\bin\Release\netstandard1.3\Sparrow.dll">
       <PackagePath>lib/netstandard1.3/</PackagePath>
@@ -53,20 +38,27 @@
       <PackagePath>lib/netstandard2.0/</PackagePath>
       <Pack>true</Pack>
     </Content>
+    <!-- this is required for the nuget build to properly include the right files -->
+    <Content Include="..\Sparrow\bin\Release\netcoreapp2.1\Sparrow.dll">
+      <PackagePath>lib/netcoreapp2.1/</PackagePath>
+      <Pack>true</Pack>
+    </Content>
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="..\Sparrow\Sparrow.csproj" PrivateAssets="All" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.CSharp" Version="4.4.1" />
-    <PackageReference Include="System.Buffers" Version="4.4.0" />
-    <PackageReference Include="Newtonsoft.Json" Version="10.0.3" />
+    <PackageReference Include="Lambda2Js.Signed" Version="3.1.2" />
+    <PackageReference Include="Microsoft.CSharp" Version="4.5.0" />
+    <PackageReference Include="System.Buffers" Version="4.5.0" />
+    <PackageReference Include="Newtonsoft.Json" Version="11.0.2" />
     <PackageReference Include="Raven.CodeAnalysis" Version="1.0.10">
       <PrivateAssets>All</PrivateAssets>
     </PackageReference>
-    <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="4.4.0" />
-    <PackageReference Include="System.Security.Cryptography.Cng" Version="4.4.0" />
-    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.4.0" />
+    <PackageReference Include="System.Runtime.CompilerServices.Unsafe" Version="4.5.2" />
+    <PackageReference Include="System.Runtime.InteropServices.RuntimeInformation" Version="4.3.0" />
+    <PackageReference Include="System.Security.Cryptography.Cng" Version="4.5.0" />
+    <PackageReference Include="System.Threading.Tasks.Extensions" Version="4.5.2" />
   </ItemGroup>
   <ItemGroup Condition="$(TargetFramework) == 'netstandard1.3'">
     <PackageReference Include="System.Diagnostics.Contracts" Version="4.3.0" />
@@ -79,10 +71,10 @@
     <PackageReference Include="System.Net.WebSockets" Version="4.3.0" />
     <PackageReference Include="System.Net.WebSockets.Client" Version="4.3.2" />
     <PackageReference Include="System.Reflection.Extensions" Version="4.3.0" />
-    <PackageReference Include="System.Reflection.TypeExtensions" Version="4.4.0" />
+    <PackageReference Include="System.Reflection.TypeExtensions" Version="4.5.1" />
     <PackageReference Include="System.Threading" Version="4.3.0" />
     <PackageReference Include="System.Threading.Thread" Version="4.3.0" />
     <PackageReference Include="System.Threading.ThreadPool" Version="4.3.0" />
-    <PackageReference Include="System.ValueTuple" Version="4.4.0" />
+    <PackageReference Include="System.ValueTuple" Version="4.5.0" />
   </ItemGroup>
 </Project>

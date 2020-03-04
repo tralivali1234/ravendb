@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
@@ -65,7 +66,7 @@ namespace Raven.Client.Documents
         }
 
         /// <inheritdoc />
-        public virtual Task ExecuteIndexAsync(AbstractIndexCreationTask task, string database = null, CancellationToken token = default(CancellationToken))
+        public virtual Task ExecuteIndexAsync(AbstractIndexCreationTask task, string database = null, CancellationToken token = default)
         {
             AssertInitialized();
             return task.ExecuteAsync(this, Conventions, database, token);
@@ -78,7 +79,7 @@ namespace Raven.Client.Documents
         }
 
         /// <inheritdoc />
-        public virtual Task ExecuteIndexesAsync(IEnumerable<AbstractIndexCreationTask> tasks, string database = null, CancellationToken token = default(CancellationToken))
+        public virtual Task ExecuteIndexesAsync(IEnumerable<AbstractIndexCreationTask> tasks, string database = null, CancellationToken token = default)
         {
             AssertInitialized();
             var indexesToAdd = IndexCreation.CreateIndexesToAdd(tasks, Conventions);
@@ -95,7 +96,12 @@ namespace Raven.Client.Documents
         public virtual DocumentConventions Conventions
         {
             get => _conventions ?? (_conventions = new DocumentConventions());
-            set => _conventions = value;
+            set
+            {
+                AssertNotInitialized(nameof(Conventions));
+
+                _conventions = value;
+            }
         }
 
         /// <summary>
@@ -111,13 +117,17 @@ namespace Raven.Client.Documents
             get => _urls;
             set
             {
-                if (value == null) throw new ArgumentNullException(nameof(value));
+                AssertNotInitialized(nameof(Urls));
+
+                if (value == null)
+                    throw new ArgumentNullException(nameof(value));
+
                 for (var i = 0; i < value.Length; i++)
                 {
-                    if(value[i] == null)
+                    if (value[i] == null)
                         throw new ArgumentNullException(nameof(value), "Urls cannot contain null");
 
-                    if(Uri.TryCreate(value[i], UriKind.Absolute, out var _) == false)
+                    if (Uri.TryCreate(value[i], UriKind.Absolute, out _) == false)
                         throw new ArgumentException(value[i] + " is no a valid url");
                     value[i] = value[i].TrimEnd('/');
                 }
@@ -141,27 +151,23 @@ namespace Raven.Client.Documents
                 throw new ObjectDisposedException(GetType().Name, "The document store has already been disposed and cannot be used");
         }
 
-        protected void AssertInitialized()
+        protected internal void AssertInitialized()
         {
             if (Initialized == false)
                 throw new InvalidOperationException("You cannot open a session or access the database commands before initializing the document store. Did you forget calling Initialize()?");
         }
 
-        protected virtual void AfterSessionCreated(InMemoryDocumentSessionOperations session)
+        private void AssertNotInitialized(string property)
         {
-            var onSessionCreatedInternal = SessionCreatedInternal;
-            onSessionCreatedInternal?.Invoke(session);
+            if (Initialized)
+                throw new InvalidOperationException($"You cannot set '{property}' after the document store has been initialized.");
         }
 
-        ///<summary>
-        /// Internal notification for integration tools, mainly
-        ///</summary>
-        public event Action<InMemoryDocumentSessionOperations> SessionCreatedInternal;
-        public event Action<string> TopologyUpdatedInternal;
         public event EventHandler<BeforeStoreEventArgs> OnBeforeStore;
         public event EventHandler<AfterSaveChangesEventArgs> OnAfterSaveChanges;
         public event EventHandler<BeforeDeleteEventArgs> OnBeforeDelete;
         public event EventHandler<BeforeQueryEventArgs> OnBeforeQuery;
+        public event EventHandler<SessionCreatedEventArgs> OnSessionCreated;
 
         /// <summary>
         /// The default database name
@@ -171,8 +177,8 @@ namespace Raven.Client.Documents
             get => _database;
             set
             {
-                if (Initialized)
-                    throw new InvalidOperationException("You cannot change the default database name after the document store has been initialized");
+                AssertNotInitialized(nameof(Database));
+
                 _database = value;
             }
         }
@@ -185,8 +191,8 @@ namespace Raven.Client.Documents
             get => _certificate;
             set
             {
-                if(Initialized)
-                    throw new InvalidOperationException("You cannot change the certificate after the document store has been initialized");
+                AssertNotInitialized(nameof(Certificate));
+
                 _certificate = value;
             }
         }
@@ -213,12 +219,12 @@ namespace Raven.Client.Documents
             session.OnBeforeQuery += OnBeforeQuery;
         }
 
+        protected void AfterSessionCreated(InMemoryDocumentSessionOperations session)
+        {
+            OnSessionCreated?.Invoke(this, new SessionCreatedEventArgs(session));
+        }
+
         public abstract MaintenanceOperationExecutor Maintenance { get; }
         public abstract OperationExecutor Operations { get; }
-
-        protected void OnTopologyUpdatedInternal(string databaseName)
-        {
-            TopologyUpdatedInternal?.Invoke(databaseName);
-        }
     }
 }

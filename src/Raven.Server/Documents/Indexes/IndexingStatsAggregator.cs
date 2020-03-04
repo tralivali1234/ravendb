@@ -3,6 +3,7 @@ using System.Diagnostics;
 using System.Linq;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Util;
+using Raven.Server.Documents.Indexes.MapReduce.Exceptions;
 using Raven.Server.Exceptions;
 using Raven.Server.Utils.Stats;
 
@@ -104,7 +105,15 @@ namespace Raven.Server.Documents.Indexes
 
         public int MapAttempts => _stats.MapAttempts;
 
+        public int MapErrors => _stats.MapErrors;
+
+        public int ReduceAttempts => _stats.ReduceAttempts;
+
+        public int ReduceErrors => _stats.ReduceErrors;
+
         public int ErrorsCount => _stats.Errors?.Count ?? 0;
+
+        public int NumberOfKeptReduceErrors => _stats.NumberOfKeptReduceErrors;
 
         public void AddAllocatedBytes(long sizeInBytes)
         {
@@ -131,7 +140,7 @@ namespace Raven.Server.Documents.Indexes
             _stats.AddCriticalError(e);
         }
 
-        public void AddMemoryError(OutOfMemoryException oome)
+        public void AddMemoryError(Exception oome)
         {
             _stats.AddMemoryError(oome);
         }
@@ -139,6 +148,11 @@ namespace Raven.Server.Documents.Indexes
         public void AddAnalyzerError(IndexAnalyzerException iae)
         {
             _stats.AddAnalyzerError(iae);
+        }
+
+        public void AddExcessiveNumberOfReduceErrors(ExcessiveNumberOfReduceErrorsException e)
+        {
+            _stats.AddExcessiveNumberOfReduceErrors(e);
         }
 
         public void AddMapError(string key, string message)

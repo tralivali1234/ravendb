@@ -47,51 +47,58 @@ namespace Voron.Platform.Posix
 
         public PosixJournalWriter(StorageEnvironmentOptions options, VoronPathSetting filename, long journalSize)
         {
-            _options = options;
-            _filename = filename;
-            _maxNumberOf4KbPerSingleWrite = int.MaxValue / (4 * Constants.Size.Kilobyte);
-
-           _fd = Syscall.open(filename.FullPath, OpenFlags.O_WRONLY | options.PosixOpenFlags | PerPlatformValues.OpenFlags.O_CREAT,
-                FilePermissions.S_IWUSR | FilePermissions.S_IRUSR);
-
-            if (_fd == -1)
+            try
             {
-                var err = Marshal.GetLastWin32Error();
-                Syscall.ThrowLastError(err, "when opening " + filename);
-            }
+                _options = options;
+                _filename = filename;
+                _maxNumberOf4KbPerSingleWrite = int.MaxValue / (4 * Constants.Size.Kilobyte);
 
-            if (RunningOnMacOsx)
-            {
-                // mac doesn't support O_DIRECT, we fcntl instead:
-                var rc = Syscall.fcntl(_fd, FcntlCommands.F_NOCACHE, (IntPtr)1);
-                if (rc != 0)
+                _fd = Syscall.open(filename.FullPath, OpenFlags.O_WRONLY | options.PosixOpenFlags | PerPlatformValues.OpenFlags.O_CREAT,
+                    FilePermissions.S_IWUSR | FilePermissions.S_IRUSR);
+
+                if (_fd == -1)
                 {
                     var err = Marshal.GetLastWin32Error();
-                    Syscall.ThrowLastError(err, "when fcntl F_NOCACHE for " + filename);
+                    Syscall.ThrowLastError(err, "when opening " + filename);
                 }
-            }
 
-            var length = new FileInfo(filename.FullPath).Length;
-            if (length < journalSize)
-            {
-                length = journalSize;
-                try
+                if (RunningOnMacOsx)
                 {
-                    PosixHelper.AllocateFileSpace(options, _fd, journalSize, filename.FullPath);
+                    // mac doesn't support O_DIRECT, we fcntl instead:
+                    var rc = Syscall.fcntl(_fd, FcntlCommands.F_NOCACHE, (IntPtr)1);
+                    if (rc != 0)
+                    {
+                        var err = Marshal.GetLastWin32Error();
+                        Syscall.ThrowLastError(err, "when fcntl F_NOCACHE for " + filename);
+                    }
                 }
-                catch (Exception)
-                {
-                    Syscall.close(_fd);
-                    throw;
-                }
-            }
-            if (Syscall.CheckSyncDirectoryAllowed(_filename.FullPath) && Syscall.SyncDirectory(filename.FullPath) == -1)
-            {
-                var err = Marshal.GetLastWin32Error();
-                Syscall.ThrowLastError(err, "when syncing dir for on " + filename);
-            }
 
-            NumberOfAllocated4Kb = (int)(length / (4 * Constants.Size.Kilobyte));
+                var length = new FileInfo(filename.FullPath).Length;
+                if (length < journalSize)
+                {
+                    length = journalSize;
+                    try
+                    {
+                        PosixHelper.AllocateFileSpace(options, _fd, journalSize, filename.FullPath);
+                    }
+                    catch (Exception)
+                    {
+                        Syscall.close(_fd);
+                        throw;
+                    }
+                }
+                if (Syscall.CheckSyncDirectoryAllowed(_filename.FullPath) && Syscall.SyncDirectory(filename.FullPath) == -1)
+                {
+                    var err = Marshal.GetLastWin32Error();
+                    Syscall.ThrowLastError(err, "when syncing dir for on " + filename);
+                }
+                NumberOfAllocated4Kb = (int)(length / (4 * Constants.Size.Kilobyte));
+            }
+            catch
+            {
+                Dispose();
+                throw;
+            }
         }
 
         public void Dispose()
@@ -148,34 +155,9 @@ namespace Voron.Platform.Posix
                 return; // nothing to do
 
             var nNumberOfBytesToWrite = (ulong)numberOf4Kb * (4 * Constants.Size.Kilobyte);
-            long actuallyWritten = 0;
-            long result;
             using (_options.IoMetrics.MeterIoRate(_filename.FullPath, IoMetrics.MeterType.JournalWrite, (long)nNumberOfBytesToWrite))
             {
-                do
-                {
-                    result = Syscall.pwrite(_fd, p, nNumberOfBytesToWrite - (ulong)actuallyWritten,
-                        position * 4 * Constants.Size.Kilobyte);
-                    if (result < 1)
-                        break;
-                    actuallyWritten += result;
-                    p += actuallyWritten;
-                } while ((ulong)actuallyWritten < nNumberOfBytesToWrite);
-            }
-            if (result == -1)
-            {
-                var err = Marshal.GetLastWin32Error();
-                Syscall.ThrowLastError(err, "when writing to " + _filename);
-            }
-            else if (result == 0)
-            {
-                var err = Marshal.GetLastWin32Error();
-                throw new IOException($"pwrite reported zero bytes written, after write of {actuallyWritten} bytes out of {nNumberOfBytesToWrite}. lastErrNo={err} on {_filename}");
-            }
-            else if ((ulong)actuallyWritten != nNumberOfBytesToWrite)
-            {
-                var err = Marshal.GetLastWin32Error();
-                throw new IOException($"pwrite couln't write {nNumberOfBytesToWrite} to file. only {actuallyWritten} written. lastErrNo={err} on {_filename}");
+                Syscall.PwriteOrThrow(_fd, p, nNumberOfBytesToWrite, position * 4 * Constants.Size.Kilobyte, _filename.FullPath, "pwrite journal WriteFile");
             }
         }
 

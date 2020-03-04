@@ -7,9 +7,11 @@ using System.Threading;
 using System.Threading.Tasks;
 using Raven.Client.Documents.Changes;
 using Raven.Client.Documents.Subscriptions;
+using Raven.Client.Exceptions.Documents.Subscriptions;
 using Raven.Client.Util;
 using Raven.Server.Documents.Subscriptions;
 using Raven.Server.Json;
+using Raven.Server.Rachis;
 using Raven.Server.ServerWide.Context;
 using Sparrow;
 using Sparrow.Json;
@@ -17,12 +19,10 @@ using Sparrow.Json.Parsing;
 using Sparrow.Logging;
 using Raven.Server.Utils;
 using Sparrow.Utils;
-using Raven.Client.Exceptions.Documents.Subscriptions;
 using Raven.Server.Documents.Queries.AST;
 using Raven.Server.Documents.Replication;
 using Constants = Voron.Global.Constants;
 using QueryParser = Raven.Server.Documents.Queries.Parser.QueryParser;
-using Raven.Client.Exceptions.Cluster;
 
 namespace Raven.Server.Documents.TcpHandlers
 {
@@ -115,33 +115,23 @@ namespace Raven.Server.Documents.TcpHandlers
                     $"Subscription connection for subscription ID: {SubscriptionId} received from {TcpConnection.TcpClient.Client.RemoteEndPoint}");
             }
             
+            // first, validate details and make sure subscription exists
             SubscriptionState = await TcpConnection.DocumentDatabase.SubscriptionStorage.AssertSubscriptionConnectionDetails(SubscriptionId,_options.SubscriptionName);
-
-            (Collection, (Script, Functions), Revisions) = ParseSubscriptionQuery(SubscriptionState.Query);
-
-
-            using (this.TcpConnection.DocumentDatabase.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
-            {
-                var collectionStats = this.TcpConnection.DocumentDatabase.DocumentsStorage.GetCollection(Collection,false);
-                if (collectionStats == null)
-                {
-                    throw new SubscriptionInvalidStateException($"Collection {Collection} could not be found. Subscription can't be opened on non existant collection");
-                }    
-            }
             
             _connectionState = TcpConnection.DocumentDatabase.SubscriptionStorage.OpenSubscription(this);
             var timeout = TimeSpan.FromMilliseconds(16);
-
-            bool shouldRetry;
+            
+            bool shouldRetry = false;
+            
             do
             {
                 try
                 {
                     DisposeOnDisconnect = await _connectionState.RegisterSubscriptionConnection(this, timeout);
-                    shouldRetry = false;
+                    shouldRetry = false;                    
                 }
                 catch (TimeoutException)
-                {
+                {                    
                     if (timeout == TimeSpan.Zero && _logger.IsInfoEnabled)
                     {
                         _logger.Info(
@@ -152,6 +142,13 @@ namespace Raven.Server.Documents.TcpHandlers
                     shouldRetry = true;
                 }
             } while (shouldRetry);
+
+           
+
+            // refresh subscription data (change vector may have been updated, because in the meanwhile, another subscription could have just completed a batch)            
+            SubscriptionState = await TcpConnection.DocumentDatabase.SubscriptionStorage.AssertSubscriptionConnectionDetails(SubscriptionId, _options.SubscriptionName);
+            
+            (Collection, (Script, Functions), Revisions) = ParseSubscriptionQuery(SubscriptionState.Query);
 
             try
             {
@@ -355,9 +352,9 @@ namespace Raven.Server.Documents.TcpHandlers
                         [nameof(SubscriptionConnectionServerMessage.Exception)] = ex.ToString()
                     });
                 }
-                else if (ex is CommandExecutionException commandExecution && commandExecution.InnerException != null && commandExecution.InnerException is SubscriptionException)
-                {                    
-                    await ReportExceptionToClient(connection, commandExecution.InnerException, recursionDepth - 1);                    
+                else if (ex is RachisApplyException commandExecution && commandExecution.InnerException is SubscriptionException)
+                {
+                    await ReportExceptionToClient(connection, commandExecution.InnerException, recursionDepth - 1);
                 }
                 else
                 {
@@ -457,7 +454,7 @@ namespace Raven.Server.Documents.TcpHandlers
         private (IDisposable ReleaseBuffer, JsonOperationContext.ManagedPinnedBuffer Buffer) _copiedBuffer;
 
         private async Task ProcessSubscriptionAsync()
-        {
+        {            
             if (_logger.IsInfoEnabled)
             {
                 _logger.Info(
@@ -641,9 +638,15 @@ namespace Raven.Server.Documents.TcpHandlers
                         writer.WriteComma();
                         writer.WritePropertyName(docsContext.GetLazyStringForFieldWithCaching(DataSegment));
                         result.Doc.EnsureMetadata();
+                                               
 
                         if (result.Exception != null)
                         {
+                            if (result.Doc.Data.Modifications != null)
+                            {
+                                result.Doc.Data = docsContext.ReadObject(result.Doc.Data, "subsDocAferModifications");
+                            }
+
                             var metadata = result.Doc.Data[Client.Constants.Documents.Metadata.Key];
                             writer.WriteValue(BlittableJsonToken.StartObject,
                                 docsContext.ReadObject(new DynamicJsonValue

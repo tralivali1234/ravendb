@@ -8,13 +8,12 @@ using System;
 using System.IO;
 using System.Threading.Tasks;
 using FastTests;
+using FastTests.Utils;
 using Raven.Client;
 using Raven.Client.Documents;
 using Raven.Client.Documents.Operations.Expiration;
 using Raven.Client.Documents.Smuggler;
-using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
-using Raven.Server.Documents.Expiration;
 using Raven.Server.Utils;
 using Sparrow.Extensions;
 using Xunit;
@@ -31,13 +30,13 @@ namespace SlowTests.Issues
         [Fact, Trait("Category", "Smuggler")]
         public async Task SmugglerWithoutExcludeExpiredDocumentsShouldWork()
         {
-            var path = Path.GetTempFileName();
+            var path = GetTempFileName();
 
             try
             {
                 using (var store = GetDocumentStore())
                 {
-                    Initialize(store);
+                    await Initialize(store);
 
                     await store.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions(), path);
                 }
@@ -67,13 +66,13 @@ namespace SlowTests.Issues
         [Fact, Trait("Category", "Smuggler")]
         public async Task SmugglerWithExcludeExpiredDocumentsShouldWork1()
         {
-            var path = Path.GetTempFileName();
+            var path = GetTempFileName();
 
             try
             {
                 using (var store = GetDocumentStore())
                 {
-                    Initialize(store);
+                    await Initialize(store);
 
                     await store.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions { IncludeExpired = false }, path);
                 }
@@ -103,13 +102,13 @@ namespace SlowTests.Issues
         [Fact, Trait("Category", "Smuggler")]
         public async Task SmugglerWithExcludeExpiredDocumentsShouldWork2()
         {
-            var path = Path.GetTempFileName();
+            var path = GetTempFileName();
 
             try
             {
                 using (var store = GetDocumentStore())
                 {
-                    Initialize(store);
+                    await Initialize(store);
 
                     await store.Smuggler.ExportAsync(new DatabaseSmugglerExportOptions { IncludeExpired = false }, path);
                 }
@@ -139,9 +138,9 @@ namespace SlowTests.Issues
             }
         }
 
-        private static void Initialize(IDocumentStore store)
+        private async Task Initialize(IDocumentStore store)
         {
-            SetupExpiration(store);
+            await SetupExpiration(store);
 
             var product1 = new Product();
             var product2 = new Product();
@@ -162,7 +161,7 @@ namespace SlowTests.Issues
             }
         }
 
-        private static void SetupExpiration(IDocumentStore store)
+        private async Task SetupExpiration(IDocumentStore store)
         {
             using (var session = store.OpenSession())
             {
@@ -171,7 +170,9 @@ namespace SlowTests.Issues
                     Disabled = false,
                     DeleteFrequencyInSec = 100,
                 };
-                store.Maintenance.Send(new ConfigureExpirationOperation(config));
+
+                await ExpirationHelper.SetupExpiration(store, Server.ServerStore, config);
+
                 session.SaveChanges();
             }
         }

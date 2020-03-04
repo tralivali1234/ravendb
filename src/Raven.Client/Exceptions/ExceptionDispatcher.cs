@@ -26,9 +26,9 @@ namespace Raven.Client.Exceptions
             public string Error { get; set; }
         }
 
-        public static Exception Get(ExceptionSchema schema, HttpStatusCode code) => Get(schema.Message, schema.Error, schema.Type, code);
+        public static Exception Get(ExceptionSchema schema, HttpStatusCode code, Exception inner) => Get(schema.Message, schema.Error, schema.Type, code, inner);
 
-        public static Exception Get(string message, string error, string typeAsString, HttpStatusCode code)
+        public static Exception Get(string message, string error, string typeAsString, HttpStatusCode code, Exception inner = null)
         {
             if (code == HttpStatusCode.Conflict)
             {
@@ -37,13 +37,13 @@ namespace Raven.Client.Exceptions
 
                 return new ConcurrencyException(message);
             }
-            
+
             // We throw the same error for different status codes: GatewayTimeout,RequestTimeout,BadGateway,ServiceUnavailable.
-            error += $"{Environment.NewLine}Response.StatusCode - {code}"; 
+            error += $"{Environment.NewLine}Response.StatusCode - {code}";
 
             var type = GetType(typeAsString);
             if (type == null)
-                return new RavenException(error);
+                return new RavenException(error, inner);
 
             Exception exception;
             try
@@ -167,8 +167,18 @@ namespace Raven.Client.Exceptions
             }
             catch (Exception e)
             {
-                stream.Position = 0;
-                throw new InvalidOperationException($"Cannot parse the {response.StatusCode} response. Content: {new StreamReader(stream).ReadToEnd()}", e);
+                string content = null;
+                if (stream.CanSeek)
+                {
+                    stream.Position = 0;
+                    using (var reader = new StreamReader(stream, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true))
+                        content = reader.ReadToEnd();
+                }
+
+                if (content != null)
+                    content = $"Content: {content}";
+
+                throw new InvalidOperationException($"Cannot parse the '{response.StatusCode}' response. {content}", e);
             }
 
             return json;

@@ -1,13 +1,13 @@
 ﻿using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
 using FastTests.Client.Subscriptions;
 using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Subscriptions;
 using Raven.Client.ServerWide.Operations.Certificates;
-using Raven.Server.Documents.Indexes.Static;
 using Sparrow.Json;
 using Xunit;
 
@@ -15,6 +15,8 @@ namespace SlowTests.Client.Subscriptions
 {
     public class CriteriaScript : SubscriptionTestBase
     {
+        private readonly TimeSpan _reasonableWaitTime = Debugger.IsAttached ? TimeSpan.FromSeconds(60 * 10) : TimeSpan.FromSeconds(30);
+
         [Theory]
         [InlineData(false)]
         [InlineData(true)]
@@ -53,7 +55,10 @@ namespace SlowTests.Client.Subscriptions
                         ChangeVector = lastChangeVector
                     };
                     var subsId = subscriptionManager.Create(subscriptionCreationParams);
-                    using (var subscription = subscriptionManager.GetSubscriptionWorker<Thing>(new SubscriptionWorkerOptions(subsId)))
+                    using (var subscription = subscriptionManager.GetSubscriptionWorker<Thing>(new SubscriptionWorkerOptions(subsId)
+                    {
+                        TimeToWaitBeforeConnectionRetry = TimeSpan.FromSeconds(5)
+                    }))
                     {
                         var list = new BlockingCollection<Thing>();
                         GC.KeepAlive(subscription.Run(x =>
@@ -65,7 +70,7 @@ namespace SlowTests.Client.Subscriptions
                         }));
 
                         Thing thing;
-                        Assert.True(list.TryTake(out thing, 5000));
+                        Assert.True(list.TryTake(out thing, _reasonableWaitTime));
                         Assert.Equal("ThingNo3", thing.Name);
                         Assert.False(list.TryTake(out thing, 50));
                     }
@@ -128,32 +133,30 @@ select project(d)
                     };
 
                     var subsId = subscriptionManager.Create(subscriptionCreationParams);
-                    using (var subscription = subscriptionManager.GetSubscriptionWorker<BlittableJsonReaderObject>(new SubscriptionWorkerOptions(subsId)))
+                    using (var subscription = subscriptionManager.GetSubscriptionWorker<Thing>(new SubscriptionWorkerOptions(subsId)
+                    {
+                        TimeToWaitBeforeConnectionRetry = TimeSpan.FromSeconds(5)
+                    }))
                     {
                         using (store.GetRequestExecutor().ContextPool.AllocateOperationContext(out JsonOperationContext context))
                         {
-                            var list = new BlockingCollection<BlittableJsonReaderObject>();
+                            var list = new BlockingCollection<Thing>();
 
                             GC.KeepAlive(subscription.Run(x =>
                             {
                                 foreach (var item in x.Items)
                                 {
-                                    list.Add(context.ReadObject(item.Result, "test"));
+                                    list.Add(item.Result);
                                 }
                             }));
 
-                            BlittableJsonReaderObject thing;
+                            Thing thing;
 
-                            Assert.True(list.TryTake(out thing, 5000));
-                            dynamic dynamicThing = new DynamicBlittableJson(thing);
-                            Assert.Equal("ThingNo4", dynamicThing.Name);
-
-
-                            Assert.True(list.TryTake(out thing, 5000));
-                            dynamicThing = new DynamicBlittableJson(thing);
-                            Assert.Equal("foo", dynamicThing.Name);
-                            Assert.Equal("ThingNo4", dynamicThing.OtherDoc.Name);
-
+                            Assert.True(list.TryTake(out thing, _reasonableWaitTime));
+                            Assert.Equal("ThingNo4", thing.Name);
+                            Assert.True(list.TryTake(out thing, _reasonableWaitTime));
+                            Assert.Equal("foo", thing.Name);
+                            Assert.Equal("ThingNo4", thing.OtherDoc.Name);
                             Assert.False(list.TryTake(out thing, 50));
                         }
                     }

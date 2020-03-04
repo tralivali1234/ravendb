@@ -4,7 +4,10 @@ import clusterNode = require("models/database/cluster/clusterNode");
 class clusterTopology {
     leader = ko.observable<string>();
     nodeTag = ko.observable<string>();
+    currentState = ko.observable<Raven.Client.ServerWide.RachisState>();
     currentTerm = ko.observable<number>();
+    
+    isPassive = ko.pureComputed(() => this.currentState() === "Passive");
     
     nodes = ko.observableArray<clusterNode>([]);
     
@@ -18,6 +21,7 @@ class clusterTopology {
         this.leader(dto.Leader);
         this.nodeTag(dto.NodeTag);
         this.currentTerm(dto.CurrentTerm);
+        this.currentState(dto.CurrentState);
 
         const topologyDto = dto.Topology;
 
@@ -28,7 +32,7 @@ class clusterTopology {
         this.nodes(_.concat<clusterNode>(members, promotables, watchers));
         this.nodes(_.sortBy(this.nodes(), x => x.tag().toUpperCase()));
 
-        this.updateAssignedCores(dto.NodeLicenseDetails);
+        this.updateNodeDetails(dto.NodeLicenseDetails);
         
         this.membersCount = ko.pureComputed(() => {
             const nodes = this.nodes();
@@ -62,7 +66,7 @@ class clusterTopology {
                 this.anyErrorsEncountered(true);
             }
             
-            return clusterNode.for(k, v, type, connected, errorDetails);
+            return clusterNode.for(k, v, type, connected, this.isPassive, errorDetails);
         });
     }
 
@@ -93,13 +97,14 @@ class clusterTopology {
             }
         });
 
-        this.updateAssignedCores(incomingChanges.NodeLicenseDetails);
+        this.updateNodeDetails(incomingChanges.NodeLicenseDetails);
         this.nodeTag(incomingChanges.NodeTag);
         this.leader(incomingChanges.Leader);
         this.currentTerm(incomingChanges.CurrentTerm);
+        this.currentState(incomingChanges.CurrentState);
     }
 
-    private updateAssignedCores(nodeLicenseDetails: { [key: string]: Raven.Server.Commercial.DetailsPerNode; }) {
+    private updateNodeDetails(nodeLicenseDetails: { [key: string]: Raven.Server.Commercial.DetailsPerNode; }) {
         if (!nodeLicenseDetails)
             return;
 
@@ -113,6 +118,9 @@ class clusterTopology {
             node.numberOfCores(detailsPerNode.NumberOfCores);
             node.installedMemoryInGb(detailsPerNode.InstalledMemoryInGb);
             node.usableMemoryInGb(detailsPerNode.UsableMemoryInGb);
+            
+            const fullVersion = detailsPerNode.BuildInfo ? detailsPerNode.BuildInfo.FullVersion : null;
+            node.nodeServerVersion(fullVersion);
         });
     }
 }

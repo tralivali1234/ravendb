@@ -158,7 +158,8 @@ namespace Sparrow.Json
             _unmanagedWriteBuffer.Dispose();
             _unmanagedWriteBuffer = (TWriter)(object)_context.GetStream(_lastSize);
             _position = 0;
-            _innerBuffer = _context.GetMemory(32);
+            if(_innerBuffer == null)
+                _innerBuffer = _context.GetMemory(32);
         }
 
         public WriteToken WriteObjectMetadata(FastList<PropertyTag> properties, long firstWrite, int maxPropId)
@@ -448,7 +449,7 @@ namespace Sparrow.Json
                 fixed (char* pChars = str)
                 {
                     var stringSize = Encodings.Utf8.GetBytes(pChars, str.Length, buffer.Address, size);
-                    JsonParserState.FindEscapePositionsIn(_intBuffer, buffer.Address, stringSize, escapePositionsMaxSize);
+                    JsonParserState.FindEscapePositionsIn(_intBuffer, buffer.Address, ref stringSize, escapePositionsMaxSize);
                     return WriteValue(buffer.Address, stringSize, _intBuffer, out token, mode, null);
                 }
             }

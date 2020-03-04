@@ -5,8 +5,16 @@ using Raven.Client.Documents.Operations;
 
 namespace Raven.Client.Documents.Changes
 {
-    internal class DatabaseConnectionState : IChangesConnectionState
+    internal class DatabaseConnectionState : IChangesConnectionState<DocumentChange>, IChangesConnectionState<IndexChange>, IChangesConnectionState<OperationStatusChange>
     {
+        public static readonly DatabaseConnectionState Dummy = new DatabaseConnectionState(() => Task.CompletedTask, () => Task.CompletedTask);
+
+        static DatabaseConnectionState()
+        {
+            Dummy.Inc();
+            Dummy.Set(Task.CompletedTask);
+        }
+
         public event Action<Exception> OnError;
         private readonly Func<Task> _onDisconnect;
         public readonly Func<Task> OnConnect;
@@ -58,9 +66,31 @@ namespace Raven.Client.Documents.Changes
             return _connected ?? _firstSet.Task;
         }
 
+        event Action<OperationStatusChange> IChangesConnectionState<OperationStatusChange>.OnChangeNotification
+        {
+            add => OnOperationStatusChangeNotification += value;
+            remove => OnOperationStatusChangeNotification -= value;
+        }
+
+        event Action<IndexChange> IChangesConnectionState<IndexChange>.OnChangeNotification
+        {
+            add => OnIndexChangeNotification += value;
+            remove => OnIndexChangeNotification -= value;
+        }
+
+        event Action<DocumentChange> IChangesConnectionState<DocumentChange>.OnChangeNotification
+        {
+            add => OnDocumentChangeNotification += value;
+            remove => OnDocumentChangeNotification -= value;
+        }
+
         public void Dispose()
         {
-            Set(Task.FromCanceled(CancellationToken.None));
+            Set(Task.FromException(new ObjectDisposedException(nameof(DatabaseConnectionState))));
+            OnDocumentChangeNotification = null;
+            OnIndexChangeNotification = null;
+            OnOperationStatusChangeNotification = null;
+            OnError = null;
         }
         
         public DatabaseConnectionState( Func<Task> onConnect, Func<Task> onDisconnect)
@@ -70,11 +100,11 @@ namespace Raven.Client.Documents.Changes
             _value = 0;
         }
 
-        public event Action<DocumentChange> OnDocumentChangeNotification;
+        private event Action<DocumentChange> OnDocumentChangeNotification;
 
-        public event Action<IndexChange> OnIndexChangeNotification;
+        private event Action<IndexChange> OnIndexChangeNotification;
 
-        public event Action<OperationStatusChange> OnOperationStatusChangeNotification;
+        private event Action<OperationStatusChange> OnOperationStatusChangeNotification;
 
         public void Send(DocumentChange documentChange)
         {

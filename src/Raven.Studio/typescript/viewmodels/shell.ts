@@ -65,6 +65,8 @@ class shell extends viewModelBase {
     currentRawUrl = ko.observable<string>("");
     rawUrlIsVisible = ko.computed(() => this.currentRawUrl().length > 0);
     showSplash = viewModelBase.showSplash;
+    browserAlert = ko.observable<boolean>(false);
+    dontShowBrowserAlertAgain = ko.observable<boolean>(false);
 
     licenseStatus = license.licenseCssClass;
     supportStatus = license.supportCssClass;
@@ -117,6 +119,8 @@ class shell extends viewModelBase {
         });
 
         activeDatabaseTracker.default.database.subscribe(newDatabase => footer.default.forDatabase(newDatabase));
+        
+        this.detectBrowser();
     }
 
     // Override canActivate: we can always load this page, regardless of any system db prompt.
@@ -178,6 +182,9 @@ class shell extends viewModelBase {
             .then(() => this.onBootstrapFinishedTask.resolve(), () => this.onBootstrapFinishedTask.reject());
 
         this.setupRouting();
+        
+        // we await here only for certificate task, as downloading license can take longer
+        return clientCertifiateTask;
     }
 
     private setupRouting() {
@@ -299,27 +306,8 @@ class shell extends viewModelBase {
         return false;
     }
 
-    loadServerConfig(): JQueryPromise<void> {
-        const deferred = $.Deferred<void>().resolve();
-        
-        // Todo - what should be here ?
-        
-        return deferred;
-    }
-
     connectToRavenServer() {
-        const serverConfigsLoadTask: JQueryPromise<void> = this.loadServerConfig();
-        const managerTask = this.databasesManager.init();
-        return $.when<any>(serverConfigsLoadTask, managerTask);
-    }
-
-    private handleRavenConnectionFailure(result: any) {
-        sys.log("Unable to connect to Raven.", result);
-        const tryAgain = "Try again";
-        this.confirmationMessage(':-(', "Couldn't connect to Raven. Details in the browser console.", [tryAgain])
-            .done(() => {
-                this.connectToRavenServer();
-            });
+        return this.databasesManager.init();
     }
 
     fetchServerBuildVersion() {
@@ -409,6 +397,35 @@ class shell extends viewModelBase {
     
     ignoreWebSocketError() {
         changesContext.default.serverNotifications().ignoreWebSocketConnectionError(true);
+    }
+    
+    detectBrowser() {
+        const isChrome = /Chrome/.test(navigator.userAgent) && /Google Inc/.test(navigator.vendor);
+        const isFirefox = navigator.userAgent.toLowerCase().indexOf('firefox') > -1;
+
+        if (!isChrome && !isFirefox) {
+            // it isn't supported browser, check if user already said: Don't show this again
+
+            studioSettings.default.globalSettings()
+                .done(settings => {
+                    if (settings.dontShowAgain.shouldShow("UnsupportedBrowser")) {
+                        this.browserAlert(true);
+                    }
+                });
+        }
+    }
+
+    browserAlertContinue() {
+        const dontShowAgain = this.dontShowBrowserAlertAgain();
+        
+        if (dontShowAgain) {
+            studioSettings.default.globalSettings()
+                .done(settings => {
+                    settings.dontShowAgain.ignore("UnsupportedBrowser");
+                });
+        }
+        
+        this.browserAlert(false);
     }
 }
 

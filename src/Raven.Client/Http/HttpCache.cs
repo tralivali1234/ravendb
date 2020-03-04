@@ -32,13 +32,22 @@ namespace Raven.Client.Http
             LowMemoryNotification.Instance.RegisterLowMemoryHandler(this);
         }
 
+        [Flags]
+        public enum ItemFlags
+        {
+            None = 0,
+            NotFound = 1,
+
+            AggresivelyCached = 16
+        }
+
         public unsafe class HttpCacheItem : IDisposable
         {
             public string ChangeVector;
             public byte* Ptr;
             public int Size;
             public DateTime LastServerUpdate;
-
+            public ItemFlags Flags;
             public int Generation;
             public AllocatedMemoryData Allocation;
             public HttpCache Cache;
@@ -93,15 +102,16 @@ namespace Raven.Client.Http
                 ReleaseRef();
             }
 
+#if !RELEASE
             ~HttpCacheItem()
             {
-#if !RELEASE
+
                 // Hitting this on DEBUG and/or VALIDATE and getting a higher number than 0 means we have a leak.
                 // On release we will leak, but wont crash. 
                 if (_usages > 0)
                     throw new LowMemoryException("Detected a leak on HttpCache when running the finalizer. See: http://issues.hibernatingrhinos.com/issue/RavenDB-9737");
+        }
 #endif
-            }
         }
 
         /// <summary>
@@ -148,8 +158,9 @@ namespace Raven.Client.Http
             old?.ReleaseRef();
         }
 
-        public void SetNotFound(string url)
+        public void SetNotFound(string url, bool aggressivelyCached)
         {
+            var flag = aggressivelyCached ? ItemFlags.AggresivelyCached : ItemFlags.None;
             var httpCacheItem = new HttpCacheItem
             {
                 ChangeVector = "404 Response",
@@ -157,7 +168,8 @@ namespace Raven.Client.Http
                 Size = 0,
                 Allocation = null,
                 Cache = this,
-                Generation = Generation
+                Generation = Generation,
+                Flags = ItemFlags.NotFound | flag
             };
             HttpCacheItem old = null;
             _items.AddOrUpdate(url, httpCacheItem, (s, oldItem) =>

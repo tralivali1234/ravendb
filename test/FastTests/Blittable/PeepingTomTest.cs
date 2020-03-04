@@ -1,5 +1,6 @@
 ﻿using System;
 using System.IO;
+using System.Threading;
 using FastTests.Voron.FixedSize;
 using Sparrow;
 using Sparrow.Json;
@@ -21,84 +22,108 @@ namespace FastTests.Blittable
         [InlineData(0, 0, 0)]
         public void PeepingTomStreamShouldPeepCorrectly(int originalSize, int chunkSizeToRead, int offset)
         {
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1)))
             using (var context = JsonOperationContext.ShortTermSingleUse())
-                PeepingTomStreamTest(originalSize, chunkSizeToRead, offset, context);
+                PeepingTomStreamTest(originalSize, chunkSizeToRead, offset, context, cts.Token);
         }
 
         [Theory]
         [InlineDataWithRandomSeed]
         [InlineData(1291481720)]
+        [InlineData(916490010)]
         public void PeepingTomStreamShouldPeepCorrectlyWithRandomValues(int seed)
         {
             var random = new Random(seed);
 
-           using (var context = JsonOperationContext.ShortTermSingleUse())
+            using (var cts = new CancellationTokenSource(TimeSpan.FromMinutes(1)))
+            using (var context = JsonOperationContext.ShortTermSingleUse())
             {
                 for (int i = 0; i < 10; i++)
                 {
                     var originalSize = random.Next(0, 128 * 1024);
                     var chunkSizeToRead = random.Next(0, originalSize);
                     var offset = chunkSizeToRead / 4;
-                    PeepingTomStreamTest(originalSize, chunkSizeToRead, offset, context);
+                    PeepingTomStreamTest(originalSize, chunkSizeToRead, offset, context, cts.Token);
                 }
             }
         }
 
-        public void PeepingTomStreamTest(int originalSize, int chunkSizeToRead, int offset, JsonOperationContext context)
+        private static void PeepingTomStreamTest(int originalSize, int chunkSizeToRead, int offset, JsonOperationContext context, CancellationToken token)
         {
-           
-            var bytes = new byte[originalSize];
-            for (var i = 0; i < bytes.Length; i++)
+            try
             {
-                bytes[i] = (byte)((i % 26) + 'a');
-            }
-
-            using (var stream = new MemoryStream())
-            using (var peeping = new PeepingTomStream(stream, context))
-            { 
-                stream.Write(bytes, 0, originalSize);
-                stream.Flush();
-                stream.Position = 0;
-
-                var totalRead = 0;
-                do
+                var bytes = new byte[originalSize];
+                for (var i = 0; i < bytes.Length; i++)
                 {
-                    int read;
+                    bytes[i] = (byte)((i % 26) + 'a');
+                }
+
+                using (var stream = new MemoryStream())
+                using (var peeping = new PeepingTomStream(stream, context))
+                {
+                    stream.Write(bytes, 0, originalSize);
+                    stream.Flush();
+                    stream.Position = 0;
+
+                    var totalRead = 0;
                     do
                     {
-                        var buffer = new byte[originalSize + offset];
-                        read = peeping.Read(buffer, offset, chunkSizeToRead);
-                        totalRead += read;
-                        Assert.True(read <= chunkSizeToRead);
-                    } while (read != 0);
+                        token.ThrowIfCancellationRequested();
 
-                } while (totalRead < originalSize);
+                        int read = -1;
+                        do
+                        {
+                            token.ThrowIfCancellationRequested();
 
-                Assert.Equal(originalSize, totalRead);
-                var peepWindow = peeping.PeepInReadStream();
-                var length = peepWindow.Length;
+                            var buffer = new byte[originalSize + offset];
+                            read = peeping.Read(buffer, offset, chunkSizeToRead);
+                            totalRead += read;
+                            Assert.True(read <= chunkSizeToRead);
+                        } while (read != 0);
 
-                Assert.True(length <= PeepingTomStream.BufferWindowSize);
-                Assert.True(length >= 0);
+                    } while (totalRead < originalSize);
 
-                var expectedLength = originalSize < PeepingTomStream.BufferWindowSize ? originalSize : PeepingTomStream.BufferWindowSize;
+                    Assert.Equal(originalSize, totalRead);
 
-                if (expectedLength != length)
-                {
-                    var expected = System.Text.Encoding.UTF8.GetString(bytes, bytes.Length - expectedLength, expectedLength);
-                    var actual = System.Text.Encoding.UTF8.GetString(peepWindow);
-                    Assert.Equal(expected, actual);
-                }
-                Assert.Equal(expectedLength, length);
+                    var peepWindow = peeping.PeepInReadStream();
 
-                for (var i = 0; i < peepWindow.Length; i++)
-                {
-                    var expectedByte = (byte)(((originalSize - peepWindow.Length + i) % 26) + 'a');
-                    if (expectedByte != peepWindow[i])
+                    var length = peepWindow.Length;
+
+                    Assert.True(length <= PeepingTomStream.BufferWindowSize);
+                    Assert.True(length >= 0);
+
+                    var expectedLength = originalSize < PeepingTomStream.BufferWindowSize ? originalSize : PeepingTomStream.BufferWindowSize;
+
+                    if (expectedLength != length)
                     {
-                        Assert.Equal(expectedByte, peepWindow[i]);
+                        var expected = System.Text.Encoding.UTF8.GetString(bytes, bytes.Length - expectedLength, expectedLength);
+                        var actual = System.Text.Encoding.UTF8.GetString(peepWindow);
+                        Assert.Equal(expected, actual);
+                    }
+                    Assert.Equal(expectedLength, length);
+
+                    for (var i = 0; i < peepWindow.Length; i++)
+                    {
+                        token.ThrowIfCancellationRequested();
+
+                        try
+                        {
+                            var expectedByte = (byte)(((originalSize - peepWindow.Length + i) % 26) + 'a');
+                            if (expectedByte != peepWindow[i])
+                            {
+                                Assert.Equal(expectedByte, peepWindow[i]);
+                            }
+                        }
+                        catch (Exception e)
+                        {
+                            throw new InvalidOperationException("Failure at index: " + i, e);
+                        }
                     }
                 }
+            }
+            catch (Exception e)
+            {
+                throw new InvalidOperationException($"Failed with originalSize {originalSize}, chunkSizeToRead {chunkSizeToRead},  offset {offset}", e);
             }
         }
     }

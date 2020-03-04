@@ -16,7 +16,7 @@ namespace Raven.Server.Utils
 {
     public class Pipes
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<RavenServer>("Raven/Server/Pipes");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<Pipes>("Server");
 
         public const string AdminConsolePipePrefix = "raven-control-pipe-";
 
@@ -29,9 +29,6 @@ namespace Raven.Server.Utils
             var pipeName = GetPipeName(AdminConsolePipePrefix);
             var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
                 PipeOptions.Asynchronous, 1024, 1024);
-
-            if (PlatformDetails.RunningOnPosix)
-                WorkaroundPipePathForPosix(pipe, pipeName);
 
             return pipe;
         }
@@ -46,7 +43,11 @@ namespace Raven.Server.Utils
 
         public static string GetPipeName(string namePrefix, int pid)
         {
-            return $"{namePrefix}{pid}";
+            var name = $"{namePrefix}{pid}";
+            if (PlatformDetails.RunningOnPosix)
+                name = Path.Combine(PipesDir, name);
+
+            return name;
         }
 
         public static void CleanupOldPipeFiles()
@@ -155,9 +156,6 @@ namespace Raven.Server.Utils
             var pipe = new NamedPipeServerStream(pipeName, PipeDirection.InOut, 1, PipeTransmissionMode.Byte,
                 PipeOptions.Asynchronous, 1024, 1024);
 
-            if (PlatformDetails.RunningOnPosix) 
-                WorkaroundPipePathForPosix(pipe, pipeName);
-
             return pipe;
         }
 
@@ -201,16 +199,6 @@ namespace Raven.Server.Utils
                 if (Logger.IsInfoEnabled)
                     Logger.Info("Error connecting to log stream pipe", e);
             }
-        }
-
-        private static void WorkaroundPipePathForPosix(NamedPipeServerStream pipe, string pipeName)
-        {
-            var pathField = pipe.GetType().GetField("_path", BindingFlags.NonPublic | BindingFlags.Instance);
-            if (pathField == null)
-            {
-                throw new InvalidOperationException("Unable to set the proper path for the admin pipe, admin channel will not be available");
-            }
-            pathField.SetValue(pipe, Path.Combine(PipesDir, pipeName));
         }
     }
 }

@@ -8,7 +8,7 @@ namespace Voron.Global
 {
     public unsafe class Constants
     {
-        public const int CurrentVersion = 22;
+        public const int CurrentVersion = 23;
 
         public const ulong MagicMarker = 0xB16BAADC0DEF0015;
         public const ulong TransactionHeaderMarker = 0x1A4C92AD90ABC123;
@@ -95,10 +95,13 @@ namespace Voron.Global
 
         static Constants()
         {
-            Slice.From(StorageEnvironment.LabelsContext, RootTreeName, ByteStringType.Immutable, out RootTreeNameSlice);
-            Slice.From(StorageEnvironment.LabelsContext, MetadataTreeName, ByteStringType.Immutable, out MetadataTreeNameSlice);
-            Slice.From(StorageEnvironment.LabelsContext, DatabaseFilename, ByteStringType.Immutable, out DatabaseFilenameSlice);
-        }
+            using (StorageEnvironment.GetStaticContext(out var ctx))
+            {
+                Slice.From(ctx, RootTreeName, ByteStringType.Immutable, out RootTreeNameSlice);
+                Slice.From(ctx, MetadataTreeName, ByteStringType.Immutable, out MetadataTreeNameSlice);
+                Slice.From(ctx, DatabaseFilename, ByteStringType.Immutable, out DatabaseFilenameSlice);
+            }
+           }
 
         public static void Assert(Func<bool> condition, Func<string> reason)
         {

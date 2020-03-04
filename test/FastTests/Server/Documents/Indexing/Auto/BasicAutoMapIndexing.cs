@@ -8,6 +8,7 @@ using Raven.Client.Documents;
 using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Indexes;
 using Raven.Client.Documents.Session;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Cluster;
 using Raven.Client.ServerWide;
 using Raven.Client.Util;
@@ -18,6 +19,8 @@ using Raven.Server.Documents.Indexes.Auto;
 using Raven.Server.Documents.Indexes.Errors;
 using Raven.Server.Documents.Queries;
 using Raven.Server.Exceptions;
+using Raven.Server.NotificationCenter.Notifications;
+using Raven.Server.Rachis;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
@@ -94,10 +97,13 @@ namespace FastTests.Server.Documents.Indexing.Auto
                 var index2 = await database.IndexStore.CreateIndex(new AutoMapIndexDefinition("Users", new[] { name2 }));
                 Assert.NotNull(index2);
 
-                var task = Task.WhenAll(database.IndexStore.SetLock(index2.Name, IndexLockMode.LockedError),
-                    database.IndexStore.SetPriority(index2.Name, IndexPriority.Low));
+                var task1 = database.IndexStore.SetLock(index2.Name, IndexLockMode.LockedError);
+                var task2 = database.IndexStore.SetPriority(index2.Name, IndexPriority.Low);
                 index2.SetState(IndexState.Disabled);
-                await task;
+                var task = Task.WhenAll(task1, task2);
+               
+                await Assert.ThrowsAsync<NotSupportedException>(async () => await task);
+                Assert.StartsWith("'Lock Mode' can't be set for the Auto-Index", task1.Exception.InnerException.Message);
 
                 Server.ServerStore.DatabasesLandlord.UnloadDirectly(dbName);
 
@@ -123,7 +129,7 @@ namespace FastTests.Server.Documents.Indexing.Auto
                 Assert.Equal(1, indexes[1].Definition.MapFields.Count);
                 Assert.Equal("Name2", indexes[1].Definition.MapFields["Name2"].Name);
                 Assert.Equal(AutoFieldIndexing.Search | AutoFieldIndexing.Default, indexes[1].Definition.MapFields["Name2"].As<AutoIndexField>().Indexing);
-                Assert.Equal(IndexLockMode.LockedError, indexes[1].Definition.LockMode);
+                Assert.Equal(IndexLockMode.Unlock, indexes[1].Definition.LockMode);
                 Assert.Equal(IndexPriority.Low, indexes[1].Definition.Priority);
                 Assert.Equal(IndexState.Disabled, indexes[1].State);
             }
@@ -165,7 +171,8 @@ namespace FastTests.Server.Documents.Indexing.Auto
 
             await database.IndexStore.DeleteIndex(index1.Name);
 
-            Assert.True(SpinWait.SpinUntil(() => Directory.Exists(path1) == false, TimeSpan.FromSeconds(5)));
+            if (index1.Configuration.RunInMemory == false)
+                Assert.True(SpinWait.SpinUntil(() => Directory.Exists(path1) == false, TimeSpan.FromSeconds(5)));
 
             var indexes = database.IndexStore.GetIndexesForCollection("Users").ToList();
 
@@ -173,7 +180,8 @@ namespace FastTests.Server.Documents.Indexing.Auto
 
             await database.IndexStore.DeleteIndex(index2.Name);
 
-            Assert.True(SpinWait.SpinUntil(() => Directory.Exists(path2) == false, TimeSpan.FromSeconds(5)));
+            if (index1.Configuration.RunInMemory == false)
+                Assert.True(SpinWait.SpinUntil(() => Directory.Exists(path2) == false, TimeSpan.FromSeconds(5)));
 
             indexes = database.IndexStore.GetIndexesForCollection("Users").ToList();
 
@@ -366,7 +374,7 @@ namespace FastTests.Server.Documents.Indexing.Auto
                         batchStats = new IndexingRunStats();
                         scope = new IndexingStatsScope(batchStats);
                         index.DoIndexingWork(scope, CancellationToken.None);
-                        Assert.Equal(4, index.GetLastProcessedDocumentTombstonesPerCollection().Values.Min());
+                        Assert.Equal(4, index.GetLastProcessedTombstonesPerCollection().Values.Min());
                         Assert.Equal(0, batchStats.MapAttempts);
                         Assert.Equal(0, batchStats.MapSuccesses);
                         Assert.Equal(0, batchStats.MapErrors);
@@ -407,8 +415,14 @@ namespace FastTests.Server.Documents.Indexing.Auto
                         new[] { new AutoIndexField { Name = "Name", Storage = FieldStorage.No } }),
                     database))
                 {
+                    var mre = new ManualResetEvent(false);
+
+                    database.IndexStore.IndexBatchCompleted = x => { mre.Set(); };
+
                     index.Start();
                     Assert.Equal(IndexRunningStatus.Running, index.Status);
+
+                    Assert.True(mre.WaitOne(TimeSpan.FromSeconds(15)));
 
                     IndexStats stats;
                     var batchStats = new IndexingRunStats();
@@ -975,23 +989,23 @@ namespace FastTests.Server.Documents.Indexing.Auto
                         now.Add(TimeSpan.FromSeconds(1))
                            .Add(database.Configuration.Indexing.TimeToWaitBeforeMarkingAutoIndexAsIdle.AsTimeSpan);
 
-                database.IndexStore.RunIdleOperations(); // nothing should happen here, because age will be greater than 2x TimeToWaitBeforeMarkingAutoIndexAsIdle but less than TimeToWaitBeforeDeletingAutoIndexMarkedAsIdle
+                database.IndexStore.RunIdleOperations(); // should not remove anything, age will be greater than 2x TimeToWaitBeforeMarkingAutoIndexAsIdle but less than TimeToWaitBeforeDeletingAutoIndexMarkedAsIdle
 
                 index1 = database.IndexStore.GetIndex(index1.Name);
                 index2 = database.IndexStore.GetIndex(index2.Name);
 
-                Assert.Equal(IndexPriority.Normal, index1.Definition.Priority);
+                Assert.Equal(IndexState.Idle, index1.State);
                 Assert.Equal(IndexState.Idle, index2.State);
 
                 now = database.Time.GetUtcNow();
                 database.Time.UtcDateTime = () => now.Add(database.Configuration.Indexing.TimeToWaitBeforeDeletingAutoIndexMarkedAsIdle.AsTimeSpan);
 
-                database.IndexStore.RunIdleOperations(); // this will delete index2
+                database.IndexStore.RunIdleOperations(); // this will delete indexes
 
                 index1 = database.IndexStore.GetIndex(index1.Name);
                 index2 = database.IndexStore.GetIndex(index2.Name);
 
-                Assert.Equal(IndexPriority.Normal, index1.Definition.Priority);
+                Assert.Null(index1);
                 Assert.Null(index2);
             }
         }
@@ -1012,7 +1026,7 @@ namespace FastTests.Server.Documents.Indexing.Auto
 
                 var definition3 = new AutoMapIndexDefinition("Users", new[] { new AutoIndexField { Name = "Name", Storage = FieldStorage.Yes } });
 
-                var e = (await Assert.ThrowsAsync<CommandExecutionException>(() => database.IndexStore.CreateIndex(definition3))).InnerException;
+                var e = (await Assert.ThrowsAsync<RachisApplyException>(() => database.IndexStore.CreateIndex(definition3))).InnerException;
 
                 Assert.Contains("Can not update auto-index", e.Message);
                 Assert.NotNull(index1);
@@ -1029,16 +1043,20 @@ namespace FastTests.Server.Documents.Indexing.Auto
                 var definition2 = new AutoMapIndexDefinition("Users", new[] { new AutoIndexField { Name = "Name", Storage = FieldStorage.No } });
 
                 var index1 = await database.IndexStore.CreateIndex(definition1);
-                index1.SetLock(IndexLockMode.LockedIgnore);
-
+                
+                var exception =  Assert.Throws<NotSupportedException>(() => index1.SetLock(IndexLockMode.LockedIgnore));
+                Assert.StartsWith("'Lock Mode' can't be set for the Auto-Index", exception.Message);
+                
                 await database.IndexStore.CreateIndex(definition2);
                 Assert.Equal(1, database.IndexStore.GetIndexes().Count());
 
-                index1.SetLock(IndexLockMode.LockedError);
+                exception =  Assert.Throws<NotSupportedException>(() => index1.SetLock(IndexLockMode.LockedError));
+                Assert.StartsWith("'Lock Mode' can't be set for the Auto-Index", exception.Message);
+                
                 var index2 = await database.IndexStore.CreateIndex(definition2);
+                
                 Assert.NotNull(index1);
                 Assert.NotNull(index2);
-                
             }
         }
 
@@ -1084,6 +1102,17 @@ namespace FastTests.Server.Documents.Indexing.Auto
                 Assert.IsType<FaultyInMemoryIndex>(index);
                 Assert.Equal(IndexState.Error, index.State);
                 Assert.Equal(indexName, index.Name);
+
+                using (database.NotificationCenter.GetStored(out var items))
+                {
+                    var alerts = items.ToList();
+                    Assert.Equal(1, alerts.Count);
+
+                    var readAlert = alerts[0].Json;
+                    
+                    Assert.Equal(AlertType.IndexStore_IndexCouldNotBeOpened.ToString(), readAlert[nameof(AlertRaised.AlertType)].ToString());
+                    Assert.Contains(indexName, readAlert[nameof(AlertRaised.Message)].ToString());
+                }
             }
         }
 

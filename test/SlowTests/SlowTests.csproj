@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>netcoreapp2.0</TargetFramework>
-    <RuntimeFrameworkVersion>2.0.6</RuntimeFrameworkVersion>
+    <TargetFramework>netcoreapp2.1</TargetFramework>
+    <RuntimeFrameworkVersion>2.1.8</RuntimeFrameworkVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>SlowTests</AssemblyName>
     <PackageId>SlowTests</PackageId>
@@ -24,12 +24,15 @@
     </Content>
     <EmbeddedResource Include="Data\create.sql" />
     <EmbeddedResource Include="Data\insert.sql" />
+    <EmbeddedResource Include="Data\RavenDB_10958.txt" />
+    <EmbeddedResource Include="Data\RavenDB_10958.json" />
   </ItemGroup>
   <ItemGroup>
     <EmbeddedResource Include="Data\non-leaf-page-seq-id-large-values-2.txt" />
     <EmbeddedResource Include="Data\non-leaf-page-seq-id-large-values.txt" />
     <EmbeddedResource Include="Data\places.txt" />
     <EmbeddedResource Include="Data\RavenDB_10404\northwind.4.0.0.ravendb-snapshot" />
+    <EmbeddedResource Include="Data\RavenDB_11664\1.ravendbdump" />
     <EmbeddedResource Include="Data\RavenDB_9912\1.ravendbdump" />
     <EmbeddedResource Include="Data\RavenDB_9912\2.ravendbdump" />
     <EmbeddedResource Include="Data\testing.ravendbdump" />
@@ -44,13 +47,17 @@
     <ProjectReference Include="..\..\src\Raven.TestDriver\Raven.TestDriver.csproj" />
     <ProjectReference Include="..\..\src\Sparrow\Sparrow.csproj" />
     <ProjectReference Include="..\..\src\Voron\Voron.csproj" />
+    <ProjectReference Include="..\..\tools\Voron.Recovery\Voron.Recovery.csproj" />
     <ProjectReference Include="..\FastTests\FastTests.csproj" />
     <ProjectReference Include="..\Tests.Infrastructure\Tests.Infrastructure.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.6.2" />
-    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.0-beta.1.build3958" />
-    <PackageReference Include="xunit" Version="2.4.0-beta.1.build3958" />
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="15.9.0" />
+    <PackageReference Include="xunit.runner.visualstudio" Version="2.4.1">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers</IncludeAssets>
+    </PackageReference>
+    <PackageReference Include="xunit" Version="2.4.1" />
     <DotNetCliToolReference Include="dotnet-xunit" Version="2.4.0-beta.1.build3958" />
   </ItemGroup>
   <ItemGroup>
@@ -61,5 +68,22 @@
     <Folder Include="Core\AdminConsole" />
     <Folder Include="Server\Basic" />
     <Folder Include="Server\Documents\Notifications" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\headers.one">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\headers.two">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\Journals\0000000000000000000.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\Journals\0000000000000000001.journal">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+    <None Update="SchemaUpgrade\Issues\DocumentsVersion\schema_9\Raven.voron">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
   </ItemGroup>
 </Project>

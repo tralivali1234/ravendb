@@ -13,8 +13,12 @@ using Raven.Server.Documents;
 using System.Threading;
 using Microsoft.AspNetCore.Http.Features.Authentication;
 using Microsoft.Extensions.Primitives;
+using Raven.Client;
+using Raven.Client.Exceptions;
 using Raven.Client.Exceptions.Routing;
+using Raven.Client.Properties;
 using Raven.Client.Util;
+using Raven.Server.ServerWide;
 using Raven.Server.Utils;
 using Raven.Server.Web;
 using Sparrow.Json;
@@ -48,18 +52,19 @@ namespace Raven.Server.Routing
             return tryMatch.Value;
         }
 
-        public async ValueTask<string> HandlePath(HttpContext context, string method, string path)
+        public async ValueTask HandlePath(RequestHandlerContext reqCtx)
         {
-            var tryMatch = _trie.TryMatch(method, path);
+            var context = reqCtx.HttpContext;
+            var tryMatch = _trie.TryMatch(context.Request.Method, context.Request.Path.Value);
             if (tryMatch.Value == null)
-                throw new RouteNotFoundException($"There is no handler for path: {method} {path}{context.Request.QueryString}");
-
-            var reqCtx = new RequestHandlerContext
             {
-                HttpContext = context,
-                RavenServer = _ravenServer,
-                RouteMatch = tryMatch.Match
-            };
+                var exception = new RouteNotFoundException($"There is no handler for path: {context.Request.Method} {context.Request.Path.Value}{context.Request.QueryString}");
+                AssertClientVersion(context, exception);
+                throw exception;
+            }
+
+            reqCtx.RavenServer = _ravenServer;
+            reqCtx.RouteMatch = tryMatch.Match;
 
             var tuple = tryMatch.Value.TryGetHandler(reqCtx);
             var handler = tuple.Item1 ?? await tuple.Item2;
@@ -68,65 +73,88 @@ namespace Raven.Server.Routing
             _serverMetrics.Requests.RequestsPerSec.Mark();
 
             Interlocked.Increment(ref _serverMetrics.Requests.ConcurrentRequestsCount);
-            _ravenServer.Statistics.LastRequestTime = SystemTime.UtcNow;
 
-            if (handler == null)
+            try
             {
-                if(_auditLog != null)
+                _ravenServer.Statistics.LastRequestTime = SystemTime.UtcNow;
+
+                if (handler == null)
                 {
-                    _auditLog.Info($"Invalid request {context.Request.Method} {context.Request.Path} by " +
-                        $"(Cert: {context.Connection.ClientCertificate?.Subject} ({context.Connection.ClientCertificate?.Thumbprint}) {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort})");
+                    if (_auditLog != null)
+                    {
+                        _auditLog.Info($"Invalid request {context.Request.Method} {context.Request.Path} by " +
+                            $"(Cert: {context.Connection.ClientCertificate?.Subject} ({context.Connection.ClientCertificate?.Thumbprint}) {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort})");
+                    }
+
+                    context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+                    using (var ctx = JsonOperationContext.ShortTermSingleUse())
+                    using (var writer = new BlittableJsonTextWriter(ctx, context.Response.Body))
+                    {
+                        ctx.Write(writer,
+                            new DynamicJsonValue
+                            {
+                                ["Type"] = "Error",
+                                ["Message"] = $"There is no handler for {context.Request.Method} {context.Request.Path}"
+                            });
+                    }
+
+                    return;
                 }
 
-                context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
-                using (var ctx = JsonOperationContext.ShortTermSingleUse())
-                using (var writer = new BlittableJsonTextWriter(ctx, context.Response.Body))
+                if (_ravenServer.Configuration.Security.AuthenticationEnabled)
                 {
-                    ctx.Write(writer,
-                        new DynamicJsonValue
-                        {
-                            ["Type"] = "Error",
-                            ["Message"] = $"There is no handler for {context.Request.Method} {context.Request.Path}"
-                        });
+                    var authResult = TryAuthorize(tryMatch.Value, context, reqCtx.Database);
+                    if (authResult == false)
+                        return;
                 }
-                return null;
-            }
 
-            if (_ravenServer.Configuration.Security.AuthenticationEnabled)
-            {
-                var authResult = TryAuthorize(tryMatch.Value, context, reqCtx.Database);
-                if (authResult == false)
-                    return reqCtx.Database?.Name;
-            }
-
-            if (reqCtx.Database != null)
-            {
-                using (reqCtx.Database.DatabaseInUse(tryMatch.Value.SkipUsagesCount))
+                if (reqCtx.Database != null)
+                {
+                    using (reqCtx.Database.DatabaseInUse(tryMatch.Value.SkipUsagesCount))
+                        await handler(reqCtx);
+                }
+                else
+                {
                     await handler(reqCtx);
+                }
             }
-            else
+            finally
             {
-                await handler(reqCtx);
+                Interlocked.Decrement(ref _serverMetrics.Requests.ConcurrentRequestsCount);
             }
+        }
 
-            Interlocked.Decrement(ref _serverMetrics.Requests.ConcurrentRequestsCount);
+        public static void AssertClientVersion(HttpContext context, Exception innerException)
+        {
+            // client in this context could be also a follower sending a command to his leader.
+            if (context.Request.Headers.TryGetValue(Constants.Headers.ClientVersion, out var versionHeader) &&
+                Version.TryParse(versionHeader, out var clientVersion))
+            {
+                var currentServerVersion = RavenVersionAttribute.Instance;
 
-            return reqCtx.Database?.Name;
+                if (currentServerVersion.MajorVersion != clientVersion.Major || currentServerVersion.BuildVersion < clientVersion.Revision || currentServerVersion.BuildVersion == ServerVersion.DevBuildNumber || (clientVersion.Revision >= 40 && clientVersion.Revision < 50))
+                {
+                    throw new ClientVersionMismatchException(
+                        $"Failed to make a request from a newer client with build version {clientVersion} to an older server with build version {RavenVersionAttribute.Instance.AssemblyVersion}.{Environment.NewLine}" +
+                        $"Upgrading this node might fix this issue.",
+                        innerException);
+                }
+            }
         }
 
         private bool TryAuthorize(RouteInformation route, HttpContext context, DocumentDatabase database)
         {
             var feature = context.Features.Get<IHttpAuthenticationFeature>() as RavenServer.AuthenticateConnection;
 
-            if(_auditLog != null)
+            if (_auditLog != null)
             {
-                if(feature.WrittenToAuditLog == 0) // intentionally racy, we'll check it again later
+                if (feature.WrittenToAuditLog == 0) // intentionally racy, we'll check it again later
                 {
                     // only one thread will win it, technically, there can't really be threading
                     // here, because there is a single connection, but better to be safe
-                    if(Interlocked.CompareExchange(ref feature.WrittenToAuditLog, 1, 0) == 0)
+                    if (Interlocked.CompareExchange(ref feature.WrittenToAuditLog, 1, 0) == 0)
                     {
-                        if(feature.WrongProtocolMessage != null)
+                        if (feature.WrongProtocolMessage != null)
                         {
                             _auditLog.Info($"Connection from {context.Connection.RemoteIpAddress}:{context.Connection.RemotePort} " +
                                 $"used the wrong protocol and will be rejected. {feature.WrongProtocolMessage}");
@@ -161,7 +189,7 @@ namespace Raven.Server.Routing
                                 return false;
                         }
                     }
-                    
+
                     return true;
                 case AuthorizationStatus.ClusterAdmin:
                 case AuthorizationStatus.Operator:
@@ -223,6 +251,8 @@ namespace Raven.Server.Routing
                     name = feature.Certificate.Subject;
                 if (string.IsNullOrWhiteSpace(name))
                     name = feature.Certificate.ToString(false);
+
+                name += "(Thumbprint: " + feature.Certificate.Thumbprint + ")";
 
                 if (feature.Status == RavenServer.AuthenticationStatus.UnfamiliarCertificate)
                 {

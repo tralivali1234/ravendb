@@ -1,7 +1,9 @@
 ﻿using System;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
+using System.Text;
 using Org.BouncyCastle.Asn1.X509;
 using Org.BouncyCastle.Crypto;
 using Org.BouncyCastle.Crypto.Generators;
@@ -11,6 +13,7 @@ using Org.BouncyCastle.Pkcs;
 using Org.BouncyCastle.Security;
 using Org.BouncyCastle.X509;
 using Org.BouncyCastle.X509.Extension;
+using Raven.Server.ServerWide;
 using Sparrow.Platform;
 using BigInteger = Org.BouncyCastle.Math.BigInteger;
 using X509Certificate = Org.BouncyCastle.X509.X509Certificate;
@@ -19,12 +22,56 @@ namespace Raven.Server.Utils
 {
     internal class CertificateUtils
     {
-        public static X509Certificate2 CreateSelfSignedCertificate(string commonNameValue, string issuerName)
+        private const int BitsPerByte = 8; 
+
+        public static byte[] CreateSelfSignedTestCertificate(string commonNameValue, string issuerName, StringBuilder log = null)
         {
-            CreateCertificateAuthorityCertificate(commonNameValue + " CA", out var ca, out var caSubjectName);
-            var selfSignedCertificateBasedOnPrivateKey = CreateSelfSignedCertificateBasedOnPrivateKey(commonNameValue, caSubjectName, ca, false, false, 0, out _);
+            // Note this is for tests only!
+            CreateCertificateAuthorityCertificate(commonNameValue + " CA", out var ca, out var caSubjectName, log);
+            CreateSelfSignedCertificateBasedOnPrivateKey(commonNameValue, caSubjectName, ca, false, false, 0, out var certBytes, log);
+            var selfSignedCertificateBasedOnPrivateKey = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
             selfSignedCertificateBasedOnPrivateKey.Verify();
-            return selfSignedCertificateBasedOnPrivateKey;
+
+            // We had a problem where we didn't cleanup the user store in Linux (~/.dotnet/corefx/cryptography/x509stores/ca)
+            // and it exploded with thousands of certificates. This caused ssl handshakes to fail on that machine, because it would timeout when
+            // trying to match one of these certs to validate the chain
+            RemoveOldTestCertificatesFromOsStore(commonNameValue);
+            return certBytes;
+        }
+
+        private static void RemoveOldTestCertificatesFromOsStore(string commonNameValue)
+        {
+            // We have the same logic in AddCertificateChainToTheUserCertificateAuthorityStoreAndCleanExpiredCerts when the server starts
+            // and when we renew a certificate. There we delete certificates only if expired but here in the tests we delete them all and keep
+            // just the ones from the last couple days
+            var storeName = PlatformDetails.RunningOnMacOsx ? StoreName.My : StoreName.CertificateAuthority;
+            using (var userIntermediateStore = new X509Store(storeName, StoreLocation.CurrentUser, OpenFlags.ReadWrite))
+            {
+                var twoDaysAgo = DateTime.Today.AddDays(-2);
+                var existingCerts = userIntermediateStore.Certificates.Find(X509FindType.FindBySubjectName, commonNameValue, false);
+                foreach (var c in existingCerts)
+                {
+                    if (c.NotBefore.ToUniversalTime() > twoDaysAgo)
+                        continue;
+
+                    var chain = new X509Chain();
+                    chain.Build(c);
+
+                    foreach (var element in chain.ChainElements)
+                    {
+                        if (element.Certificate.NotBefore.ToUniversalTime() > twoDaysAgo)
+                            continue;
+                        try
+                        {
+                            userIntermediateStore.Remove(element.Certificate);
+                        }
+                        catch (CryptographicException)
+                        {
+                            // Access denied?
+                        }
+                    }
+                }
+            }
         }
 
         public static void RegisterCertificateInOperatingSystem(X509Certificate2 cert)
@@ -40,7 +87,9 @@ namespace Raven.Server.Utils
             // will send the appropriate signers.
             // At least on Linux, this is done by looking at the _issuers_ of certs in the 
             // root store
-            using (var store = new X509Store(StoreName.Root, StoreLocation.CurrentUser))
+
+            var storeName = PlatformDetails.RunningOnMacOsx ? StoreName.My : StoreName.Root;
+            using (var store = new X509Store(storeName, StoreLocation.CurrentUser))
             {
                 store.Open(OpenFlags.ReadWrite);
 
@@ -67,7 +116,6 @@ namespace Raven.Server.Utils
                 5,
                 out certBytes);
 
-
             ValidateNoPrivateKeyInServerCert(serverCertBytes);
 
             Pkcs12Store store = new Pkcs12StoreBuilder().Build();
@@ -80,8 +128,8 @@ namespace Raven.Server.Utils
             store.Save(memoryStream, Array.Empty<char>(), GetSeededSecureRandom());
             certBytes = memoryStream.ToArray();
 
-            var cert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable);
-            RegisterCertificateInOperatingSystem(new X509Certificate2(cert.Export(X509ContentType.Cert)));
+            var cert = new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable | X509KeyStorageFlags.MachineKeySet);
+            RegisterCertificateInOperatingSystem(new X509Certificate2(cert.Export(X509ContentType.Cert), (string)null, X509KeyStorageFlags.MachineKeySet));
             return cert;
         }
 
@@ -89,7 +137,7 @@ namespace Raven.Server.Utils
         {
             var collection = new X509Certificate2Collection();
             // without the server private key here
-            collection.Import(serverCertBytes);
+            collection.Import(serverCertBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
 
             if (new X509Certificate2Collection().OfType<X509Certificate2>().FirstOrDefault(x => x.HasPrivateKey) != null)
                 throw new InvalidOperationException("After export of CERT, still have private key from signer in certificate, should NEVER happen");
@@ -99,24 +147,29 @@ namespace Raven.Server.Utils
         {
             var readCertificate = new X509CertificateParser().ReadCertificate(certificateHolder.Certificate.Export(X509ContentType.Cert));
             
-            return CreateSelfSignedCertificateBasedOnPrivateKey(
+            CreateSelfSignedCertificateBasedOnPrivateKey(
                 commonNameValue,
                 readCertificate.SubjectDN,
                 (certificateHolder.PrivateKey.Key, readCertificate.GetPublicKey()),
                 true,
                 false,
                 -1,
-                out _);
+                out var certBytes);
+
+            return new X509Certificate2(certBytes, (string)null, X509KeyStorageFlags.MachineKeySet);
         }
 
-        public static X509Certificate2 CreateSelfSignedCertificateBasedOnPrivateKey(string commonNameValue, 
+        public static void CreateSelfSignedCertificateBasedOnPrivateKey(string commonNameValue, 
             X509Name issuer, 
             (AsymmetricKeyParameter PrivateKey, AsymmetricKeyParameter PublicKey) key,
             bool isClientCertificate,
             bool isCaCertificate,
             int yearsUntilExpiration,
-            out byte[] certBytes)
+            out byte[] certBytes, 
+            StringBuilder log = null)
         {
+            log?.AppendLine("CreateSelfSignedCertificateBasedOnPrivateKey:");
+
             // Generating Random Numbers
             var random = GetSeededSecureRandom();
             ISignatureFactory signatureFactory = new Asn1SignatureFactory("SHA512WITHRSA", key.PrivateKey, random);
@@ -144,14 +197,17 @@ namespace Raven.Server.Utils
             }
 
             // Serial Number
-            var serialNumber = new BigInteger(20, random);
+            var serialNumber = new BigInteger(20 * BitsPerByte, random);
             certificateGenerator.SetSerialNumber(serialNumber);
+            log?.AppendLine($"serialNumber = {serialNumber}");
 
             // Issuer and Subject Name
-         
+
             X509Name subjectDN = new X509Name("CN=" + commonNameValue);
             certificateGenerator.SetIssuerDN(issuer);
             certificateGenerator.SetSubjectDN(subjectDN);
+            log?.AppendLine($"issuerDN = {issuer}");
+            log?.AppendLine($"subjectDN = {subjectDN}");
 
             // Valid For
             DateTime notBefore = DateTime.UtcNow.Date.AddDays(-7);
@@ -160,8 +216,9 @@ namespace Raven.Server.Utils
             DateTime notAfter = yearsUntilExpiration == 0 ? DateTime.UtcNow.Date.AddMonths(3) : notBefore.AddYears(yearsUntilExpiration);
             certificateGenerator.SetNotBefore(notBefore);
             certificateGenerator.SetNotAfter(notAfter);
-
-
+            log?.AppendLine($"notBefore = {notBefore}");
+            log?.AppendLine($"notAfter = {notAfter}");
+            
             var subjectKeyPair = GetRsaKey();
 
             certificateGenerator.SetPublicKey(subjectKeyPair.Public);
@@ -170,31 +227,34 @@ namespace Raven.Server.Utils
             var store = new Pkcs12Store();
             string friendlyName = certificate.SubjectDN.ToString();
             var certificateEntry = new X509CertificateEntry(certificate);
+            var keyEntry = new AsymmetricKeyEntry(subjectKeyPair.Private);
+
+            log?.AppendLine($"certificateEntry.Certificate = {certificateEntry.Certificate}");
+
             store.SetCertificateEntry(friendlyName, certificateEntry);
-            store.SetKeyEntry(friendlyName, new AsymmetricKeyEntry(subjectKeyPair.Private), new[] { certificateEntry });
+            store.SetKeyEntry(friendlyName, keyEntry, new[] { certificateEntry });
             var stream = new MemoryStream();
             store.Save(stream, new char[0], random);
-            certBytes = stream.ToArray();
-            var convertedCertificate =
-                new X509Certificate2(
-                    certBytes, (string)null,
-                    X509KeyStorageFlags.PersistKeySet | X509KeyStorageFlags.Exportable);
-            stream.Position = 0;
 
-            return convertedCertificate;
+            certBytes = stream.ToArray();
+
+            log?.AppendLine($"certBytes.Length = {certBytes.Length}");
+            log?.AppendLine($"cert in base64 = {Convert.ToBase64String(certBytes)}");
         }
 
         public static void CreateCertificateAuthorityCertificate(string commonNameValue, 
             out (AsymmetricKeyParameter PrivateKey, AsymmetricKeyParameter PublicKey) ca,
-            out X509Name name)
+            out X509Name name, StringBuilder log = null)
         {
+            log?.AppendLine("CreateCertificateAuthorityCertificate:");
             var random = GetSeededSecureRandom();
 
             // The Certificate Generator
             X509V3CertificateGenerator certificateGenerator = new X509V3CertificateGenerator();
 
             // Serial Number
-            BigInteger serialNumber = new BigInteger(20, random);
+            BigInteger serialNumber = new BigInteger(20 * BitsPerByte, random);
+            log?.AppendLine($"serialNumber = {serialNumber}");
             certificateGenerator.SetSerialNumber(serialNumber);
 
             // Issuer and Subject Name
@@ -202,13 +262,16 @@ namespace Raven.Server.Utils
             X509Name issuerDN = subjectDN;
             certificateGenerator.SetIssuerDN(issuerDN);
             certificateGenerator.SetSubjectDN(subjectDN);
+            log?.AppendLine($"issuerDN = {issuerDN}");
+            log?.AppendLine($"subjectDN = {subjectDN}");
 
             // Valid For
             DateTime notBefore = DateTime.UtcNow.Date.AddDays(-7);
             DateTime notAfter = notBefore.AddYears(2);
-
             certificateGenerator.SetNotBefore(notBefore);
             certificateGenerator.SetNotAfter(notAfter);
+            log?.AppendLine($"notBefore = {notBefore}");
+            log?.AppendLine($"notAfter = {notAfter}");
 
             var subjectKeyPair = new AsymmetricCipherKeyPair(
                 PublicKeyFactory.CreateKey(caKeyPair.Value.Public),

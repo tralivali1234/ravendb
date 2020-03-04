@@ -9,13 +9,17 @@ using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.IO;
+using System.Net;
+using System.Net.Sockets;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading;
 using System.Threading.Tasks;
 using FastTests;
+using Raven.Client.Http;
 using Raven.Server;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
+using Raven.Server.Config.Settings;
 using Sparrow.Json;
 using Tests.Infrastructure;
 using Xunit;
@@ -24,22 +28,26 @@ namespace SlowTests.Authentication
 {
     public partial class AuthenticationLetsEncryptTests : ClusterTestBase
     {
-        [NightlyBuildFact]
+        [Fact]
         public async Task CanGetLetsEncryptCertificateAndRenewIt()
         {
-            UseNewLocalServer();
+            var settingPath = Path.Combine(NewDataPath(forceCreateDir: true), "settings.json");
+            var defaultSettingsPath = new PathSetting("settings.default.json").FullPath;
+            File.Copy(defaultSettingsPath, settingPath, true);
+
+            UseNewLocalServer(customConfigPath: settingPath);
 
             var acmeStaging = "https://acme-staging.api.letsencrypt.org/directory";
             Server.Configuration.Core.AcmeUrl = acmeStaging;
             Server.ServerStore.Configuration.Core.SetupMode = SetupMode.Initial;
 
-            var domain = "RavenClusterTest" +  Environment.MachineName.Replace("-", "");
+            var domain = "RavenClusterTest" + Environment.MachineName.Replace("-", "");
             string email;
             string rootDomain;
 
             Server.ServerStore.EnsureNotPassive();
             var license = Server.ServerStore.LoadLicense();
-            
+
             using (var store = GetDocumentStore())
             using (var commands = store.Commands())
             using (Server.ServerStore.ContextPool.AllocateOperationContext(out JsonOperationContext context))
@@ -57,6 +65,11 @@ namespace SlowTests.Authentication
                 email = command.Result.Email;
             }
 
+            var tcpListener = new TcpListener(IPAddress.Loopback, 0);
+            tcpListener.Start();
+            var port = ((IPEndPoint)tcpListener.LocalEndpoint).Port;
+            tcpListener.Stop();
+
             var setupInfo = new SetupInfo
             {
                 Domain = domain,
@@ -71,7 +84,7 @@ namespace SlowTests.Authentication
                 {
                     ["A"] = new SetupInfo.NodeInfo
                     {
-                        Port = 8080,
+                        Port = port,
                         Addresses = new List<string>
                         {
                             "127.0.0.1"
@@ -81,6 +94,7 @@ namespace SlowTests.Authentication
             };
 
             X509Certificate2 serverCert;
+            byte[] serverCertBytes;
             string firstServerCertThumbprint;
             BlittableJsonReaderObject settingsJsonObject;
 
@@ -98,45 +112,50 @@ namespace SlowTests.Authentication
 
                 try
                 {
-                    settingsJsonObject = SetupManager.ExtractCertificatesAndSettingsJsonFromZip(zipBytes, "A", context, out serverCert, out _, out _, out _);
+                    settingsJsonObject = SetupManager.ExtractCertificatesAndSettingsJsonFromZip(zipBytes, "A", context, out serverCertBytes, out serverCert, out _, out _, out _);
                     firstServerCertThumbprint = serverCert.Thumbprint;
                 }
                 catch (Exception e)
                 {
                     throw new InvalidOperationException("Unable to extract setup information from the zip file.", e);
                 }
+
+                // Finished the setup wizard, need to restart the server. 
+                // Since cannot restart we'll create a new server loaded with the new certificate and settings and use the server cert to connect to it
+
+                settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Security.CertificatePassword), out string certPassword);
+                settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Security.CertificateLetsEncryptEmail), out string letsEncryptEmail);
+                settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.PublicServerUrl), out string publicServerUrl);
+                settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.ServerUrls), out string serverUrl);
+                settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.SetupMode), out SetupMode setupMode);
+                settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.ExternalIp), out string externalIp);
+
+                var tempFileName = GetTempFileName();
+                File.WriteAllBytes(tempFileName, serverCertBytes);
+
+                IDictionary<string, string> customSettings = new ConcurrentDictionary<string, string>
+                {
+                    [RavenConfiguration.GetKey(x => x.Security.CertificatePath)] = tempFileName,
+                    [RavenConfiguration.GetKey(x => x.Security.CertificateLetsEncryptEmail)] = letsEncryptEmail,
+                    [RavenConfiguration.GetKey(x => x.Security.CertificatePassword)] = certPassword,
+                    [RavenConfiguration.GetKey(x => x.Core.PublicServerUrl)] = publicServerUrl,
+                    [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = serverUrl,
+                    [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
+                    [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
+                    [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = acmeStaging
+                };
+
+                Server.Dispose();
+
+                DoNotReuseServer(customSettings);
             }
 
-            // Finished the setup wizard, need to restart the server. 
-            // Since cannot restart we'll create a new server loaded with the new certificate and settings and use the server cert to connect to it
-
-            settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Security.CertificatePassword), out string certPassword);
-            settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Security.CertificateLetsEncryptEmail), out string letsEncryptEmail);
-            settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.PublicServerUrl), out string publicServerUrl);
-            settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.ServerUrls), out string serverUrl);
-            settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.SetupMode), out SetupMode setupMode);
-            settingsJsonObject.TryGet(RavenConfiguration.GetKey(x => x.Core.ExternalIp), out string externalIp);
-
-            var tempFileName = Path.GetTempFileName();
-            byte[] certData = serverCert.Export(X509ContentType.Pfx);
-            File.WriteAllBytes(tempFileName, certData);
-
-            IDictionary<string, string> customSettings = new ConcurrentDictionary<string, string>
-            {
-                [RavenConfiguration.GetKey(x => x.Security.CertificatePath)] = tempFileName,
-                [RavenConfiguration.GetKey(x => x.Security.CertificateLetsEncryptEmail)] = letsEncryptEmail,
-                [RavenConfiguration.GetKey(x => x.Security.CertificatePassword)] = certPassword,
-                [RavenConfiguration.GetKey(x => x.Core.PublicServerUrl)] = publicServerUrl,
-                [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = serverUrl,
-                [RavenConfiguration.GetKey(x => x.Core.SetupMode)] = setupMode.ToString(),
-                [RavenConfiguration.GetKey(x => x.Core.ExternalIp)] = externalIp,
-                [RavenConfiguration.GetKey(x => x.Core.AcmeUrl)] = acmeStaging
-            };
-
-            Server.Dispose();
-
-            DoNotReuseServer(customSettings);
             UseNewLocalServer();
+
+
+            // Note: because we use a staging lets encrypt cert, the chain is not trusted.
+            // It only works because in the TestBase ctor we do:
+            // RequestExecutor.ServerCertificateCustomValidationCallback += (msg, cert, chain, errors) => true;
 
             using (var store = GetDocumentStore(new Options
             {
@@ -159,7 +178,20 @@ namespace SlowTests.Authentication
 
                 await commands.RequestExecutor.ExecuteAsync(command, commands.Context);
 
-                mre.Wait(Debugger.IsAttached ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(2));
+                Assert.True(command.Result.Success, "ForceRenewCertCommand returned false");
+
+                var result = mre.Wait(Debugger.IsAttached ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(2));
+
+                if (result == false && Server.RefreshTask.IsCompleted)
+                {
+                    if (Server.RefreshTask.IsFaulted || Server.RefreshTask.IsCanceled)
+                    {
+                        Assert.True(result,
+                            $"Refresh task failed to complete successfully. Exception: {Server.RefreshTask.Exception}");
+                    }
+                    Assert.True(result, "Refresh task completed successfully, waited too long for the cluster cert to be replaced");
+                }
+                Assert.True(result, "Refresh task didn't complete. Waited too long for the cluster cert to be replaced");
 
                 Assert.NotEqual(firstServerCertThumbprint, Server.Certificate.Certificate.Thumbprint);
             }

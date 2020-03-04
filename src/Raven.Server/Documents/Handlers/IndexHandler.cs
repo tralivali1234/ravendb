@@ -44,7 +44,7 @@ namespace Raven.Server.Documents.Handlers
 
             while (Database.DatabaseShutdown.IsCancellationRequested == false)
             {
-                if (Database.IndexStore.TryReplaceIndexes(name, newIndex.Name))
+                if (Database.IndexStore.TryReplaceIndexes(name, newIndex.Name, Database.DatabaseShutdown))
                     break;
             }
 
@@ -117,7 +117,7 @@ namespace Raven.Server.Documents.Handlers
                 }
             }
 
-            return NoContent();
+            return Task.CompletedTask;
         }
 
         [RavenAction("/databases/*/indexes/debug", "GET", AuthorizationStatus.ValidUser)]
@@ -186,7 +186,7 @@ namespace Raven.Server.Documents.Handlers
             }
         }
 
-        [RavenAction("/databases/*/indexes", "GET", AuthorizationStatus.ValidUser)]
+        [RavenAction("/databases/*/indexes", "GET", AuthorizationStatus.ValidUser, IsDebugInformationEndpoint = true)]
         public Task GetAll()
         {
             var name = GetStringQueryString("name", required: false);
@@ -238,7 +238,7 @@ namespace Raven.Server.Documents.Handlers
             return Task.CompletedTask;
         }
 
-        [RavenAction("/databases/*/indexes/stats", "GET", AuthorizationStatus.ValidUser)]
+        [RavenAction("/databases/*/indexes/stats", "GET", AuthorizationStatus.ValidUser, IsDebugInformationEndpoint = true)]
         public Task Stats()
         {
             var name = GetStringQueryString("name", required: false);
@@ -500,6 +500,15 @@ namespace Raven.Server.Documents.Handlers
                 var json = await context.ReadForMemoryAsync(RequestBodyStream(), "index/set-lock");
                 var parameters = JsonDeserializationServer.Parameters.SetIndexLockParameters(json);
 
+                if (parameters.IndexNames == null || parameters.IndexNames.Length == 0)
+                    throw new ArgumentNullException(nameof(parameters.IndexNames));
+
+                // Check for auto-indexes - we do not set lock for auto-indexes
+                if (parameters.IndexNames.Any(indexName => indexName.StartsWith("Auto/", StringComparison.OrdinalIgnoreCase)))
+                {
+                    throw new InvalidOperationException("'Indexes list contains Auto-Indexes. Lock Mode' is not set for Auto-Indexes.");
+                }
+
                 foreach (var name in parameters.IndexNames)
                 {
                     await Database.IndexStore.SetLock(name, parameters.Mode);
@@ -526,7 +535,7 @@ namespace Raven.Server.Documents.Handlers
             }
         }
 
-        [RavenAction("/databases/*/indexes/errors", "GET", AuthorizationStatus.ValidUser)]
+        [RavenAction("/databases/*/indexes/errors", "GET", AuthorizationStatus.ValidUser, IsDebugInformationEndpoint = true)]
         public Task GetErrors()
         {
             var names = GetStringValuesQueryString("name", required: false);
@@ -596,9 +605,7 @@ namespace Raven.Server.Documents.Handlers
             {
                 var existingResultEtag = GetLongFromHeaders("If-None-Match");
 
-                var index = Database.QueryRunner.GetIndex(name);
-
-                var result = Database.QueryRunner.ExecuteGetTermsQuery(index, field, fromValue, existingResultEtag, GetPageSize(), context, token);
+                var result = Database.QueryRunner.ExecuteGetTermsQuery(name, field, fromValue, existingResultEtag, GetPageSize(), context, token, out var index);
 
                 if (result.NotModified)
                 {
@@ -610,18 +617,18 @@ namespace Raven.Server.Documents.Handlers
 
                 using (var writer = new BlittableJsonTextWriter(context, ResponseBodyStream()))
                 {
-                    if(field.EndsWith("__minX") ||
+                    if (field.EndsWith("__minX") ||
                         field.EndsWith("__minY") ||
                         field.EndsWith("__maxX") ||
                         field.EndsWith("__maxY"))
                     {
                         if (index.Definition.IndexFields != null &&
-                        index.Definition.IndexFields.TryGetValue(field.Substring(0, name.Length - 6), out var indexField) == true)
+                        index.Definition.IndexFields.TryGetValue(field.Substring(0, field.Length - 6), out var indexField) == true)
                         {
                             if (indexField.Spatial?.Strategy == Client.Documents.Indexes.Spatial.SpatialSearchStrategy.BoundingBox)
                             {
-                                // here we need to convert these to numbers, otherwise the studio
-                                // can't display them in the studio
+                                // Term-values for 'Spatial Index Fields' with 'BoundingBox' are encoded in Lucene as 'prefixCoded bytes'
+                                // Need to convert to numbers for the Studioio
                                 var readableTerms = new HashSet<string>();
                                 foreach (var item in result.Terms)
                                 {
@@ -632,7 +639,7 @@ namespace Raven.Server.Documents.Handlers
                             }
                         }
                     }
-                    
+
                     writer.WriteTermsQueryResult(context, result);
                 }
 

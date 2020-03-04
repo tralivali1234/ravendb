@@ -10,6 +10,7 @@ using System.IO;
 using System.Runtime.InteropServices;
 using Sparrow;
 using Sparrow.Platform.Posix;
+using Sparrow.Utils;
 using Voron.Exceptions;
 using Voron.Impl.FileHeaders;
 using Voron.Util.Settings;
@@ -25,17 +26,8 @@ namespace Voron.Platform.Posix
             
             if (result == (int)Errno.ENOSPC)
             {
-                int matchLen = 0;
-                DriveInfo match = null;
-                foreach (var drive in DriveInfo.GetDrives())
-                {
-                    if (file.StartsWith(drive.RootDirectory.Name))
-                    {
-                        if (drive.RootDirectory.Name.Length > matchLen)
-                            match = drive;
-                    }
-                }
-                throw new DiskFullException(file, size, match?.AvailableFreeSpace);
+                var diskSpaceResult = DiskSpaceChecker.GetDiskSpaceInfo(file);
+                throw new DiskFullException(file, size, diskSpaceResult?.TotalFreeSpace.GetValue(SizeUnit.Bytes));
             }
             if (result != 0)
                 Syscall.ThrowLastError(result, $"posix_fallocate(\"{file}\", {size})");
@@ -43,6 +35,7 @@ namespace Voron.Platform.Posix
 
         public static unsafe void WriteFileHeader(FileHeader* header, VoronPathSetting path)
         {
+            bool syncIsNeeded = false;
             var fd = Syscall.open(path.FullPath, OpenFlags.O_WRONLY | PerPlatformValues.OpenFlags.O_CREAT,
                 FilePermissions.S_IWUSR | FilePermissions.S_IRUSR);
 
@@ -55,6 +48,11 @@ namespace Voron.Platform.Posix
                 }
 
                 int remaining = sizeof(FileHeader);
+                
+                FileInfo fi = new FileInfo(path.FullPath);
+                if (fi.Length != remaining)
+                    syncIsNeeded = true;
+                
                 var ptr = ((byte*) header);
                 while (remaining > 0)
                 {
@@ -73,7 +71,9 @@ namespace Voron.Platform.Posix
                     var err = Marshal.GetLastWin32Error();
                     Syscall.ThrowLastError(err, "FSync " + path);
                 }
-                Syscall.FsyncDirectoryFor(path.FullPath);
+
+                if (syncIsNeeded)
+                    Syscall.FsyncDirectoryFor(path.FullPath);
             }
             finally
             {

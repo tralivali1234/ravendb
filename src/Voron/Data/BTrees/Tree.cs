@@ -200,6 +200,11 @@ namespace Voron.Data.BTrees
 
             return true;
         }
+        public void Add(Slice key, long value)
+        {
+            using (DirectAdd(key, sizeof(long), out byte* ptr))
+                *(long*)ptr = value;
+        }
 
         public void Add(Slice key, Stream value)
         {
@@ -408,7 +413,7 @@ namespace Voron.Data.BTrees
 
         private static void ThrowConcurrencyException()
         {
-            throw new ConcurrencyException("Value already exists, but requested NewOnly");
+            throw new VoronConcurrencyErrorException("Value already exists, but requested NewOnly");
         }
 
         public struct DirectAddScope : IDisposable
@@ -1416,6 +1421,80 @@ namespace Voron.Data.BTrees
 
             _newPageAllocator = newPageAllocator;
             HasNewPageAllocator = true;
+        }
+
+        internal void DebugValidateBranchReferences()
+        {
+            var rootPageNumber = State.RootPageNumber;
+
+            var pages = new HashSet<long>();
+            var stack = new Stack<TreePage>();
+            var root = GetReadOnlyTreePage(rootPageNumber);
+            stack.Push(root);
+            pages.Add(rootPageNumber);
+
+            while (stack.Count > 0)
+            {
+                var p = stack.Pop();
+
+                if (p.IsBranch == false)
+                    continue;
+
+                if (p.NumberOfEntries < 2)
+                {
+                    throw new InvalidOperationException("The branch page " + p.PageNumber + " has " +
+                                                        p.NumberOfEntries + " entry");
+                }
+
+                for (int i = 0; i < p.NumberOfEntries; i++)
+                {
+                    var page = p.GetNode(i)->PageNumber;
+
+                    if (pages.Add(page) == false)
+                    {
+                        DebugStuff.RenderAndShow(this);
+                        throw new InvalidOperationException("The page " + page + " already appeared in the tree!");
+                    }
+
+                    var refPage = GetReadOnlyTreePage(page);
+
+                    using (p.GetNodeKey(_llt, i, out var referenceKey))
+                    {
+                        Validate(refPage, referenceKey);
+
+                        if (refPage.IsCompressed)
+                        {
+                            using (var decompressedRefPage = DecompressPage(refPage, skipCache: true))
+                            {
+                                Validate(decompressedRefPage, referenceKey);
+                            }
+                        }
+                    }
+
+                    if (refPage.IsBranch == false)
+                        continue;
+
+                    stack.Push(refPage);
+
+                    void Validate(TreePage pageRef, Slice refKey)
+                    {
+                        if (refKey.Options == SliceOptions.Key)
+                        {
+                            for (int j = 0; j < pageRef.NumberOfEntries; j++)
+                            {
+                                using (pageRef.GetNodeKey(_llt, j, out var key))
+                                {
+                                    if (key.HasValue && key.Size > 0 && SliceComparer.Compare(key, refKey) < 0)
+                                    {
+                                        DebugStuff.RenderAndShow(this);
+                                        throw new InvalidOperationException($"Found invalid reference in branch page: {p}. Reference key: {refKey}, key found in referenced {pageRef} page: {key}");
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 }

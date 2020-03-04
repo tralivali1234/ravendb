@@ -6,8 +6,6 @@ using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
 using System.Threading.Tasks;
 using Sparrow;
-using Sparrow.Collections;
-using Sparrow.LowMemory;
 using Sparrow.Threading;
 using Sparrow.Utils;
 using Voron.Data;
@@ -106,6 +104,7 @@ namespace Voron.Impl
         private readonly StorageEnvironmentState _state;
 
         private CommitStats _requestedCommitStats;
+        private JournalFile.UpdatePageTranslationTableAction? _updatePageTranslationTable;
 
         public TransactionPersistentContext PersistentContext { get; }
         public TransactionFlags Flags { get; }
@@ -154,12 +153,11 @@ namespace Voron.Impl
             _journal = env.Journal;
             _id = txId;
             _freeSpaceHandling = previous._freeSpaceHandling;
-            _allocator = previous._allocator;
-
-            _disposeAllocator = previous._disposeAllocator;
-            previous._disposeAllocator = false;
-
             PersistentContext = previous.PersistentContext;
+
+            _allocator = new ByteStringContext(SharedMultipleUseFlag.None);
+            _disposeAllocator = true;
+
             Flags = TransactionFlags.ReadWrite;
 
             _pagerStates = new HashSet<PagerState>(ReferenceEqualityComparer<PagerState>.Default);
@@ -226,7 +224,9 @@ namespace Voron.Impl
         public LowLevelTransaction(StorageEnvironment env, long id, TransactionPersistentContext transactionPersistentContext, TransactionFlags flags, IFreeSpaceHandling freeSpaceHandling, ByteStringContext context = null)
         {
             TxStartTime = DateTime.UtcNow;
-            env.Options.AssertNoCatastrophicFailure();
+
+            if (flags == TransactionFlags.ReadWrite)
+                env.Options.AssertNoCatastrophicFailure();
 
             DataPager = env.Options.DataPager;
             _env = env;
@@ -289,6 +289,11 @@ namespace Voron.Impl
 
         [Conditional("DEBUG")]
         private void EnsureNoDuplicateTransactionId(long id)
+        {
+            EnsureNoDuplicateTransactionId_Forced(id);
+        }
+
+        internal void EnsureNoDuplicateTransactionId_Forced(long id)
         {
             foreach (var journalFile in _journal.Files)
             {
@@ -392,16 +397,13 @@ namespace Voron.Impl
             Page newPage;
             if (currentPage.IsOverflow)
             {
-                int numberOfAllocatedPages;
-                newPage = AllocateOverflowRawPage(currentPage.OverflowSize, out numberOfAllocatedPages, num, currentPage, zeroPage: false);
+                newPage = AllocateOverflowRawPage(currentPage.OverflowSize, out var numberOfAllocatedPages, num, currentPage, zeroPage: false);
                 pageSize = Constants.Storage.PageSize * numberOfAllocatedPages;
-                _numberOfModifiedPages += numberOfAllocatedPages;
             }
             else
             {
                 newPage = AllocatePage(1, num, currentPage, zeroPage: false); // allocate new page in a log file but with the same number			
                 pageSize = Environment.Options.PageSize;
-                _numberOfModifiedPages += 1;
             }
 
             Memory.Copy(newPage.Pointer, currentPage.Pointer, pageSize);
@@ -706,34 +708,40 @@ namespace Voron.Impl
             if (_disposed)
                 return;
 
-            if (!Committed && !RolledBack && Flags == TransactionFlags.ReadWrite)
-                Rollback();
-
-            _disposed = true;
-
-            PersistentContext.FreePageLocator(_pageLocator);
-
-            _env.TransactionCompleted(this);
-
-            foreach (var pagerState in _pagerStates)
+            try
             {
-                pagerState.Release();
+                if (!Committed && !RolledBack && Flags == TransactionFlags.ReadWrite)
+                    Rollback();
+
+                _disposed = true;
+
+                PersistentContext.FreePageLocator(_pageLocator);
             }
-            if (JournalFiles != null)
+            finally
             {
-                foreach (var journalFile in JournalFiles)
+                _env.TransactionCompleted(this);
+
+                foreach (var pagerState in _pagerStates)
                 {
-                    journalFile.Release();
+                    pagerState.Release();
                 }
+
+                if (JournalFiles != null)
+                {
+                    foreach (var journalFile in JournalFiles)
+                    {
+                        journalFile.Release();
+                    }
+                }
+
+                _root?.Dispose();
+                _freeSpaceTree?.Dispose();
+
+                if (_disposeAllocator)
+                    _allocator.Dispose();
+
+                OnDispose?.Invoke(this);
             }
-
-            _root?.Dispose();
-            _freeSpaceTree?.Dispose();
-
-            if (_disposeAllocator)
-                _allocator.Dispose();
-
-            OnDispose?.Invoke(this);
         }
 
         internal void FreePageOnCommit(long pageNumber)
@@ -927,14 +935,20 @@ namespace Voron.Impl
             {
                 sp = Stopwatch.StartNew();
             }
-            var numberOfWrittenPages = _journal.WriteToJournal(this, out var journalFilePath);
+            var result = _journal.WriteToJournal(this, out var journalFilePath);
+
+            _updatePageTranslationTable = result.UpdatePageTranslationTable;
+
             FlushedToJournal = true;
+
+            if (SimulateThrowingOnCommitStage2)
+                ThrowSimulateErrorOnCommitStage2();
 
             if (_requestedCommitStats != null)
             {
                 _requestedCommitStats.WriteToJournalDuration = sp.Elapsed;
-                _requestedCommitStats.NumberOfModifiedPages = numberOfWrittenPages.NumberOfUncompressedPages;
-                _requestedCommitStats.NumberOf4KbsWrittenToDisk = numberOfWrittenPages.NumberOf4Kbs;
+                _requestedCommitStats.NumberOfModifiedPages = result.NumberOfUncompressedPages;
+                _requestedCommitStats.NumberOf4KbsWrittenToDisk = result.NumberOf4Kbs;
                 _requestedCommitStats.JournalFilePath = journalFilePath;
             }
         }
@@ -981,6 +995,9 @@ namespace Voron.Impl
                 Allocator.Release(ref _txHeaderMemory);
 
                 Committed = true;
+
+                _updatePageTranslationTable?.ExecuteAfterCommit();
+
                 _env.TransactionAfterCommit(this);
 
                 if (_asyncCommitNextTransaction != null)
@@ -1201,6 +1218,13 @@ namespace Voron.Impl
         internal TransactionHeader* GetTransactionHeader()
         {
             return _txHeader;
+        }
+
+        internal bool SimulateThrowingOnCommitStage2 = false;
+
+        private static void ThrowSimulateErrorOnCommitStage2()
+        {
+            throw new InvalidOperationException("Simulation error");
         }
     }
 }

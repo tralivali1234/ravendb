@@ -24,6 +24,7 @@ namespace Raven.Server.Documents.Subscriptions
         private readonly DocumentDatabase _db;
         private readonly ServerStore _serverStore;
         public static TimeSpan TwoMinutesTimespan = TimeSpan.FromMinutes(2);
+        public bool HasHighlyAvailableTasks;
         private readonly ConcurrentDictionary<long, SubscriptionConnectionState> _subscriptionConnectionStates = new ConcurrentDictionary<long, SubscriptionConnectionState>();
         private readonly Logger _logger;
         private readonly SemaphoreSlim _concurrentConnectionsSemiSemaphore;
@@ -79,7 +80,7 @@ namespace Raven.Server.Documents.Subscriptions
             return subscriptionState;
         }
 
-		public async Task AcknowledgeBatchProcessed(long id, string name, string changeVector, string previousChangeVector)
+        public async Task AcknowledgeBatchProcessed(long id, string name, string changeVector, string previousChangeVector)
         {           
             var command = new AcknowledgeSubscriptionBatchCommand(_db.Name)
             {
@@ -132,7 +133,7 @@ namespace Raven.Server.Documents.Subscriptions
                 var whoseTaskIsIt = _db.WhoseTaskIsIt(databaseRecord.Topology, subscription, subscription);
                 if (whoseTaskIsIt != _serverStore.NodeTag)
                 {
-                    throw new SubscriptionDoesNotBelongToNodeException($"Subscripition with id {id} can't be proccessed on current node ({_serverStore.NodeTag}), because it belongs to {whoseTaskIsIt}")
+                    throw new SubscriptionDoesNotBelongToNodeException($"Subscription with id {id} can't be processed on current node ({_serverStore.NodeTag}), because it belongs to {whoseTaskIsIt}")
                     {
                         AppropriateNode = whoseTaskIsIt
                     };
@@ -251,7 +252,7 @@ namespace Raven.Server.Documents.Subscriptions
             var subscriptionBlittable = _serverStore.Cluster.Read(context, SubscriptionState.GenerateSubscriptionItemKeyName(_db.Name, name));
 
             if (subscriptionBlittable == null)
-                throw new SubscriptionDoesNotExistException($"Subscripiton with name {name} was not found in server store");
+                throw new SubscriptionDoesNotExistException($"Subscription with name {name} was not found in server store");
 
             var subscriptionState = JsonDeserializationClient.SubscriptionState(subscriptionBlittable);
             var subscriptionJsonValue = new SubscriptionGeneralDataAndStats(subscriptionState);
@@ -388,7 +389,7 @@ namespace Raven.Server.Documents.Subscriptions
             }
         }
 
-        public void HandleDatabaseValueChange(DatabaseRecord databaseRecord)
+        public void HandleDatabaseRecordChange(DatabaseRecord databaseRecord)
         {
             using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             using (context.OpenReadTransaction())

@@ -104,7 +104,7 @@ namespace Raven.Client.Documents.Subscriptions
                 else
                     criteria.Query = "from " + collectionName;
                 criteria.Query += " as doc";
-            }
+            }            
             if (predicate != null)
             {
                 var script = predicate.CompileToJavascript(
@@ -113,13 +113,15 @@ namespace Raven.Client.Documents.Subscriptions
                         JavascriptConversionExtensions.MathSupport.Instance,
                         new JavascriptConversionExtensions.DictionarySupport(),
                         JavascriptConversionExtensions.LinqMethodsSupport.Instance,
+                        new JavascriptConversionExtensions.SubscriptionsWrappedConstantSupport(_store.Conventions),
                         new JavascriptConversionExtensions.ConstSupport(_store.Conventions),
                         new JavascriptConversionExtensions.ReplaceParameterWithNewName(predicate.Parameters[0], "this"),
+                        JavascriptConversionExtensions.ToStringSupport.Instance,
                         JavascriptConversionExtensions.DateTimeSupport.Instance,
                         JavascriptConversionExtensions.InvokeSupport.Instance,
                         JavascriptConversionExtensions.NullCoalescingSupport.Instance,
                         JavascriptConversionExtensions.NestedConditionalSupport.Instance,
-                        JavascriptConversionExtensions.StringSupport.Instance
+                        JavascriptConversionExtensions.StringSupport.Instance                        
                     ));
 
                 criteria.Query = $"declare function predicate() {{ return {script} }}{Environment.NewLine}" +
@@ -135,6 +137,7 @@ namespace Raven.Client.Documents.Subscriptions
                         new JavascriptConversionExtensions.DictionarySupport(),
                         JavascriptConversionExtensions.LinqMethodsSupport.Instance,
                         new JavascriptConversionExtensions.ConstSupport(_store.Conventions),
+                        JavascriptConversionExtensions.ToStringSupport.Instance,
                         JavascriptConversionExtensions.DateTimeSupport.Instance,
                         JavascriptConversionExtensions.InvokeSupport.Instance,
                         JavascriptConversionExtensions.NullCoalescingSupport.Instance,
@@ -164,7 +167,7 @@ namespace Raven.Client.Documents.Subscriptions
         /// </summary>
         /// <returns>Created subscription name.</returns>
         public async Task<string> CreateAsync(SubscriptionCreationOptions options, string database = null)
-        {
+        {            
             if (options == null)
                 throw new InvalidOperationException("Cannot create a subscription if options is null");
 
@@ -172,12 +175,12 @@ namespace Raven.Client.Documents.Subscriptions
                 throw new InvalidOperationException("Cannot create a subscription if the script is null");
 
             var requestExecutor = _store.GetRequestExecutor(database ?? _store.Database);
-            requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context);
-
-            var command = new CreateSubscriptionCommand(_store.Conventions, options);
-            await requestExecutor.ExecuteAsync(command, context).ConfigureAwait(false);
-
-            return command.Result.Name;
+            using (requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+            {
+                var command = new CreateSubscriptionCommand(_store.Conventions, options);
+                await requestExecutor.ExecuteAsync(command, context).ConfigureAwait(false);
+                return command.Result.Name;
+            }
         }
 
         /// <summary>
@@ -201,7 +204,7 @@ namespace Raven.Client.Documents.Subscriptions
         /// </summary>
         /// <returns>Subscription object that allows to add/remove subscription handlers.</returns>
         public SubscriptionWorker<dynamic> GetSubscriptionWorker(string subscriptionName, string database = null)
-        {
+        {            
             return GetSubscriptionWorker<dynamic>(new SubscriptionWorkerOptions(subscriptionName), database);
         }
 
@@ -214,6 +217,7 @@ namespace Raven.Client.Documents.Subscriptions
         /// <returns>Subscription object that allows to add/remove subscription handlers.</returns>
         public SubscriptionWorker<T> GetSubscriptionWorker<T>(SubscriptionWorkerOptions options, string database = null) where T : class
         {
+            ((DocumentStoreBase)_store).AssertInitialized();
             if (options == null)
                 throw new InvalidOperationException("Cannot open a subscription if options are null");
 
@@ -244,12 +248,13 @@ namespace Raven.Client.Documents.Subscriptions
         public async Task<List<SubscriptionState>> GetSubscriptionsAsync(int start, int take, string database = null)
         {
             var requestExecutor = _store.GetRequestExecutor(database ?? _store.Database);
-            requestExecutor.ContextPool.AllocateOperationContext(out var jsonOperationContext);
+            using (requestExecutor.ContextPool.AllocateOperationContext(out var jsonOperationContext))
+            {
+                var command = new GetSubscriptionsCommand(start, take);
+                await requestExecutor.ExecuteAsync(command, jsonOperationContext).ConfigureAwait(false);
 
-            var command = new GetSubscriptionsCommand(start, take);
-            await requestExecutor.ExecuteAsync(command, jsonOperationContext).ConfigureAwait(false);
-
-            return command.Result.ToList();
+                return command.Result.ToList();
+            }
         }
 
         /// <summary>
@@ -257,12 +262,14 @@ namespace Raven.Client.Documents.Subscriptions
         /// </summary>
         public async Task DeleteAsync(string name, string database = null)
         {
-            JsonOperationContext jsonOperationContext;
+            (_store as DocumentStoreBase).AssertInitialized();            
             var requestExecutor = _store.GetRequestExecutor(database ?? _store.Database);
-            requestExecutor.ContextPool.AllocateOperationContext(out jsonOperationContext);
 
-            var command = new DeleteSubscriptionCommand(name);
-            await requestExecutor.ExecuteAsync(command, jsonOperationContext).ConfigureAwait(false);
+            using (requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext jsonOperationContext))
+            {
+                var command = new DeleteSubscriptionCommand(name);
+                await requestExecutor.ExecuteAsync(command, jsonOperationContext).ConfigureAwait(false);
+            }
         }
 
 
@@ -299,11 +306,12 @@ namespace Raven.Client.Documents.Subscriptions
                 throw new ArgumentNullException("SubscriptionName");
 
             var requestExecutor = _store.GetRequestExecutor(database);
-            requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context);
-
-            var command = new GetSubscriptionStateCommand(subscriptionName);
-            await requestExecutor.ExecuteAsync(command, context).ConfigureAwait(false);
-            return command.Result;
+            using (requestExecutor.ContextPool.AllocateOperationContext(out JsonOperationContext context))
+            {
+                var command = new GetSubscriptionStateCommand(subscriptionName);
+                await requestExecutor.ExecuteAsync(command, context).ConfigureAwait(false);
+                return command.Result;
+            }
         }
 
         public void Dispose()

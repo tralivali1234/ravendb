@@ -15,6 +15,7 @@ using System.Threading;
 using Sparrow.Collections;
 using Voron.Global;
 using Voron.Util;
+using System.Buffers;
 
 namespace Voron.Impl.Journal
 {
@@ -23,6 +24,9 @@ namespace Voron.Impl.Journal
         private readonly StorageEnvironment _env;
         private IJournalWriter _journalWriter;
         private long _writePosIn4Kb;
+
+        private TransactionHeader[] _transactionHeaders;
+        private int _numberOfTransactionHeaders;
 
         private readonly PageTable _pageTranslationTable = new PageTable();
 
@@ -35,6 +39,7 @@ namespace Voron.Impl.Journal
         {
             Number = journalNumber;
             _env = env;
+            _transactionHeaders = ArrayPool<TransactionHeader>.Shared.Rent(journalWriter.NumberOfAllocated4Kb);
             _journalWriter = journalWriter;
             _writePosIn4Kb = 0;
             _unusedPages = new FastList<PagePosition>();
@@ -74,6 +79,9 @@ namespace Voron.Impl.Journal
 
         public void Dispose()
         {
+            if (_transactionHeaders != null)
+                ArrayPool<TransactionHeader>.Shared.Return(_transactionHeaders);
+            _transactionHeaders = null;
             _unusedPagesHashSetPool.Clear();
             _unusedPages.Clear();
             _pageTranslationTable.Clear();
@@ -95,15 +103,81 @@ namespace Voron.Impl.Journal
             };
         }
 
-        public bool ReadTransaction(long pos, TransactionHeader* txHeader)
+        public void SetLastReadTxHeader(long maxTransactionId, ref TransactionHeader lastReadTxHeader)
         {
-            return _journalWriter.Read((byte*)txHeader, sizeof(TransactionHeader), pos);
+            int low = 0;
+            int high = _numberOfTransactionHeaders-1;
+
+            while (low <= high)
+            {
+                int mid = (low + high) >> 1;
+                long midValTxId = _transactionHeaders[mid].TransactionId;
+
+                if (midValTxId < maxTransactionId)
+                    low = mid + 1;
+                else if (midValTxId > maxTransactionId)
+                    high = mid - 1;
+                else // found the max tx id
+                {
+                    lastReadTxHeader = _transactionHeaders[mid];
+                    return; 
+                }
+            }
+            if(low == 0)
+            {
+                lastReadTxHeader.TransactionId = -1; // not found
+                return;
+            }
+            if(high != _numberOfTransactionHeaders - 1)
+            {
+                throw new InvalidOperationException("Found a gap in the transaction headers held by this journal file in memory, shouldn't be possible");
+            }
+            lastReadTxHeader = _transactionHeaders[_numberOfTransactionHeaders - 1];
+        }
+
+        /// <summary>
+        /// Write a buffer of transactions (from lazy, usually) to the file
+        /// </summary>
+        public void Write(long posBy4Kb, byte* p, int numberOf4Kbs)
+        {
+            int posBy4Kbs = 0;
+            while (posBy4Kbs < numberOf4Kbs)
+            {
+                var readTxHeader = (TransactionHeader*)(p + (posBy4Kbs * 4 * Constants.Size.Kilobyte));
+                var totalSize = readTxHeader->CompressedSize != -1 ? readTxHeader->CompressedSize + 
+                    sizeof(TransactionHeader) : readTxHeader->UncompressedSize + sizeof(TransactionHeader);
+                var roundTo4Kb = (totalSize / (4 * Constants.Size.Kilobyte)) +
+                                   (totalSize % (4 * Constants.Size.Kilobyte) == 0 ? 0 : 1);
+                if (roundTo4Kb > int.MaxValue)
+                {
+                    MathFailure(numberOf4Kbs);
+                }
+
+                // We skip to the next transaction header.
+                posBy4Kbs += (int)roundTo4Kb ;
+                if(_transactionHeaders.Length == _numberOfTransactionHeaders)
+                {
+                    var temp = ArrayPool<TransactionHeader>.Shared.Rent(_transactionHeaders.Length * 2);
+                    Array.Copy(_transactionHeaders, temp, _transactionHeaders.Length);
+                    ArrayPool<TransactionHeader>.Shared.Return(_transactionHeaders);
+                    _transactionHeaders = temp;
+                }
+                Debug.Assert(readTxHeader->HeaderMarker == Constants.TransactionHeaderMarker);
+                _transactionHeaders[_numberOfTransactionHeaders++] = *readTxHeader;
+            }
+
+            JournalWriter.Write(posBy4Kb, p, numberOf4Kbs);
+        }
+
+        private static void MathFailure(int numberOf4Kbs)
+        {
+            throw new InvalidOperationException("Math failed, total size is larger than 2^31*4KB but we have just: " + numberOf4Kbs + " * 4KB");
         }
 
         /// <summary>
         /// write transaction's raw page data into journal
         /// </summary>
-        public void Write(LowLevelTransaction tx, CompressedPagesResult pages, LazyTransactionBuffer lazyTransactionScratch)
+        public UpdatePageTranslationTableAction Write(LowLevelTransaction tx, CompressedPagesResult pages, LazyTransactionBuffer lazyTransactionScratch)
         {
             var ptt = new Dictionary<long, PagePosition>(NumericEqualityComparer.BoxedInstanceInt64);
             var cur4KbPos = _writePosIn4Kb;
@@ -111,21 +185,12 @@ namespace Voron.Impl.Journal
             Debug.Assert(pages.NumberOf4Kbs > 0);
 
             UpdatePageTranslationTable(tx, _unusedPagesHashSetPool, ptt);
-
-            using (_locker2.Lock())
-            {
-                Debug.Assert(!_unusedPages.Any(_unusedPagesHashSetPool.Contains)); // We ensure there cannot be duplicates here (disjoint sets). 
-
-                foreach (var item in _unusedPagesHashSetPool)
-                    _unusedPages.Add(item);
-            }
-            _unusedPagesHashSetPool.Clear();
-
+            
             if (tx.IsLazyTransaction == false && (lazyTransactionScratch == null || lazyTransactionScratch.HasDataInBuffer() == false))
             {
                 try
                 {
-                    _journalWriter.Write(cur4KbPos, pages.Base, pages.NumberOf4Kbs);
+                    Write(cur4KbPos, pages.Base, pages.NumberOf4Kbs);
                 }
                 catch (Exception e)
                 {
@@ -166,17 +231,7 @@ namespace Voron.Impl.Journal
                 }
             }
 
-            using (_locker2.Lock())
-            {
-                _pageTranslationTable.SetItems(tx, ptt);
-                // it is important that the last write position will be set
-                // _after_ the PTT update, because a flush that is concurrent 
-                // with the write will first get the WritePosIn4KB and then 
-                // do the flush based on the PTT. Worst case, we'll flush 
-                // more then we need, but won't get into a position where we
-                // think we flushed, and then realize that we didn't.
-                Interlocked.Add(ref _writePosIn4Kb, pages.NumberOf4Kbs);
-            }
+            return new UpdatePageTranslationTableAction(this, tx, ptt, pages.NumberOf4Kbs);
         }
 
         private void UpdatePageTranslationTable(LowLevelTransaction tx, HashSet<PagePosition> unused, Dictionary<long, PagePosition> ptt)
@@ -226,9 +281,10 @@ namespace Voron.Impl.Journal
             }
         }
 
-        public void InitFrom(JournalReader journalReader)
+        public void InitFrom(JournalReader journalReader, TransactionHeader[] transactionHeaders, int transactionsCount)
         {
             _writePosIn4Kb = journalReader.Next4Kb;
+            Array.Copy(transactionHeaders, _transactionHeaders, transactionsCount);
         }
 
         public bool DeleteOnClose { set { _journalWriter.DeleteOnClose = value; } }
@@ -305,6 +361,46 @@ namespace Voron.Impl.Journal
 
             _scratchPagesPositionsPool.Free(unusedPages);
             _scratchPagesPositionsPool.Free(unusedAndFree);
+        }
+
+        public struct UpdatePageTranslationTableAction
+        {
+            private readonly JournalFile _parent;
+            private readonly LowLevelTransaction _tx;
+            private readonly Dictionary<long, PagePosition> _ptt;
+            private readonly int _numberOfWritten4Kbs;
+
+            public UpdatePageTranslationTableAction(JournalFile parent, LowLevelTransaction tx, Dictionary<long, PagePosition> ptt, int numberOfWritten4Kbs)
+            {
+                _parent = parent;
+                _tx = tx;
+                _ptt = ptt;
+                _numberOfWritten4Kbs = numberOfWritten4Kbs;
+            }
+
+            public void ExecuteAfterCommit()
+            {
+                Debug.Assert(_tx.Committed);
+
+                using (_parent._locker2.Lock())
+                {
+                    Debug.Assert(!_parent._unusedPages.Any(_parent._unusedPagesHashSetPool.Contains)); // We ensure there cannot be duplicates here (disjoint sets). 
+
+                    foreach (var item in _parent._unusedPagesHashSetPool)
+                        _parent._unusedPages.Add(item);
+
+                    _parent._pageTranslationTable.SetItems(_tx, _ptt);
+                    // it is important that the last write position will be set
+                    // _after_ the PTT update, because a flush that is concurrent 
+                    // with the write will first get the WritePosIn4KB and then 
+                    // do the flush based on the PTT. Worst case, we'll flush 
+                    // more then we need, but won't get into a position where we
+                    // think we flushed, and then realize that we didn't.
+                    Interlocked.Add(ref _parent._writePosIn4Kb, _numberOfWritten4Kbs);
+                }
+
+                _parent._unusedPagesHashSetPool.Clear();
+            }
         }
     }
 }

@@ -70,7 +70,7 @@ namespace Raven.Client.Documents.Smuggler
                 var command = new ExportCommand(_requestExecutor.Conventions, context, options, handleStreamResponse, operationId);
                 await _requestExecutor.ExecuteAsync(command, context, token: token).ConfigureAwait(false);
 
-                return new Operation(_requestExecutor, () => _store.Changes(), _requestExecutor.Conventions, operationId);
+                return new Operation(_requestExecutor, () => _store.Changes(_databaseName), _requestExecutor.Conventions, operationId);
             }
         }
 
@@ -92,14 +92,8 @@ namespace Raven.Client.Documents.Smuggler
         public async Task ImportIncrementalAsync(DatabaseSmugglerImportOptions options, string fromDirectory, CancellationToken cancellationToken = default)
         {
             var files = Directory.GetFiles(fromDirectory)
-                .Where(file =>
-                {
-                    var extension = Path.GetExtension(file);
-                    return
-                        Constants.Documents.PeriodicBackup.IncrementalBackupExtension.Equals(extension, StringComparison.OrdinalIgnoreCase) ||
-                        Constants.Documents.PeriodicBackup.FullBackupExtension.Equals(extension, StringComparison.OrdinalIgnoreCase);
-                })
-                .OrderBy(File.GetLastWriteTimeUtc)
+                .Where(BackupUtils.IsBackupFile)
+                .OrderBackups()
                 .ToArray();
 
             if (files.Length == 0)
@@ -162,7 +156,7 @@ namespace Raven.Client.Documents.Smuggler
                 var command = new ImportCommand(_requestExecutor.Conventions, context, options, stream, operationId);
                 await _requestExecutor.ExecuteAsync(command, context, token: token).ConfigureAwait(false);
 
-                return new Operation(_requestExecutor, () => _store.Changes(), _requestExecutor.Conventions, operationId);
+                return new Operation(_requestExecutor, () => _store.Changes(_databaseName), _requestExecutor.Conventions, operationId);
             }
         }
 
@@ -181,7 +175,7 @@ namespace Raven.Client.Documents.Smuggler
                 if (context == null)
                     throw new ArgumentNullException(nameof(context));
                 _handleStreamResponse = handleStreamResponse ?? throw new ArgumentNullException(nameof(handleStreamResponse));
-                _options = EntityToBlittable.ConvertEntityToBlittable(options, conventions, context);
+                _options = EntityToBlittable.ConvertCommandToBlittable(options,context);
                 _operationId = operationId;
             }
 
@@ -227,7 +221,7 @@ namespace Raven.Client.Documents.Smuggler
                     throw new ArgumentNullException(nameof(options));
                 if (context == null)
                     throw new ArgumentNullException(nameof(context));
-                _options = EntityToBlittable.ConvertEntityToBlittable(options, conventions, context);
+                _options = EntityToBlittable.ConvertCommandToBlittable(options,context);
                 _operationId = operationId;
             }
 

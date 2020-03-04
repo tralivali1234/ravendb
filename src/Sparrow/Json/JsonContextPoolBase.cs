@@ -26,20 +26,6 @@ namespace Sparrow.Json
 
         private class ContextStack : StackHeader<T>, IDisposable
         {
-            ~ContextStack()
-            {
-                if (Environment.HasShutdownStarted)
-                    return; // let the OS clean this up
-
-                try
-                {
-                    DisposeOfContexts();
-                }
-                catch (ObjectDisposedException)
-                {
-                }
-            }
-
             public void Dispose()
             {
                 GC.SuppressFinalize(this);
@@ -50,7 +36,7 @@ namespace Sparrow.Json
 
             private void DisposeOfContexts()
             {
-                var current = Head;
+                var current = Interlocked.Exchange(ref Head, HeaderDisposed);
                 while (current != null)
                 {
                     var ctx = current.Value;
@@ -92,9 +78,16 @@ namespace Sparrow.Json
                 return; // the context pool was already disposed
             }
 
-            while(current != null)
+            while (current != null)
             {
-                current.Value?.Dispose();
+                var value = current.Value;
+
+                if (value != null)
+                {
+                    if (value.InUse.Raise()) // it could be stolen by another thread - RavenDB-11409
+                        value.Dispose();
+                }
+
                 current = current.Next;
             }
         }
@@ -184,12 +177,24 @@ namespace Sparrow.Json
 
             public void Dispose()
             {
+                if (Parent == null)
+                    return;// disposed already
+
+                if (Context.DoNotReuse)
+                {
+                    Context.Dispose();
+                    return;
+                }
+
                 Context.Reset();
                 // These contexts are reused, so we don't want to use LowerOrDie here.
                 Context.InUse.Lower();
                 Context.InPoolSince = DateTime.UtcNow;
 
                 Parent.Push(Context);
+
+                Parent = null;
+                Context = null;
             }
 
         }
@@ -209,6 +214,11 @@ namespace Sparrow.Json
             while (true)
             {
                 var current = threadHeader.Head;
+                if(current == ContextStack.HeaderDisposed)
+                {
+                    context.Dispose();
+                    return;
+                }
                 var newHead = new StackNode<T> { Value = context, Next = current };
                 if (Interlocked.CompareExchange(ref threadHeader.Head, newHead, current) == current)
                     return;

@@ -60,6 +60,15 @@ class licenseModel {
         return `${status.MaxCores} Cores, ${maxMemory}, Max cluster size: ${maxClusterSize}`;
     });
 
+    static licenseId = ko.pureComputed(() => {
+        const status = licenseModel.licenseStatus();
+        if (!status || status.Type === "None") {
+            return null;
+        }
+
+        return status.Id;
+    });
+
     static developerLicense = ko.pureComputed(() => {
         const licenseStatus = licenseModel.licenseStatus();
         
@@ -124,6 +133,11 @@ class licenseModel {
                 return 'Community';
         }
     });
+    
+    static supportTableCssClass = ko.pureComputed(() => {
+        const label = licenseModel.supportLabel();
+        return label.toLocaleLowerCase();
+    })
 }
 
 export = licenseModel;

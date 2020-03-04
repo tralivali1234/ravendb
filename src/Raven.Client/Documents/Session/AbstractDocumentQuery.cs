@@ -251,6 +251,8 @@ namespace Raven.Client.Documents.Session
         public void RandomOrdering()
         {
             AssertNoRawQuery();
+
+            NoCaching();
             OrderByTokens.AddLast(OrderByToken.Random);
         }
 
@@ -261,11 +263,14 @@ namespace Raven.Client.Documents.Session
         public void RandomOrdering(string seed)
         {
             AssertNoRawQuery();
+
             if (string.IsNullOrWhiteSpace(seed))
             {
                 RandomOrdering();
                 return;
             }
+
+            NoCaching();
             OrderByTokens.AddLast(OrderByToken.CreateRandom(seed));
         }
 
@@ -524,7 +529,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         /// <summary>
         ///   Filter the results from the index using the specified where clause.
         /// </summary>
-        public void WhereLucene(string fieldName, string whereClause)
+        public void WhereLucene(string fieldName, string whereClause, bool exact)
         {
             fieldName = EnsureValidFieldName(fieldName, isNestedPath: false);
 
@@ -532,7 +537,9 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
 
             AppendOperatorIfNeeded(tokens);
             NegateIfNeeded(tokens, fieldName);
-            var whereToken = WhereToken.Create(WhereOperator.Lucene, fieldName, AddQueryParameter(whereClause));
+
+            var options = exact ? new WhereToken.WhereOptions(exact) : null;
+            var whereToken = WhereToken.Create(WhereOperator.Lucene, fieldName, AddQueryParameter(whereClause), options);
             tokens.AddLast(whereToken);
         }
 
@@ -594,16 +601,16 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
 
             whereParams.FieldName = EnsureValidFieldName(whereParams.FieldName, whereParams.IsNestedPath);
-            
+
             var tokens = GetCurrentWhereTokens();
             AppendOperatorIfNeeded(tokens);
-            
-            if (IfValueIsMethod(WhereOperator.Equals, whereParams, tokens)) 
+
+            if (IfValueIsMethod(WhereOperator.Equals, whereParams, tokens))
                 return;
-            
+
             var transformToEqualValue = TransformValue(whereParams);
             var addQueryParameter = AddQueryParameter(transformToEqualValue);
-            var whereToken = WhereToken.Create(WhereOperator.Equals, whereParams.FieldName, addQueryParameter, 
+            var whereToken = WhereToken.Create(WhereOperator.Equals, whereParams.FieldName, addQueryParameter,
                 new WhereToken.WhereOptions(whereParams.Exact));
             tokens.AddLast(whereToken);
         }
@@ -629,7 +636,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 {
                     throw new ArgumentException($"Unknown method {type}");
                 }
-                
+
                 tokens.AddLast(token);
                 return true;
             }
@@ -672,10 +679,10 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             AppendOperatorIfNeeded(tokens);
 
             whereParams.FieldName = EnsureValidFieldName(whereParams.FieldName, whereParams.IsNestedPath);
-            
-            if (IfValueIsMethod(WhereOperator.NotEquals, whereParams, tokens)) 
+
+            if (IfValueIsMethod(WhereOperator.NotEquals, whereParams, tokens))
                 return;
-            
+
             var whereToken = WhereToken.Create(WhereOperator.NotEquals, whereParams.FieldName, AddQueryParameter(transformToEqualValue),
                 new WhereToken.WhereOptions(whereParams.Exact));
             tokens.AddLast(whereToken);
@@ -756,7 +763,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
         }
 
         /// <summary>
-        ///   Matches fields where the value is between the specified start and end, exclusive
+        ///   Matches fields where the value is between the specified start and end, inclusive
         /// </summary>
         /// <param name = "fieldName">Name of the field.</param>
         /// <param name = "start">The start.</param>
@@ -1194,7 +1201,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 .ToArray();
 
             var whereToken = WhereToken.Create(WhereOperator.In, fieldName, AddQueryParameter(array), new WhereToken.WhereOptions(false));
-            
+
             tokens.AddLast(whereToken);
         }
 
@@ -1216,7 +1223,7 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
             }
 
             var whereToken = WhereToken.Create(WhereOperator.AllIn, fieldName, AddQueryParameter(array));
-            
+
             tokens.AddLast(whereToken);
         }
 
@@ -1536,8 +1543,8 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
 
             var type = whereParams.Value.GetType().GetNonNullableType();
 
-            if (_conventions.TryConvertValueForQuery(whereParams.FieldName, whereParams.Value, forRange, out var strVal))
-                return strVal;
+            if (_conventions.TryConvertValueToObjectForQuery(whereParams.FieldName, whereParams.Value, forRange, out var objValue))
+                return objValue;
 
             if (type == typeof(DateTime) || type == typeof(DateTimeOffset))
                 return whereParams.Value;
@@ -1649,6 +1656,34 @@ Use session.Query<T>() instead of session.Advanced.DocumentQuery<T>. The session
                 var whereToken = token as WhereToken;
                 whereToken?.AddAlias(fromAlias);
             }
+        }
+
+        protected static void GetSourceAliasIfExists(QueryData queryData, string[] fields, out string sourceAlias)
+        {
+            sourceAlias = null;
+
+            if (fields.Length != 1 || fields[0] == null)
+                return;
+
+            var indexOf = fields[0].IndexOf(".", StringComparison.Ordinal);
+            if (indexOf == -1)
+                return;
+
+            var possibleAlias = fields[0].Substring(0, indexOf);
+            if (queryData.FromAlias != null &&
+                queryData.FromAlias == possibleAlias)
+            {
+                sourceAlias = possibleAlias;
+                return;
+            }
+
+            if (queryData.LoadTokens == null ||
+                queryData.LoadTokens.Count == 0)
+                return;
+            if (queryData.LoadTokens.Any(lt => lt.Alias == possibleAlias) == false)
+                return;
+
+            sourceAlias = possibleAlias;
         }
 
         public string ProjectionParameter(object id)

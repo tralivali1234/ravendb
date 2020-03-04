@@ -5,13 +5,17 @@ using System.Diagnostics;
 using System.Runtime.ExceptionServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Raven.Server.Exceptions;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
 using Raven.Server.Utils;
 using Sparrow;
 using Sparrow.Logging;
+using Sparrow.LowMemory;
+using Sparrow.Platform;
 using Sparrow.Utils;
 using Voron.Debugging;
+using Voron.Exceptions;
 using Voron.Global;
 using Voron.Impl;
 using static Sparrow.DatabasePerformanceMetrics;
@@ -40,6 +44,8 @@ namespace Raven.Server.Documents
         private readonly long _maxTxSizeInBytes;
         private readonly double _maxTimeToWaitForPreviousTxBeforeRejectingInMs;
 
+        private readonly bool _is32Bits;
+
         public TransactionOperationsMerger(DocumentDatabase parent, CancellationToken shutdown)
         {
             _parent = parent;
@@ -49,6 +55,7 @@ namespace Raven.Server.Documents
             _maxTimeToWaitForPreviousTxInMs = _parent.Configuration.TransactionMergerConfiguration.MaxTimeToWaitForPreviousTx.AsTimeSpan.TotalMilliseconds;
             _maxTxSizeInBytes = _parent.Configuration.TransactionMergerConfiguration.MaxTxSize.GetValue(SizeUnit.Bytes);
             _maxTimeToWaitForPreviousTxBeforeRejectingInMs = _parent.Configuration.TransactionMergerConfiguration.MaxTimeToWaitForPreviousTxBeforeRejecting.AsTimeSpan.TotalMilliseconds;
+            _is32Bits = _parent.Configuration.Storage.ForceUsing32BitsPager || PlatformDetails.Is32Bits;
         }
 
         public DatabasePerformanceMetrics GeneralWaitPerformanceMetrics = new DatabasePerformanceMetrics(MetricType.GeneralWait, 256, 1);
@@ -60,7 +67,7 @@ namespace Raven.Server.Documents
 
         public void Start()
         {
-            _txLongRunningOperation = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => MergeOperationThreadProc(), null, TransactionMergerThreadName);            
+            _txLongRunningOperation = PoolOfThreads.GlobalRavenThreadPool.LongRunning(x => MergeOperationThreadProc(), null, TransactionMergerThreadName);
         }
 
         public abstract class MergedTransactionCommand
@@ -68,6 +75,8 @@ namespace Raven.Server.Documents
             public abstract int Execute(DocumentsOperationContext context);
             public readonly TaskCompletionSource<object> TaskCompletionSource = new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously);
             public Exception Exception;
+
+            public bool RetryOnError = false;
         }
 
         /// <summary>
@@ -119,7 +128,7 @@ namespace Raven.Server.Documents
                     _log.Info("Unable to elevate the transaction merger thread for " + _parent.Name, e);
                 }
             }
-            
+
             var oomTimer = new Stopwatch();// this is allocated here to avoid OOM when using it
 
             while (true) // this is actually only executed once, except if we are trying to recover from OOM errors
@@ -147,7 +156,7 @@ namespace Raven.Server.Documents
                 {
                     // clean shutdown, nothing to do
                 }
-                catch (Exception e) when (e is OutOfMemoryException)
+                catch (Exception e) when (e is EarlyOutOfMemoryException || e is OutOfMemoryException)
                 {
                     // this catch block is meant to handle potentially transient errors
                     // in particular, an OOM error is something that we want to recover
@@ -161,7 +170,7 @@ namespace Raven.Server.Documents
                                 "OutOfMemoryException happened in the transaction merger, will abort all transactions for the next 3 seconds and then resume operations",
                                 e);
                         }
-                        catch 
+                        catch
                         {
                             // under these conditions, this may throw, but we don't care, we wanna survive (cue music)
                         }
@@ -272,11 +281,13 @@ namespace Raven.Server.Documents
 
         private void MergeTransactionsOnce()
         {
+            DocumentsOperationContext context = null;
+            IDisposable returnContext = null;
             DocumentsTransaction tx = null;
             try
             {
                 var pendingOps = GetBufferForPendingOps();
-                using (_parent.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                returnContext = _parent.DocumentsStorage.ContextPool.AllocateOperationContext(out context);
                 {
                     try
                     {
@@ -351,7 +362,7 @@ namespace Raven.Server.Documents
                             }
                             return;
                         case PendingOperations.HasMore:
-                            MergeTransactionsWithAsyncCommit(context, pendingOps);
+                            MergeTransactionsWithAsyncCommit(ref context, ref returnContext, pendingOps);
                             return;
                         default:
                             Debug.Assert(false, "Should never happen");
@@ -361,7 +372,8 @@ namespace Raven.Server.Documents
             }
             finally
             {
-                tx?.Dispose();
+                context?.Transaction?.Dispose();
+                returnContext?.Dispose();
             }
         }
 
@@ -383,7 +395,7 @@ namespace Raven.Server.Documents
 
         private void NotifyTransactionFailureAndRerunIndependently(List<MergedTransactionCommand> pendingOps, Exception e)
         {
-            if (pendingOps.Count == 1)
+            if (pendingOps.Count == 1 && pendingOps[0].RetryOnError == false)
             {
                 pendingOps[0].Exception = e;
                 NotifyOnThreadPool(pendingOps);
@@ -397,22 +409,25 @@ namespace Raven.Server.Documents
         }
 
         private void MergeTransactionsWithAsyncCommit(
-            DocumentsOperationContext context,
+            ref DocumentsOperationContext previous,
+            ref IDisposable returnPreviousContext,
             List<MergedTransactionCommand> previousPendingOps)
         {
-            var previous = context.Transaction;
+            DocumentsOperationContext current = null;
+            IDisposable currentReturnContext = null;
             try
             {
                 while (true)
                 {
                     if (_log.IsInfoEnabled)
-                        _log.Info($"BeginAsyncCommit on {previous.InnerTransaction.LowLevelTransaction.Id} with {_operations.Count} additional operations pending");
+                        _log.Info($"BeginAsyncCommit on {previous.Transaction.InnerTransaction.LowLevelTransaction.Id} with {_operations.Count} additional operations pending");
 
+                    currentReturnContext = _parent.DocumentsStorage.ContextPool.AllocateOperationContext(out current);
                     CommitStats commitStats = null;
                     try
                     {
-                        previous.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out commitStats);
-                        context.Transaction = previous.BeginAsyncCommitAndStartNewTransaction();
+                        previous.Transaction.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out commitStats);
+                        current.Transaction = previous.Transaction.BeginAsyncCommitAndStartNewTransaction(current);
                     }
                     catch (Exception e)
                     {
@@ -427,107 +442,110 @@ namespace Raven.Server.Documents
                             try
                             {
                                 //already throwing, attempt to complete previous tx
-                                CompletePreviousTransaction(previous, commitStats, ref previousPendingOps, throwOnError: false);
+                                CompletePreviousTransaction(previous.Transaction, commitStats, ref previousPendingOps, throwOnError: false);
                             }
                             finally
                             {
-                                context.Transaction?.Dispose();
+                                current.Transaction?.Dispose();
+                                currentReturnContext?.Dispose();
                             }
                         }
 
                         return;
                     }
+
+                    var currentPendingOps = GetBufferForPendingOps();
+                    PendingOperations result;
+                    bool calledCompletePreviousTx = false;
                     try
                     {
-                        var currentPendingOps = GetBufferForPendingOps();
-                        PendingOperations result;
-                        bool calledCompletePreviousTx = false;
+                        var transactionMeter = TransactionPerformanceMetrics.MeterPerformanceRate();
                         try
                         {
-                            var transactionMeter = TransactionPerformanceMetrics.MeterPerformanceRate();
+                            result = ExecutePendingOperationsInTransaction(
+                                currentPendingOps, current,
+                                previous.Transaction.InnerTransaction.LowLevelTransaction.AsyncCommit, ref transactionMeter);
+                            UpdateGlobalReplicationInfoBeforeCommit(current);
+                        }
+                        finally
+                        {
+                            transactionMeter.Dispose();
+                        }
+                        calledCompletePreviousTx = true;
+                        CompletePreviousTransaction(previous.Transaction, commitStats, ref previousPendingOps, throwOnError: true);
+                    }
+                    catch (Exception e)
+                    {
+                        if (_log.IsInfoEnabled)
+                        {
+                            _log.Info(
+                                $"Failed to run merged transaction with {currentPendingOps.Count:#,#0} operations in async manner, will retry independently",
+                                e);
+                        }
+
+                        using (current.Transaction)
+                        using (currentReturnContext)
+                        {
+                            if (calledCompletePreviousTx == false)
+                            {
+                                CompletePreviousTransaction(
+                                    previous.Transaction,
+                                    commitStats,
+                                    ref previousPendingOps,
+                                    // if this previous threw, it won't throw again
+                                    throwOnError: false);
+                            }
+                            else
+                            {
+                                throw;
+                            }
+                        }
+                        NotifyTransactionFailureAndRerunIndependently(currentPendingOps, e);
+                        return;
+                    }
+
+                    previous.Transaction.Dispose();
+                    returnPreviousContext.Dispose();
+
+                    previous = current;
+                    returnPreviousContext = currentReturnContext;
+
+                    switch (result)
+                    {
+                        case PendingOperations.CompletedAll:
                             try
                             {
+                                previous.Transaction.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
+                                previous.Transaction.Commit();
 
-                                result = ExecutePendingOperationsInTransaction(
-                                    currentPendingOps, context,
-                                    previous.InnerTransaction.LowLevelTransaction.AsyncCommit, ref transactionMeter);
-                                UpdateGlobalReplicationInfoBeforeCommit(context);
+                                SlowWriteNotification.Notify(stats, _parent);
                             }
-                            finally
+                            catch (Exception e)
                             {
-                                transactionMeter.Dispose();
-                            }
-                            calledCompletePreviousTx = true;
-                            CompletePreviousTransaction(previous, commitStats, ref previousPendingOps, throwOnError: true);
-                        }
-                        catch (Exception e)
-                        {
-                            if (_log.IsInfoEnabled)
-                            {
-                                _log.Info(
-                                    $"Failed to run merged transaction with {currentPendingOps.Count:#,#0} operations in async manner, will retry independently",
-                                    e);
-                            }
-                            using (previous)
-                            using (context.Transaction)
-                            {
-                                if (calledCompletePreviousTx == false)
+                                foreach (var op in currentPendingOps)
                                 {
-                                    CompletePreviousTransaction(previous,
-                                        commitStats,
-                                        ref previousPendingOps,
-                                        // if this previous threw, it won't throw again
-                                        throwOnError: false);
-                                }
-                                else
-                                {
-                                    throw;
+                                    op.Exception = e;
                                 }
                             }
-                            NotifyTransactionFailureAndRerunIndependently(currentPendingOps, e);
+                            NotifyOnThreadPool(currentPendingOps);
                             return;
-                        }
-                        previous.Dispose();
-
-                        switch (result)
-                        {
-                            case PendingOperations.CompletedAll:
-                                try
-                                {
-                                    context.Transaction.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
-                                    context.Transaction.Commit();
-                                    SlowWriteNotification.Notify(stats, _parent);
-                                    context.Transaction.Dispose();
-                                }
-                                catch (Exception e)
-                                {
-                                    foreach (var op in currentPendingOps)
-                                    {
-                                        op.Exception = e;
-                                    }
-                                }
-                                NotifyOnThreadPool(currentPendingOps);
-                                return;
-                            case PendingOperations.HasMore:
-                                previousPendingOps = currentPendingOps;
-                                previous = context.Transaction;
-                                context.Transaction = null;
-                                break;
-                            default:
-                                Debug.Assert(false);
-                                return;
-                        }
-
-                    }
-                    finally
-                    {
-                        context.Transaction?.Dispose();
+                        case PendingOperations.HasMore:
+                            previousPendingOps = currentPendingOps;
+                            break;
+                        default:
+                            Debug.Assert(false);
+                            return;
                     }
                 }
             }
-            finally
+            catch
             {
-                previous.Dispose();
+                if (current.Transaction != null)
+                {
+                    current.Transaction.Dispose();
+                }
+                currentReturnContext?.Dispose();
+                throw;
             }
         }
 
@@ -542,14 +560,13 @@ namespace Raven.Server.Documents
                 previous.EndAsyncCommit();
 
                 //not sure about this 'if'
-                if (commitStats != null) 
+                if (commitStats != null)
                 {
                     SlowWriteNotification.Notify(commitStats, _parent);
                 }
 
                 if (_log.IsInfoEnabled)
                     _log.Info($"EndAsyncCommit on {previous.InnerTransaction.LowLevelTransaction.Id}");
-
                 NotifyOnThreadPool(previousPendingOps);
             }
             catch (Exception e)
@@ -600,7 +617,7 @@ namespace Raven.Server.Documents
                 var modifiedSize = llt.NumberOfModifiedPages * Constants.Storage.PageSize;
 
                 var canCloseCurrentTx = previousOperation == null || previousOperation.IsCompleted;
-                if (canCloseCurrentTx)
+                if (canCloseCurrentTx || _is32Bits)
                 {
                     if (_operations.IsEmpty)
                         break; // nothing remaining to do, let's us close this work
@@ -623,7 +640,6 @@ namespace Raven.Server.Documents
                     continue; // we can still process requests at this time, so let's do that...
 
                 UnlikelyRejectOperations(previousOperation, sp, llt, modifiedSize);
-
                 break;
 
             } while (true);
@@ -643,7 +659,7 @@ namespace Raven.Server.Documents
 
             // we have now reached the point were we are consuming too much memory, and we cannot
             // proceed with accepting a new request, it is time to start rejecting requests
-            WaitHandle[] waitHandles = 
+            WaitHandle[] waitHandles =
             {
                 _waitHandle.WaitHandle,
                 previousOperation.AsyncWaitHandle
@@ -769,24 +785,36 @@ namespace Raven.Server.Documents
             {
                 foreach (var op in pendingOps)
                 {
-                    try
+                    bool alreadyRetried = false;
+                    while (true)
                     {
-                        using (_parent.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
+                        try
                         {
-                            using (var tx = context.OpenWriteTransaction())
+                            using (_parent.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext context))
                             {
-                                op.Execute(context);
-                                tx.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
-                                tx.Commit();
-                                SlowWriteNotification.Notify(stats, _parent);
+                                using (var tx = context.OpenWriteTransaction())
+                                {
+                                    op.RetryOnError = false;
+                                    op.Execute(context);
+                                    tx.InnerTransaction.LowLevelTransaction.RetrieveCommitStats(out var stats);
+                                    tx.Commit();
+                                    SlowWriteNotification.Notify(stats, _parent);
+                                }
                             }
+                            DoCommandNotification(op);
                         }
-                        DoCommandNotification(op);
-                    }
-                    catch (Exception e)
-                    {
-                        op.Exception = e;
-                        NotifyOnThreadPool(op);
+                        catch (Exception e)
+                        {
+                            if (alreadyRetried == false && op.RetryOnError)
+                            {
+                                alreadyRetried = true;
+                                continue;
+                            }
+
+                            op.Exception = e;
+                            NotifyOnThreadPool(op);
+                        }
+                        break;
                     }
                 }
             }

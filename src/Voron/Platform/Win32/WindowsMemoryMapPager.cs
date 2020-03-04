@@ -66,7 +66,7 @@ namespace Voron.Platform.Win32
             _copyOnWriteMode = Options.CopyOnWriteMode && FileName.FullPath.EndsWith(Constants.DatabaseFilename);
             if (_copyOnWriteMode)
             {
-                _memoryMappedFileAccess = MemoryMappedFileAccess.Read | MemoryMappedFileAccess.CopyOnWrite;
+                _memoryMappedFileAccess = MemoryMappedFileAccess.CopyOnWrite;
                 fileAttributes = Win32NativeFileAttributes.Readonly;
                 _access = Win32NativeFileAccess.GenericRead;
             }
@@ -269,7 +269,7 @@ namespace Voron.Platform.Win32
 
             ProtectPageRange(newMappingBaseAddress, (ulong)allocationSize);
 
-            NativeMemory.RegisterFileMapping(_fileInfo.FullName, new IntPtr(newMappingBaseAddress), allocationSize);
+            NativeMemory.RegisterFileMapping(_fileInfo.FullName, new IntPtr(newMappingBaseAddress), allocationSize, GetAllocatedInBytes);
 
             return new PagerState.AllocationInfo
             {
@@ -316,7 +316,7 @@ namespace Voron.Platform.Win32
                 throw new OutOfMemoryException(errorMessage, innerException);
             }
 
-            NativeMemory.RegisterFileMapping(_fileInfo.FullName, new IntPtr(startingBaseAddressPtr), _fileStream.Length);
+            NativeMemory.RegisterFileMapping(_fileInfo.FullName, new IntPtr(startingBaseAddressPtr), _fileStream.Length, GetAllocatedInBytes);
 
             // If we are working on memory validation mode, then protect the pages by default.
             ProtectPageRange(startingBaseAddressPtr, (ulong)_fileStream.Length);

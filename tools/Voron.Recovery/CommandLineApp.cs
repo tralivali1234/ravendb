@@ -67,6 +67,8 @@ namespace Voron.Recovery
                 var initialContextLongLivedSizeInKbArg = cmd.Option("--InitialContextLongLivedSizeInKB", "Will set the recovery tool to use a long lived context size of the provided size in KB.", CommandOptionType.SingleValue);
                 var progressIntervalInSecArg = cmd.Option("--ProgressIntervalInSec", "Will set the recovery tool refresh to console rate interval in seconds.", CommandOptionType.SingleValue);
                 var disableCopyOnWriteModeArg = cmd.Option("--DisableCopyOnWriteMode", "Default is false.", CommandOptionType.SingleValue);
+                var ignoreInvalidJournalErrorsArg = cmd.Option("--IgnoreInvalidJournalErrors", "Default is false.", CommandOptionType.SingleValue);
+
                 var loggingModeArg = cmd.Option("--LoggingMode", "Logging mode: Operations or Information.", CommandOptionType.SingleValue);
 
                 cmd.OnExecute(() =>
@@ -144,6 +146,15 @@ namespace Voron.Recovery
                         config.DisableCopyOnWriteMode = disableCopyOnWriteMode;
                     }
 
+                    if (ignoreInvalidJournalErrorsArg.HasValue())
+                    {
+                        var value = ignoreInvalidJournalErrorsArg.Value();
+                        if (bool.TryParse(value, out var ignoreInvalidJournalErrors) == false)
+                            return ExitWithError($"{nameof(config.IgnoreInvalidJournalErrors)} argument value ({value}) is invalid", cmd);
+
+                        config.IgnoreInvalidJournalErrors = ignoreInvalidJournalErrors;
+                    }
+
                     if (loggingModeArg.HasValue())
                     {
                         var value = loggingModeArg.Value();
@@ -152,25 +163,25 @@ namespace Voron.Recovery
                         config.LoggingMode = mode;
                     }
 
-                    var recovery = new Recovery(config);
-                    var cts = new CancellationTokenSource();
-                    Console.WriteLine("Press 'q' to quit the recovery process");
-                    var cancellationTask = Task.Factory.StartNew(() =>
-                    {                
-                        while (Console.Read() != 'q')
+                    using (var recovery = new Recovery(config))
+                    {
+                        var cts = new CancellationTokenSource();
+                        Console.WriteLine("Press 'q' to quit the recovery process");
+                        var cancellationTask = Task.Factory.StartNew(() =>
                         {
-                        }
+                            while (Console.Read() != 'q')
+                            {
+                            }
+
+                            cts.Cancel();
+                            //The reason i do an exit here is because if we are in the middle of journal recovery 
+                            //we can't cancel it and it may take a long time.
+                            //That said i'm still going to give it a while to do a proper exit
+                            Task.Delay(5000).ContinueWith(_ => { Environment.Exit(1); });
+                        }, cts.Token);
+                        recovery.Execute(Console.Out, cts.Token);
                         cts.Cancel();
-                        //The reason i do an exit here is because if we are in the middle of journal recovery 
-                        //we can't cancel it and it may take a long time.
-                        //That said i'm still going to give it a while to do a proper exit
-                        Task.Delay(5000).ContinueWith(_ =>
-                        {
-                            Environment.Exit(1);
-                        });
-                    }, cts.Token);
-                    recovery.Execute(cts.Token);
-                    cts.Cancel();
+                    }
 
                     return 0;
                 });

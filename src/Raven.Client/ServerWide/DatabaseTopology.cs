@@ -190,8 +190,43 @@ namespace Raven.Client.ServerWide
             return destinations;
         }
 
+        public static (List<string> Members, List<string> Promotables, List<string> Rehabs) Reorder(DatabaseTopology topology, List<string> order)
+        {
+            if (topology.Count != order.Count
+                || topology.AllNodes.All(order.Contains) == false)
+            {
+                throw new ArgumentException("The reordered list doesn't correspond to the existing nodes of the database group.");
+            }
+
+            var newMembers = new List<string>();
+            var newPromotables = new List<string>();
+            var newRehabs = new List<string>();
+
+            foreach (var node in order)
+            {
+                if (topology.Members.Contains(node))
+                {
+                    newMembers.Add(node);
+                } 
+                else if (topology.Promotables.Contains(node))
+                {
+                    newPromotables.Add(node);
+                } 
+                else if (topology.Rehabs.Contains(node))
+                {
+                    newRehabs.Add(node);
+                }
+                else
+                {
+                    throw new ArgumentException($"Can't find node {node} in the topology");
+                }
+            }
+
+            return (newMembers, newPromotables, newRehabs);
+        }
+
         // Find changes in the connection of the internal database group
-        internal static (HashSet<string> AddedDestinations, HashSet<string> RemovedDestiantions) FindChanges(List<ReplicationNode> oldDestinations, List<ReplicationNode> newDestinations)
+        internal static (HashSet<string> AddedDestinations, HashSet<string> RemovedDestiantions) FindChanges(IEnumerable<ReplicationNode> oldDestinations, List<ReplicationNode> newDestinations)
         {
             var oldList = new List<string>();
             var newList = new List<string>();
@@ -250,7 +285,7 @@ namespace Raven.Client.ServerWide
                 [nameof(Members)] = new DynamicJsonArray(Members),
                 [nameof(Promotables)] = new DynamicJsonArray(Promotables),
                 [nameof(Rehabs)] = new DynamicJsonArray(Rehabs),
-                [nameof(Stamp)] = Stamp.ToJson(),
+                [nameof(Stamp)] = Stamp?.ToJson(),
                 [nameof(PromotablesStatus)] = DynamicJsonValue.Convert(PromotablesStatus),
                 [nameof(DemotionReasons)] = DynamicJsonValue.Convert(DemotionReasons),
                 [nameof(DynamicNodesDistribution)] = DynamicNodesDistribution,

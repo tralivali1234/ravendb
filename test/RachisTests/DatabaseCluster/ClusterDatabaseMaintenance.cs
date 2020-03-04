@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using FastTests.Server.Replication;
 using Raven.Client.Documents;
@@ -8,6 +9,7 @@ using Raven.Client.Documents.Indexes;
 using Raven.Client.ServerWide;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.ServerWide.Operations.Certificates;
+using Raven.Server;
 using Raven.Server.Config;
 using Raven.Server.Config.Categories;
 using Raven.Server.Rachis;
@@ -18,7 +20,7 @@ using Xunit;
 
 namespace RachisTests.DatabaseCluster
 {
-    public class ClusterDatabaseMaintenance : ReplicationTestBase
+    public class ClusterDatabaseMaintenance : ClusterTestBase
     {
         private class User
         {
@@ -38,7 +40,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task DontPurgeTombstonesWhenNodeIsDown()
         {
             var clusterSize = 3;
@@ -72,7 +74,7 @@ namespace RachisTests.DatabaseCluster
                 WaitForIndexing(store);
 
                 var database = await leader.ServerStore.DatabasesLandlord.TryGetOrCreateResourceStore(store.Database);
-                await database.DocumentTombstoneCleaner.ExecuteCleanup();
+                await database.TombstoneCleaner.ExecuteCleanup();
                 using (database.DocumentsStorage.ContextPool.AllocateOperationContext(out DocumentsOperationContext ctx))
                 using (ctx.OpenReadTransaction())
                 {
@@ -81,7 +83,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task MoveToRehabOnServerDown()
         {
             var clusterSize = 3;
@@ -108,7 +110,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task PromoteOnCatchingUp()
         {
             var clusterSize = 3;
@@ -156,7 +158,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task SuccessfulMaintenanceOnLeaderChange()
         {
             var clusterSize = 3;
@@ -189,7 +191,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task PromoteDatabaseNodeBackAfterReconnection()
         {
             var clusterSize = 3;
@@ -230,13 +232,16 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task MoveToPassiveWhenRefusedConnectionFromAllNodes()
         {
             //DebuggerAttachedTimeout.DisableLongTimespan = true;
             var clusterSize = 3;
             var databaseName = "MoveToPassiveWhenRefusedConnectionFromAllNodes";
-            var leader = await CreateRaftClusterAndGetLeader(clusterSize, false, 0);
+            var leader = await CreateRaftClusterAndGetLeader(clusterSize, false, 0, customSettings: new Dictionary<string, string>()
+            {
+                [RavenConfiguration.GetKey(x => x.Cluster.ElectionTimeout)] = "600"
+            });
 
             using (var store = new DocumentStore
             {
@@ -258,7 +263,9 @@ namespace RachisTests.DatabaseCluster
                 var nodeTag = Servers[1].ServerStore.NodeTag;
                 // kill the process and remove the node from topology
                 DisposeServerAndWaitForFinishOfDisposal(Servers[1]);
-                await leader.ServerStore.RemoveFromClusterAsync(nodeTag);
+
+                await ActionWithLeader((l) => l.ServerStore.RemoveFromClusterAsync(nodeTag));
+
                 using (leader.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
                 {
                     var val = await WaitForValueAsync(() =>
@@ -279,17 +286,24 @@ namespace RachisTests.DatabaseCluster
                     Assert.Equal(clusterSize - 1, val);
                 }
                 // bring the node back to live and ensure that he moves to passive state
-                Servers[1] = GetNewServer(new Dictionary<string, string> { { RavenConfiguration.GetKey(x => x.Core.PublicServerUrl), urls[0] }, { RavenConfiguration.GetKey(x => x.Core.ServerUrls), urls[0] } }, runInMemory: false, deletePrevious: false, partialPath: dataDir);
-                await Servers[1].ServerStore.WaitForState(RachisState.Passive).WaitAsync(TimeSpan.FromSeconds(30));
-                Assert.Equal(RachisState.Passive, Servers[1].ServerStore.CurrentRachisState);
+                Servers[1] = GetNewServer(new Dictionary<string, string>
+                {
+                    {RavenConfiguration.GetKey(x => x.Core.PublicServerUrl), urls[0]},
+                    {RavenConfiguration.GetKey(x => x.Core.ServerUrls), urls[0]},
+                    {RavenConfiguration.GetKey(x => x.Cluster.ElectionTimeout), "600"}
+
+                }, runInMemory: false, deletePrevious: false, partialPath: dataDir);
+
+                Assert.True(await Servers[1].ServerStore.WaitForState(RachisState.Passive, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30)), "1st assert");
                 // rejoin the node to the cluster
-                await leader.ServerStore.AddNodeToClusterAsync(urls[0], nodeTag);
-                await Servers[1].ServerStore.WaitForState(RachisState.Follower).WaitAsync(TimeSpan.FromSeconds(300));
-                Assert.Equal(RachisState.Follower, Servers[1].ServerStore.CurrentRachisState);
+
+                await ActionWithLeader( (l) => l.ServerStore.AddNodeToClusterAsync(urls[0], nodeTag));
+
+                Assert.True(await Servers[1].ServerStore.WaitForState(RachisState.Follower, CancellationToken.None).WaitAsync(TimeSpan.FromSeconds(30)), "2nd assert");
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task RedistrebuteDatabaseIfNodeFailes()
         {
             DebuggerAttachedTimeout.DisableLongTimespan = true;
@@ -330,7 +344,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task RedistrebuteDatabaseOnMultiFailure()
         {
             DebuggerAttachedTimeout.DisableLongTimespan = true;
@@ -373,7 +387,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task RemoveNodeFromClusterWhileDeletion()
         {
             var databaseName = "RemoveNodeFromClusterWhileDeletion" + Guid.NewGuid();
@@ -416,7 +430,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task DontRemoveNodeWhileItHasNotReplicatedDocs()
         {
             var databaseName = "DontRemoveNodeWhileItHasNotReplicatedDocs" + Guid.NewGuid();
@@ -514,7 +528,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task Promote_immedtialty_should_work()
         {
             var databaseName = "Promote_immedtialty_should_work" + Guid.NewGuid();
@@ -550,7 +564,7 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task ChangeUrlOfSingleNodeCluster()
         {
             var databaseName = "ChangeUrlOfSingleNodeCluster" + Guid.NewGuid();
@@ -590,14 +604,14 @@ namespace RachisTests.DatabaseCluster
             }
         }
 
-        [NightlyBuildFact]
+        [Fact]
         public async Task ChangeUrlOfMultiNodeCluster()
         {
             var fromSeconds = TimeSpan.FromSeconds(8);
 
-            var databaseName = "ChangeUrlOfMultiNodeCluster" + Guid.NewGuid();
+            var databaseName = GetDatabaseName();
             var groupSize = 3;
-            var newUrl = "http://" + Environment.MachineName + ":8080";
+            var newUrl = "http://127.0.0.1:0";
             string nodeTag;
 
             var leader = await CreateRaftClusterAndGetLeader(groupSize, shouldRunInMemory: false, leaderIndex: 0, customSettings: new Dictionary<string, string>
@@ -624,9 +638,10 @@ namespace RachisTests.DatabaseCluster
                 var customSettings = new Dictionary<string, string>
                 {
                     [RavenConfiguration.GetKey(x => x.Core.ServerUrls)] = newUrl,
-                    [RavenConfiguration.GetKey(x => x.Security.UnsecuredAccessAllowed)] = UnsecuredAccessAddressRange.PrivateNetwork.ToString()
+                    [RavenConfiguration.GetKey(x => x.Security.UnsecuredAccessAllowed)] = UnsecuredAccessAddressRange.PublicNetwork.ToString()
                 };
                 Servers[1] = GetNewServer(customSettings, runInMemory: false, deletePrevious: false, partialPath: dataDir);
+                newUrl = Servers[1].WebUrl;
                 // ensure that at this point we still can't talk to node 
                 await Task.Delay(fromSeconds); // wait for the observer to update the status
                 dbToplogy = (await leaderStore.Maintenance.Server.SendAsync(new GetDatabaseRecordOperation(databaseName))).Topology;
@@ -639,13 +654,15 @@ namespace RachisTests.DatabaseCluster
 
             // remove and rejoin to change the url
             Assert.True(await leader.ServerStore.RemoveFromClusterAsync(nodeTag).WaitAsync(fromSeconds));
-            Assert.True(await Servers[1].ServerStore.WaitForState(RachisState.Passive).WaitAsync(fromSeconds));
+            Assert.True(await Servers[1].ServerStore.WaitForState(RachisState.Passive, CancellationToken.None).WaitAsync(fromSeconds));
 
             Assert.True(await leader.ServerStore.AddNodeToClusterAsync(Servers[1].ServerStore.GetNodeHttpServerUrl(), nodeTag).WaitAsync(fromSeconds));
-            Assert.True(await Servers[1].ServerStore.WaitForState(RachisState.Follower).WaitAsync(fromSeconds));
+            Assert.True(await Servers[1].ServerStore.WaitForState(RachisState.Follower, CancellationToken.None).WaitAsync(fromSeconds));
 
-            // create a new database and verify that it resids on the server with the new url
-            var (_, dbGroupNodes) = await CreateDatabaseInCluster("new" + databaseName, groupSize, leader.WebUrl);
+            Assert.Equal(3, WaitForValue(() => leader.ServerStore.GetClusterTopology().Members.Count, 3));
+
+            // create a new database and verify that it resides on the server with the new url
+            var (_, dbGroupNodes) = await CreateDatabaseInCluster(GetDatabaseName(), groupSize, leader.WebUrl);
             Assert.True(dbGroupNodes.Select(s => s.WebUrl).Contains(newUrl));
             
         }

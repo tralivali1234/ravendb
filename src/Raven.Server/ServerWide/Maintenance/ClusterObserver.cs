@@ -5,9 +5,12 @@ using System.Linq;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
+using Raven.Client;
+using Raven.Client.Documents.Indexes;
 using Raven.Client.Exceptions;
 using Raven.Client.Http;
 using Raven.Client.ServerWide;
+using Raven.Server.Documents.Indexes;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.Rachis;
 using Raven.Server.ServerWide.Commands;
@@ -76,7 +79,12 @@ namespace Raven.Server.ServerWide.Maintenance
 
         public async Task Run(CancellationToken token)
         {
-            var prevStats = new Dictionary<string, ClusterNodeStatusReport>();
+            // we give some time to populate the stats.
+            await TimeoutManager.WaitFor(SupervisorSamplePeriod, token);
+            var prevStats = _maintenance.GetStats();
+            // wait before collecting the stats again.
+            await TimeoutManager.WaitFor(SupervisorSamplePeriod, token);
+
             while (_term == _engine.CurrentTerm && token.IsCancellationRequested == false)
             {
                 var delay = TimeoutManager.WaitFor(SupervisorSamplePeriod, token);
@@ -231,7 +239,24 @@ namespace Raven.Server.ServerWide.Maintenance
                 _logger.Operations(alertMsg);
             }
         }
-        
+
+        private void RaiseNodeNotFoundAlert(string alertMsg, string node)
+        {
+            var alert = AlertRaised.Create(
+                null,
+                $"Node {node} not found.",
+                $"{alertMsg}",
+                AlertType.DatabaseTopologyWarning,
+                NotificationSeverity.Warning
+            );
+
+            NotificationCenter.Add(alert);
+            if (_logger.IsOperationsEnabled)
+            {
+                _logger.Operations(alertMsg);
+            }
+        }
+
         private string UpdateDatabaseTopology(string dbName, DatabaseRecord record, ClusterTopology clusterTopology,
             Dictionary<string, ClusterNodeStatusReport> current,
             Dictionary<string, ClusterNodeStatusReport> previous,
@@ -245,8 +270,27 @@ namespace Raven.Server.ServerWide.Maintenance
             foreach (var member in topology.Members)
             {
                 var status = None;
-                if (current.TryGetValue(member, out var nodeStats) &&
-                    nodeStats.Status == ClusterNodeStatusReport.ReportStatus.Ok &&
+                if(current.TryGetValue(member, out var nodeStats) == false)
+                {
+                    // there isn't much we can do here, except for log it.
+                    if (previous.TryGetValue(member, out _))
+                    {
+                        // if we found this node in the previous report, we will ignore it this time and wait for the next report.
+                        continue;
+                    }
+
+                    var msg =
+                        $"The member node {member} was not found in both current and previous reports of the cluster observer. " +
+                        $"If this error continue to raise, check the latency between the cluster nodes.";
+                    if (_logger.IsInfoEnabled)
+                    {
+                        _logger.Info(msg);
+                        
+                    }
+                    RaiseNodeNotFoundAlert(msg, member);
+                    continue;
+                }
+                if (nodeStats.Status == ClusterNodeStatusReport.ReportStatus.Ok &&
                     nodeStats.Report.TryGetValue(dbName, out var dbStats))
                 {
                     status = dbStats.Status;
@@ -497,21 +541,21 @@ namespace Raven.Server.ServerWide.Maintenance
                 switch (nodeStats.Status)
                 {
                     case ClusterNodeStatusReport.ReportStatus.Timeout:
-                        reason = $"Node in rehabilitation due to timeout reached trying to get stats from node";
+                        reason = $"Node in rehabilitation due to timeout reached trying to get stats from node.{Environment.NewLine}";
                         break;
 
                     default:
-                        reason = $"Node in rehabilitation due to last report status being '{nodeStats.Status}'";
+                        reason = $"Node in rehabilitation due to last report status being '{nodeStats.Status}'.{Environment.NewLine}";
                         break;
                 }
             }
             else if (nodeStats.Report.TryGetValue(dbName, out var stats) && stats.Status == Faulted)
             {
-                reason = $"In rehabilitation because the DatabaseStatus for this node is {nameof(Faulted)}";
+                reason = $"In rehabilitation because the DatabaseStatus for this node is {nameof(Faulted)}.{Environment.NewLine}";
             }
             else
             {
-                reason = "In rehabilitation because the node is reachable but had no report about the database";
+                reason = $"In rehabilitation because the node is reachable but had no report about the database.{Environment.NewLine}";
             }
 
             if (nodeStats?.Error != null)
@@ -534,7 +578,7 @@ namespace Raven.Server.ServerWide.Maintenance
 
             if (_logger.IsOperationsEnabled)
             {
-                _logger.Operations(reason);
+                _logger.Operations($"Node {member} of database '{dbName}': {reason}");
             }
 
             return true;
@@ -606,7 +650,8 @@ namespace Raven.Server.ServerWide.Maintenance
                 return (false, null);
             }
 
-            var indexesCatchedUp = CheckIndexProgress(promotablePrevDbStats.LastEtag, promotablePrevDbStats.LastIndexStats, promotableDbStats.LastIndexStats);
+            var indexesCatchedUp = CheckIndexProgress(promotablePrevDbStats.LastEtag, promotablePrevDbStats.LastIndexStats, promotableDbStats.LastIndexStats,
+                mentorCurrDbStats.LastIndexStats);
             if (indexesCatchedUp)
             {
                 if (_logger.IsOperationsEnabled)
@@ -626,8 +671,10 @@ namespace Raven.Server.ServerWide.Maintenance
             if (topology.PromotablesStatus.TryGetValue(promotable, out var currentStatus) == false
                 || currentStatus != DatabasePromotionStatus.IndexNotUpToDate)
             {
+                var msg = $"Node {promotable} not ready to be a member, because the indexes are not up-to-date";
                 topology.PromotablesStatus[promotable] = DatabasePromotionStatus.IndexNotUpToDate;
-                return (false, $"Node {promotable} not ready to be a member, because the indexes are not up-to-date");
+                topology.DemotionReasons[promotable] = msg;
+                return (false, msg);
             }
             return (false, null);
         }
@@ -812,7 +859,8 @@ namespace Raven.Server.ServerWide.Maintenance
         private static bool CheckIndexProgress(
             long lastPrevEtag,
             Dictionary<string, DatabaseStatusReport.ObservedIndexStatus> previous,
-            Dictionary<string, DatabaseStatusReport.ObservedIndexStatus> current)
+            Dictionary<string, DatabaseStatusReport.ObservedIndexStatus> current,
+            Dictionary<string, DatabaseStatusReport.ObservedIndexStatus> mentor)
         {
             /*
             Here we are being a bit tricky. A database node is consider ready for promotion when
@@ -831,15 +879,39 @@ namespace Raven.Server.ServerWide.Maintenance
              */
 
 
-            foreach (var currentIndexStatus in current)
+            foreach (var mentorIndex in mentor)
             {
-                if (currentIndexStatus.Value.IsStale == false)
+                // we go over all of the mentor indexes to validated that the promotable has them.
+                // Since we don't save in the state machine the definition of side-by-side indexes, we will skip them, because
+                // the promotable don't have them. 
+
+                if (mentorIndex.Value.IsSideBySide)
                     continue;
 
-                if (previous.TryGetValue(currentIndexStatus.Key, out var _) == false)
+                if (mentor.TryGetValue(Constants.Documents.Indexing.SideBySideIndexNamePrefix + mentorIndex.Key, out var mentorIndexStats) == false)
+                {
+                    mentorIndexStats = mentorIndex.Value;
+                }
+
+                if (previous.TryGetValue(mentorIndex.Key, out var _) == false)
                     return false;
 
-                if (lastPrevEtag > currentIndexStatus.Value.LastIndexedEtag)
+                if (current.TryGetValue(mentorIndex.Key, out var currentIndexStats) == false)
+                    return false;
+
+                if (currentIndexStats.IsStale == false)
+                    continue;
+
+                if (mentorIndexStats.LastIndexedEtag == (long)Index.IndexProgressStatus.Faulty)
+                {
+                    continue; // skip the check for faulty indexes
+                }
+
+                if (mentorIndexStats.State == IndexState.Error && currentIndexStats.State == IndexState.Error)
+                    continue;
+                
+                var lastIndexEtag = currentIndexStats.LastIndexedEtag;
+                if (lastPrevEtag > lastIndexEtag)
                     return false;
 
             }

@@ -92,18 +92,20 @@ namespace Raven.Server.Smuggler.Documents
             }
 
             var type = ReadType();
-            if (type == null)
-                return DatabaseItemType.None;
-
-            while (type.Equals("Transformers", StringComparison.OrdinalIgnoreCase))
+            var dbItemType = GetType(type);
+            while (dbItemType == DatabaseItemType.Unknown)
             {
-                SkipArray();
+                var msg = $"You are trying to import items of type '{type}' which is unknown or not supported in 4.0. Ignoring items.";
+                if (_log.IsOperationsEnabled)
+                    _log.Operations(msg);
+                _result.AddWarning(msg);
+
+                SkipArray(onSkipped: null, CancellationToken.None);
                 type = ReadType();
-                if (type == null)
-                    break;
+                dbItemType = GetType(type);
             }
 
-            return GetType(type);
+            return dbItemType;
         }
 
         public DatabaseRecord GetDatabaseRecord()
@@ -212,10 +214,9 @@ namespace Raven.Server.Smuggler.Documents
             return databaseRecord;
         }
 
-        public IDisposable GetCompareExchangeValues(out IEnumerable<(string key, long index, BlittableJsonReaderObject value)> compareExchange)
+        public IEnumerable<(string key, long index, BlittableJsonReaderObject value)> GetCompareExchangeValues()
         {
-            compareExchange = InternalGetCompareExchangeValues();
-            return null;
+            return InternalGetCompareExchangeValues();
         }
 
         private unsafe void SetBuffer(UnmanagedJsonParser parser, LazyStringValue value)
@@ -257,7 +258,7 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
-        public long SkipType(DatabaseItemType type, Action<long> onSkipped)
+        public long SkipType(DatabaseItemType type, Action<long> onSkipped, CancellationToken token)
         {
             switch (type)
             {
@@ -272,7 +273,7 @@ namespace Raven.Server.Smuggler.Documents
                 case DatabaseItemType.CompareExchange:
                 case DatabaseItemType.LegacyDocumentDeletions:
                 case DatabaseItemType.LegacyAttachmentDeletions:
-                    return SkipArray(onSkipped);
+                    return SkipArray(onSkipped, token);
                 case DatabaseItemType.DatabaseRecord:
                     return SkipObject(onSkipped);
                 default:
@@ -306,7 +307,7 @@ namespace Raven.Server.Smuggler.Documents
             return ReadLegacyDeletions();
         }
 
-        public IEnumerable<DocumentTombstone> GetTombstones(List<string> collectionsToExport, INewDocumentActions actions)
+        public IEnumerable<Tombstone> GetTombstones(List<string> collectionsToExport, INewDocumentActions actions)
         {
             return ReadTombstones(actions);
         }
@@ -346,10 +347,9 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
-        public IDisposable GetIdentities(out IEnumerable<(string Prefix, long Value)> identities)
+        public IEnumerable<(string Prefix, long Value)> GetIdentities()
         {
-            identities = InternalGetIdentities();
-            return null;
+            return InternalGetIdentities();
         }
 
         private IEnumerable<(string Prefix, long Value)> InternalGetIdentities()
@@ -435,13 +435,15 @@ namespace Raven.Server.Smuggler.Documents
             return _state.Long;
         }
 
-        private long SkipArray(Action<long> onSkipped = null)
+        private long SkipArray(Action<long> onSkipped, CancellationToken token)
         {
             var count = 0L;
             foreach (var _ in ReadArray())
             {
                 using (_)
                 {
+                    token.ThrowIfCancellationRequested();
+
                     count++; //skipping
                     onSkipped?.Invoke(count);
                 }
@@ -575,6 +577,7 @@ namespace Raven.Server.Smuggler.Documents
                         if (oldContext != context)
                         {
                             builder.Dispose();
+                            modifier = new BlittableMetadataModifier(context);
                             builder = CreateBuilder(context, modifier);
                         }
                     }
@@ -691,6 +694,11 @@ namespace Raven.Server.Smuggler.Documents
                         if (oldContext != context)
                         {
                             builder.Dispose();
+                            modifier = new BlittableMetadataModifier(context)
+                            {
+                                ReadFirstEtagOfLegacyRevision = legacyImport,
+                                ReadLegacyEtag = _readLegacyEtag
+                            };
                             builder = CreateBuilder(context, modifier);
                         }
                     }
@@ -704,9 +712,17 @@ namespace Raven.Server.Smuggler.Documents
                     builder.Reset();
 
                     if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) &&
-                        metadata.TryGet(DocumentItem.ExportDocumentType.Key, out string type) &&
-                        type == DocumentItem.ExportDocumentType.Attachment)
+                        metadata.TryGet(DocumentItem.ExportDocumentType.Key, out string type))
                     {
+                        if (type != DocumentItem.ExportDocumentType.Attachment)
+                        {
+                            var msg = $"Ignoring an item of type `{type}`. " + data;
+                            if (_log.IsOperationsEnabled)
+                                _log.Operations(msg);
+                            _result.AddWarning(msg);
+                            continue;
+                        }
+
                         if (attachments == null)
                             attachments = new List<DocumentItem.AttachmentStream>();
 
@@ -730,8 +746,12 @@ namespace Raven.Server.Smuggler.Documents
                                     [Constants.Documents.Metadata.Collection] = CollectionName.HiLoCollection
                                 }
                             };
-                            data = context.ReadObject(data, modifier.Id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
                         }
+                    }
+
+                    if (data.Modifications != null)
+                    {
+                        data = context.ReadObject(data, modifier.Id, BlittableJsonDocumentBuilder.UsageMode.ToDisk);
                     }
 
                     _result.LegacyLastDocumentEtag = modifier.LegacyEtag;
@@ -758,7 +778,7 @@ namespace Raven.Server.Smuggler.Documents
             }
         }
 
-        private IEnumerable<DocumentTombstone> ReadTombstones(INewDocumentActions actions = null)
+        private IEnumerable<Tombstone> ReadTombstones(INewDocumentActions actions = null)
         {
             if (UnmanagedJsonParserHelper.Read(_peepingTomStream, _parser, _state, _buffer) == false)
                 UnmanagedJsonParserHelper.ThrowInvalidJson("Unexpected end of json", _peepingTomStream, _parser);
@@ -797,13 +817,24 @@ namespace Raven.Server.Smuggler.Documents
                     var data = builder.CreateReader();
                     builder.Reset();
 
-                    var tombstone = new DocumentTombstone();
+                    var tombstone = new Tombstone();
                     if (data.TryGet("Key", out tombstone.LowerId) &&
-                        data.TryGet(nameof(DocumentTombstone.Type), out string type) &&
-                        data.TryGet(nameof(DocumentTombstone.Collection), out tombstone.Collection) &&
-                        data.TryGet(nameof(DocumentTombstone.LastModified), out tombstone.LastModified))
+                        data.TryGet(nameof(Tombstone.Type), out string type) &&
+                        data.TryGet(nameof(Tombstone.Collection), out tombstone.Collection) &&
+                        data.TryGet(nameof(Tombstone.LastModified), out tombstone.LastModified))
                     {
-                        tombstone.Type = Enum.Parse<DocumentTombstone.TombstoneType>(type);
+                        if (Enum.TryParse<Tombstone.TombstoneType>(type, out var tombstoneType) == false)
+                        {
+                            var msg = $"Ignoring a tombstone of type `{type}` which is not supported in 4.0. ";
+                            if (_log.IsOperationsEnabled)
+                                _log.Operations(msg);
+
+                            _result.Tombstones.ErroredCount++;
+                            _result.AddWarning(msg);
+                            continue;
+                        }
+
+                        tombstone.Type = tombstoneType;
                         yield return tombstone;
                     }
                     else
@@ -1059,7 +1090,7 @@ namespace Raven.Server.Smuggler.Documents
             if (type.Equals("AttachmentsDeletions", StringComparison.OrdinalIgnoreCase))
                 return DatabaseItemType.LegacyAttachmentDeletions;
 
-            throw new InvalidOperationException("Got unexpected property name '" + type + "' on " + _parser.GenerateErrorState());
+            return DatabaseItemType.Unknown;
         }
 
         public void Dispose()

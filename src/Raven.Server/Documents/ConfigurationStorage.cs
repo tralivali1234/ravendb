@@ -23,10 +23,15 @@ namespace Raven.Server.Documents
         public ConfigurationStorage(DocumentDatabase db)
         {
             var path = db.Configuration.Core.DataDirectory.Combine("Configuration");
+            string tempPath = null;
+            if (db.Configuration.Storage.TempPath != null)
+            {
+                tempPath = db.Configuration.Storage.TempPath.Combine("Configuration").ToFullPath();
+            }
 
             var options = db.Configuration.Core.RunInMemory
-                ? StorageEnvironmentOptions.CreateMemoryOnly(path.FullPath, db.Configuration.Storage.TempPath?.FullPath, db.IoChanges, db.CatastrophicFailureNotification)
-                : StorageEnvironmentOptions.ForPath(path.FullPath, db.Configuration.Storage.TempPath?.FullPath, null, db.IoChanges, db.CatastrophicFailureNotification);
+                ? StorageEnvironmentOptions.CreateMemoryOnly(path.FullPath, tempPath, db.IoChanges, db.CatastrophicFailureNotification)
+                : StorageEnvironmentOptions.ForPath(path.FullPath, tempPath, null, db.IoChanges, db.CatastrophicFailureNotification);
 
             options.OnNonDurableFileSystemError += db.HandleNonDurableFileSystemError;
             options.OnRecoveryError += db.HandleOnConfigurationRecoveryError;
@@ -37,13 +42,16 @@ namespace Raven.Server.Documents
             options.TimeToSyncAfterFlashInSec = (int)db.Configuration.Storage.TimeToSyncAfterFlash.AsTimeSpan.TotalSeconds;
             options.NumOfConcurrentSyncsPerPhysDrive = db.Configuration.Storage.NumberOfConcurrentSyncsPerPhysicalDrive;
             options.MasterKey = db.MasterKey?.ToArray();
+            options.IgnoreInvalidJournalErrors = db.Configuration.Storage.IgnoreInvalidJournalErrors;
             options.DoNotConsiderMemoryLockFailureAsCatastrophicError = db.Configuration.Security.DoNotConsiderMemoryLockFailureAsCatastrophicError;
-
-            Environment = LayoutUpdater.OpenEnvironment(options);
-
+            if (db.Configuration.Storage.MaxScratchBufferSize.HasValue)
+                options.MaxScratchBufferSize = db.Configuration.Storage.MaxScratchBufferSize.Value.GetValue(SizeUnit.Bytes);
+            
             NotificationsStorage = new NotificationsStorage(db.Name);
 
             OperationsStorage = new OperationsStorage();
+
+            Environment = StorageLoader.OpenEnvironment(options, StorageEnvironmentWithType.StorageEnvironmentType.Configuration);
 
             ContextPool = new TransactionContextPool(Environment);
         }

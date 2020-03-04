@@ -11,6 +11,7 @@ using Raven.Client.Documents.Operations.Attachments;
 using Raven.Client.Documents.Smuggler;
 using Raven.Client.Extensions;
 using Raven.Client.Json;
+using Raven.Client.Properties;
 using Raven.Server.Documents;
 using Raven.Server.Documents.Revisions;
 using Raven.Server.Smuggler.Documents;
@@ -23,6 +24,7 @@ using Voron.Data;
 using Voron.Data.BTrees;
 using Voron.Data.RawData;
 using Voron.Data.Tables;
+using Voron.Exceptions;
 using Voron.Global;
 using Voron.Impl.Paging;
 using static System.String;
@@ -30,7 +32,7 @@ using static Voron.Data.BTrees.Tree;
 
 namespace Voron.Recovery
 {
-    public unsafe class Recovery
+    public unsafe class Recovery : IDisposable
     {
         public Recovery(VoronRecoveryConfiguration config)
         {
@@ -39,16 +41,27 @@ namespace Voron.Recovery
             _pageSize = config.PageSizeInKB * Constants.Size.Kilobyte;
             _initialContextSize = config.InitialContextSizeInMB * Constants.Size.Megabyte;
             _initialContextLongLivedSize = config.InitialContextLongLivedSizeInKB * Constants.Size.Kilobyte;
-            _option = StorageEnvironmentOptions.ForPath(config.DataFileDirectory, null, null, null, null);
-            _copyOnWrite = !config.DisableCopyOnWriteMode;
+            
             // by default CopyOnWriteMode will be true
-            _option.CopyOnWriteMode = _copyOnWrite;
+            _copyOnWrite = !config.DisableCopyOnWriteMode;
+            _config = config;
+            _option = CreateOptions();
+            
             _progressIntervalInSec = config.ProgressIntervalInSec;
             _previouslyWrittenDocs = new Dictionary<string, long>();
             LoggingSource.Instance.SetupLogMode(config.LoggingMode, Path.Combine(Path.GetDirectoryName(_output), LogFileName));
-            _logger = LoggingSource.Instance.GetLogger<Recovery>("Voron recovery");
+            _logger = LoggingSource.Instance.GetLogger<Recovery>("Voron Recovery");
         }
 
+        private StorageEnvironmentOptions CreateOptions()
+        {
+            var result = StorageEnvironmentOptions.ForPath(_config.DataFileDirectory, null, null, null, null);
+            result.CopyOnWriteMode = _copyOnWrite;
+            result.ManualFlushing = true;
+            result.IgnoreInvalidJournalErrors = _config.IgnoreInvalidJournalErrors;
+
+            return result;
+        }
 
         private readonly byte[] _streamHashState = new byte[(int)Sodium.crypto_generichash_statebytes()];
         private readonly byte[] _streamHashResult = new byte[(int)Sodium.crypto_generichash_bytes()];
@@ -60,34 +73,61 @@ namespace Voron.Recovery
             return (long)position - offset;
         }
 
-        public RecoveryStatus Execute(CancellationToken ct)
+        public RecoveryStatus Execute(TextWriter writer, CancellationToken ct)
         {
+            StorageEnvironment se = null;
             try
             {
                 var sw = new Stopwatch();
-                StorageEnvironment se = null;
                 sw.Start();
+                byte* mem = null;
                 if (_copyOnWrite)
                 {
-                    Console.WriteLine("Recovering journal files, this may take a while...");
+                    writer.WriteLine("Recovering journal files, this may take a while...");
+
+                    bool optionOwnsPagers = _option.OwnsPagers;
                     try
                     {
+                        _option.OwnsPagers = false;
 
-                        se = new StorageEnvironment(_option);
-                        Console.WriteLine(
+                        while (true)
+                        {
+                            try
+                            {
+                                se = new StorageEnvironment(_option);
+                                break;
+                            }
+                            catch (IncreasingDataFileInCopyOnWriteModeException e)
+                            {
+                                _option.Dispose();
+
+                                using (var file = File.Open(e.DataFilePath, FileMode.Open))
+                                {
+                                    file.SetLength(e.RequestedSize);
+                                }
+
+                                _option = CreateOptions();
+                            }
+                        }
+
+                        mem = se.Options.DataPager.AcquirePagePointer(null, 0);
+                        writer.WriteLine(
                             $"Journal recovery has completed successfully within {sw.Elapsed.TotalSeconds:N1} seconds");
                     }
                     catch (Exception e)
                     {
-                        Console.WriteLine($"Journal recovery failed, reason:{Environment.NewLine}{e}");
+                        se?.Dispose();
+                        writer.WriteLine($"Journal recovery failed, reason:{Environment.NewLine}{e}");
                     }
                     finally
                     {
-                        se?.Dispose();
+                        _option.OwnsPagers = optionOwnsPagers;
                     }
                 }
-                _option = StorageEnvironmentOptions.ForPath(Path.GetDirectoryName(_datafile));            
-                var mem = Pager.AcquirePagePointer(null, 0);
+                if (mem == null)
+                {
+                    mem = Pager.AcquirePagePointer(null, 0);
+                }
                 long startOffset = (long)mem;
                 var fi = new FileInfo(_datafile);
                 var fileSize = fi.Length;
@@ -105,9 +145,11 @@ namespace Voron.Recovery
                 using (var revisionsWriter = new BlittableJsonTextWriter(context, gZipStreamRevisions))
                 using (var conflictsWriter = new BlittableJsonTextWriter(context, gZipStreamConflicts))
                 {
-                    WriteSmugglerHeader(documentsWriter, 40018, "Docs");
-                    WriteSmugglerHeader(revisionsWriter, 40018, nameof(DatabaseItemType.RevisionDocuments));
-                    WriteSmugglerHeader(conflictsWriter, 40018, nameof(DatabaseItemType.Conflicts));
+                    var version = RavenVersionAttribute.Instance.BuildVersion;
+
+                    WriteSmugglerHeader(documentsWriter, version, "Docs");
+                    WriteSmugglerHeader(revisionsWriter, version, nameof(DatabaseItemType.RevisionDocuments));
+                    WriteSmugglerHeader(conflictsWriter, version, nameof(DatabaseItemType.Conflicts));
 
                     while (mem < eof)
                     {
@@ -125,13 +167,12 @@ namespace Voron.Recovery
                             {
                                 if (lastProgressReport != DateTime.MinValue)
                                 {
-                                    Console.Clear();
-                                    Console.WriteLine("Press 'q' to quit the recovery process");
+                                    writer.WriteLine("Press 'q' to quit the recovery process");
                                 }
                                 lastProgressReport = now;
                                 var currPos = GetFilePosition(startOffset, mem);
                                 var eofPos = GetFilePosition(startOffset, eof);
-                                Console.WriteLine(
+                                writer.WriteLine(
                                     $"{now:hh:MM:ss}: Recovering page at position {currPos:#,#;;0}/{eofPos:#,#;;0} ({(double)currPos / eofPos:p}) - Last recovered doc is {_lastRecoveredDocumentKey}");
                             }
 
@@ -198,7 +239,7 @@ namespace Voron.Recovery
                                                 ExtractTagFromLastPage(nextPage, streamPageHeader, ref tag);
                                                 break;
                                             }
-                                            totalSize += streamPageHeader->ChunkSize;                                        
+                                            totalSize += streamPageHeader->ChunkSize;
                                             var dataStart = (byte*)nextPage + PageHeader.SizeOf;
                                             _attachmentChunks.Add(((IntPtr)dataStart, (int)streamPageHeader->ChunkSize));
                                             rc = Sodium.crypto_generichash_update(hashStatePtr, dataStart, (ulong)streamPageHeader->ChunkSize);
@@ -227,7 +268,7 @@ namespace Voron.Recovery
                                             if (valid == false)
                                             {
                                                 break;
-                                            }                                        
+                                            }
 
                                         }
                                         if (valid == false)
@@ -348,18 +389,18 @@ namespace Voron.Recovery
                         }
                     }
 
-                    ReportOrphanAttachmentsAndMissingAttachments(ct, documentsWriter);
+                    ReportOrphanAttachmentsAndMissingAttachments(writer, ct, documentsWriter);
 
                     //This will only be the case when we don't have orphan attachments and we wrote the last attachment after we wrote the 
                     //last document
-                    if (_lastWriteIsDocument == false)
+                    if (_lastWriteIsDocument == false && _lastAttachmentInfo.HasValue)
                     {
-                        WriteDummyDocumentForAttachment(documentsWriter, _lastAttachmentInfo.hash, _lastAttachmentInfo.size, _lastAttachmentInfo.tag);
+                        WriteDummyDocumentForAttachment(documentsWriter, _lastAttachmentInfo.Value.hash, _lastAttachmentInfo.Value.size, _lastAttachmentInfo.Value.tag);
                     }
 
                     documentsWriter.WriteEndArray();
                     conflictsWriter.WriteEndArray();
-                    revisionsWriter.WriteEndArray();                
+                    revisionsWriter.WriteEndArray();
                     documentsWriter.WriteEndObject();
                     conflictsWriter.WriteEndObject();
                     revisionsWriter.WriteEndObject();
@@ -369,10 +410,10 @@ namespace Voron.Recovery
                     {
                         _logger.Operations(Environment.NewLine +
                             $"Discovered a total of {_numberOfDocumentsRetrieved:#,#;00} documents within {sw.Elapsed.TotalSeconds::#,#.#;;00} seconds." + Environment.NewLine +
-                            $"Discovered a total of {_attachmentsHashs.Count:#,#;00} attachments. " + Environment.NewLine + 
+                            $"Discovered a total of {_attachmentsHashs.Count:#,#;00} attachments. " + Environment.NewLine +
                             $"Discovered a total of {_numberOfFaultedPages::#,#;00} faulted pages.");
                     }
-                
+
                 }
                 if (_cancellationRequested)
                     return RecoveryStatus.CancellationRequested;
@@ -380,6 +421,7 @@ namespace Voron.Recovery
             }
             finally
             {
+                se?.Dispose();
                 LoggingSource.Instance.EndLogging();
             }
         }
@@ -400,12 +442,12 @@ namespace Voron.Recovery
         }
 
         private const string EmptyCollection = "@empty";
-        private static readonly char[] TagSeparator = {(char)SpecialChars.RecordSeparator};
-        private void WriteDummyDocumentForAttachment(BlittableJsonTextWriter writer, string hash,long size, string tag)
+        private static readonly char[] TagSeparator = { (char)SpecialChars.RecordSeparator };
+        private void WriteDummyDocumentForAttachment(BlittableJsonTextWriter writer, string hash, long size, string tag)
         {
             writer.WriteComma();
             //start metadata
-            writer.WriteStartObject();            
+            writer.WriteStartObject();
             writer.WritePropertyName(Raven.Client.Constants.Documents.Metadata.Key);
             writer.WriteStartObject();
             //collection name
@@ -477,7 +519,7 @@ namespace Voron.Recovery
             writer.WriteInteger(size);
         }
 
-        private void ReportOrphanAttachmentsAndMissingAttachments(CancellationToken ct, BlittableJsonTextWriter writer)
+        private void ReportOrphanAttachmentsAndMissingAttachments(TextWriter writer, CancellationToken ct, BlittableJsonTextWriter documentWriter)
         {
             //No need to scare the user if there are no attachments in the dump
             if (_attachmentsHashs.Count == 0 && _documentsAttachments.Count == 0)
@@ -485,18 +527,18 @@ namespace Voron.Recovery
             if (_attachmentsHashs.Count == 0)
             {
                 if (_logger.IsOperationsEnabled)
-                    _logger.Operations("No attachments were recoverd but there are documents pointing to attachments.");
+                    _logger.Operations("No attachments were recovered but there are documents pointing to attachments.");
                 return;
             }
             if (_documentsAttachments.Count == 0)
             {
                 foreach (var (hash, tag, size) in _attachmentsHashs)
                 {
-                    ReportOrphanAttachmentDocumentId(hash, size, tag, writer);
+                    ReportOrphanAttachmentDocumentId(hash, size, tag, documentWriter);
                 }
                 return;
             }
-            Console.WriteLine("Starting to compute orphan and missing attachments this may take a while.");
+            writer.WriteLine("Starting to compute orphan and missing attachments this may take a while.");
             if (ct.IsCancellationRequested)
             {
                 return;
@@ -506,7 +548,7 @@ namespace Voron.Recovery
             {
                 return;
             }
-            _documentsAttachments.Sort((x,y)=>Compare(x.hash, y.hash, StringComparison.Ordinal));
+            _documentsAttachments.Sort((x, y) => Compare(x.hash, y.hash, StringComparison.Ordinal));
             //We rely on the fact that the attachment hash are unqiue in the _attachmentsHashs list (no duplicated values).
             int index = 0;
             foreach (var (hash, docId, size) in _attachmentsHashs)
@@ -538,13 +580,13 @@ namespace Voron.Recovery
                 }
                 if (foundEqual == false)
                 {
-                    ReportOrphanAttachmentDocumentId(hash, size, docId, writer);
+                    ReportOrphanAttachmentDocumentId(hash, size, docId, documentWriter);
                 }
 
             }
         }
 
-        private void ReportOrphanAttachmentDocumentId(string hash,long size, string tag, BlittableJsonTextWriter writer)
+        private void ReportOrphanAttachmentDocumentId(string hash, long size, string tag, BlittableJsonTextWriter writer)
         {
             var msg = new StringBuilder($"Found orphan attachment with hash {hash}");
             if (tag != null)
@@ -559,12 +601,12 @@ namespace Voron.Recovery
         private long _attachmentNumber = 0;
         private readonly List<(string hash, string tag, long size)> _attachmentsHashs = new List<(string, string, long)>();
         private const string TagPrefix = "Recovered attachment #";
-        private void WriteAttachment(BlittableJsonTextWriter writer, long totalSize, string hash,string tag = null)
+        private void WriteAttachment(BlittableJsonTextWriter writer, long totalSize, string hash, string tag = null)
         {
             if (_documentWritten)
             {
                 writer.WriteComma();
-            }            
+            }
 
             writer.WriteStartObject();
 
@@ -586,12 +628,12 @@ namespace Voron.Recovery
             writer.WriteComma();
 
             writer.WritePropertyName(nameof(DocumentItem.AttachmentStream.Tag));
-            writer.WriteString(tag??$"{TagPrefix}{++_attachmentNumber}");
+            writer.WriteString(tag ?? $"{TagPrefix}{++_attachmentNumber}");
 
             writer.WriteEndObject();
             foreach (var chunk in _attachmentChunks)
             {
-                writer.WriteMemoryChunk(chunk.Ptr,chunk.Size);
+                writer.WriteMemoryChunk(chunk.Ptr, chunk.Size);
             }
             _attachmentsHashs.Add((hash, tag, totalSize));
             _lastWriteIsDocument = false;
@@ -635,7 +677,7 @@ namespace Voron.Recovery
             return true;
         }
 
-        private void WriteSmugglerHeader(BlittableJsonTextWriter writer, int version,string docType)
+        private void WriteSmugglerHeader(BlittableJsonTextWriter writer, int version, string docType)
         {
             writer.WriteStartObject();
             writer.WritePropertyName(("BuildVersion"));
@@ -645,7 +687,7 @@ namespace Voron.Recovery
             writer.WriteStartArray();
         }
 
-        private bool Write(byte* mem, int sizeInBytes, BlittableJsonTextWriter documentsWriter, BlittableJsonTextWriter revisionsWriter, 
+        private bool Write(byte* mem, int sizeInBytes, BlittableJsonTextWriter documentsWriter, BlittableJsonTextWriter revisionsWriter,
             BlittableJsonTextWriter conflictsWritet, JsonOperationContext context, long startOffest, byte tableType)
         {
             switch ((TableType)tableType)
@@ -870,17 +912,23 @@ namespace Voron.Recovery
         private readonly string _datafile;
         private readonly bool _copyOnWrite;
         private readonly Dictionary<string, long> _previouslyWrittenDocs;
-        private readonly List<(string hash,string docId)> _documentsAttachments = new List<(string hash, string docId)>();
+        private readonly List<(string hash, string docId)> _documentsAttachments = new List<(string hash, string docId)>();
         private int _dummyDocNumber;
         private int _dummyAttachmentNumber;
         private bool _lastWriteIsDocument;
-        private (string hash, long size, string tag) _lastAttachmentInfo;
+        private (string hash, long size, string tag)? _lastAttachmentInfo;
         private Logger _logger;
+        private VoronRecoveryConfiguration _config;
 
         public enum RecoveryStatus
         {
             Success,
             CancellationRequested
+        }
+
+        public void Dispose()
+        {
+            _option?.Dispose();
         }
     }
 }

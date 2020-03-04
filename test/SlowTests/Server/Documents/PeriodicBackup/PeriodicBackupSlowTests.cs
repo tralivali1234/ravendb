@@ -44,7 +44,7 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 var periodicBackupTaskId = result.TaskId;
 
                 var getPeriodicBackupStatus = new GetPeriodicBackupStatusOperation(periodicBackupTaskId);
-                var done = SpinWait.SpinUntil(() => store.Maintenance.Send(getPeriodicBackupStatus).Status?.LastFullBackup != null, TimeSpan.FromSeconds(60));
+                var done = SpinWait.SpinUntil(() => store.Maintenance.Send(getPeriodicBackupStatus).Status?.LastFullBackup != null, TimeSpan.FromSeconds(180));
                 Assert.True(done, "Failed to complete the backup in time");
             }
 
@@ -297,13 +297,13 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                 };
 
                 var backupTaskId = (await store.Maintenance.SendAsync(new UpdatePeriodicBackupOperation(config))).TaskId;
-                await store.Maintenance.SendAsync(new StartBackupOperation(true, backupTaskId));
+                var backupStatus = await store.Maintenance.SendAsync(new StartBackupOperation(true, backupTaskId));
                 var operation = new GetPeriodicBackupStatusOperation(backupTaskId);
-                SpinWait.SpinUntil(() =>
+                Assert.True(SpinWait.SpinUntil(() =>
                 {
                     var getPeriodicBackupResult = store.Maintenance.Send(operation);
                     return getPeriodicBackupResult.Status?.LastEtag > 0;
-                }, TimeSpan.FromSeconds(15));
+                }, TimeSpan.FromSeconds(15)));
 
                 var etagForBackups = store.Maintenance.Send(operation).Status.LastEtag;
                 using (var session = store.OpenAsyncSession())
@@ -312,12 +312,19 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     await session.SaveChangesAsync();
                 }
 
-                await store.Maintenance.SendAsync(new StartBackupOperation(false, backupTaskId));
-                SpinWait.SpinUntil(() =>
+                StartBackupOperationResult newBackupStatus;
+                do
+                {
+                    newBackupStatus = await store.Maintenance.SendAsync(new StartBackupOperation(false, backupTaskId));
+                }
+                //Race condition between reading the backup status and creating new backup
+                while (newBackupStatus.OperationId == backupStatus.OperationId); 
+                
+                Assert.True(SpinWait.SpinUntil(() =>
                 {
                     var newLastEtag = store.Maintenance.Send(operation).Status.LastEtag;
                     return newLastEtag != etagForBackups;
-                }, TimeSpan.FromSeconds(15));
+                }, TimeSpan.FromSeconds(15)));
             }
 
             using (var store = GetDocumentStore(new Options
@@ -391,11 +398,11 @@ namespace SlowTests.Server.Documents.PeriodicBackup
             {
                 var backupDirectory = Directory.GetDirectories(backupPath).First();
 
-                var backupToMovePath = $"{backupPath}\\IncrementalBackupTemp";
+                var backupToMovePath = $"{backupPath}{Path.DirectorySeparatorChar}IncrementalBackupTemp";
                 Directory.CreateDirectory(backupToMovePath);
-                var incrementalBackupFile = Directory.GetFiles(backupDirectory).Last();
+                var incrementalBackupFile = Directory.GetFiles(backupDirectory).OrderBackups().Last();
                 var fileName = Path.GetFileName(incrementalBackupFile);
-                File.Move(incrementalBackupFile, $"{backupToMovePath}\\{fileName}");
+                File.Move(incrementalBackupFile, $"{backupToMovePath}{Path.DirectorySeparatorChar}{fileName}");
 
                 await store1.Smuggler.ImportIncrementalAsync(new DatabaseSmugglerImportOptions(), backupDirectory);
                 using (var session = store1.OpenAsyncSession())
@@ -544,7 +551,6 @@ namespace SlowTests.Server.Documents.PeriodicBackup
 
                 // restore the database with a different name
                 string restoredDatabaseName = $"restored_database_snapshot-{Guid.NewGuid()}";
-
                 using (RestoreDatabase(store, new RestoreBackupConfiguration
                 {
                     BackupLocation = Directory.GetDirectories(backupPath).First(),
@@ -554,6 +560,8 @@ namespace SlowTests.Server.Documents.PeriodicBackup
                     using (var session = store.OpenAsyncSession(restoredDatabaseName))
                     {
                         var users = await session.LoadAsync<User>(new[] { "users/1", "users/2" });
+                        Assert.NotNull(users["users/1"]);
+                        Assert.NotNull(users["users/2"]);
                         Assert.True(users.Any(x => x.Value.Name == "oren"));
                         Assert.True(users.Any(x => x.Value.Name == "ayende"));
                     }

@@ -17,10 +17,11 @@ class clusterNode {
     usableMemory = ko.pureComputed(() => this.getNumber(this.usableMemoryInGb()));
     errorDetails = ko.observable<string>();
     isLeader = ko.observable<boolean>();
-    isPassive: KnockoutComputed<boolean>;
+    isPassive: KnockoutObservable<boolean>;
+    nodeServerVersion = ko.observable<string>();
     
-    constructor() {
-        this.isPassive = ko.pureComputed(() => this.tag() === "?");
+    constructor(isPassive: KnockoutObservable<boolean>) {
+        this.isPassive = isPassive;
     }
     
     errorDetailsShort = ko.pureComputed(() => {
@@ -72,10 +73,11 @@ class clusterNode {
         this.usableMemoryInGb(incoming.usableMemoryInGb());
         this.errorDetails(incoming.errorDetails());
         this.isLeader(incoming.isLeader());
+        this.nodeServerVersion(incoming.nodeServerVersion());
     }
 
-    static for(tag: string, serverUrl: string, type: clusterNodeType, connected: boolean, errorDetails?: string) {
-        const node = new clusterNode();
+    static for(tag: string, serverUrl: string, type: clusterNodeType, connected: boolean, isPassive: KnockoutObservable<boolean>, errorDetails?: string) {
+        const node = new clusterNode(isPassive);
         node.tag(tag);
         node.serverUrl(serverUrl);
         node.type(type);
@@ -107,7 +109,6 @@ class clusterNode {
     createStateObservable(topologyProvider: KnockoutObservable<clusterTopology>) {
         return ko.pureComputed(() => {
             const topology = topologyProvider();
-
             if (!topology.leader()) {
                 if (this.type() === "Watcher") {
                     return "Waiting";
@@ -118,16 +119,13 @@ class clusterNode {
                 }
             }
 
-            if (topology.nodeTag() !== topology.leader()) {
-                return "";
-            }
-
             return this.connected() ? "Active" : "Error";
         });
     }
 
     createStateClassObservable(topologyProvider: KnockoutObservable<clusterTopology>) {
         return ko.pureComputed(() => {
+            
             const topology = topologyProvider();
             if (!topology.leader()) {
                 if (this.type() === "Watcher") {
@@ -135,10 +133,6 @@ class clusterNode {
                 }
                 
                 return this.connected() ? "state-info" : "state-danger";
-            }
-
-            if (topology.nodeTag() !== topology.leader()) {
-                return "state-unknown";
             }
 
             return this.connected() ? "state-success" : "state-danger";

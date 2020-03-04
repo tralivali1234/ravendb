@@ -23,33 +23,29 @@ fi
 
 eval 
 
-if [[ ! "$DOTNET_VERSION_CMD" =~ ^2\.1\.[1-9][0-9]{2}$ ]] ; then
-    echo ".NET Core SDK 2.1.4 (or newer) not found. Installing.."
-    
-    if [ -z "$CURL_CMD" ]; then
-        sudo apt-get install -y curl 
-    fi
+echo "Installing .NET Core SDK 2.1"
 
-    curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
-    
-    if [ "$UBUNTU_VERSION" = "16.04" ] ; then
-        sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-xenial-prod xenial main" > /etc/apt/sources.list.d/dotnetdev.list'
-    elif [ "$UBUNTU_VERSION" = "14.04" ] ; then
-        sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-trusty-prod trusty main" > /etc/apt/sources.list.d/dotnetdev.list'
-    fi
-    
-    sudo apt-get update
-    sudo apt-get install -y dotnet-sdk-2.1.101
-    
-    mkdir ./dotnet_tmp
-    cd ./dotnet_tmp
-    sudo dotnet new console
-    sudo dotnet build #dotnet telemetry
-    cd ..
-    sudo rm -rf ./dotnet_tmp
-else
-    echo ".NET Core SDK 2.1.101 (or newer) is installed."
+if [ -z "$CURL_CMD" ]; then
+    sudo apt-get install -y curl 
 fi
+
+curl https://packages.microsoft.com/keys/microsoft.asc | sudo apt-key add -
+
+if [ "$UBUNTU_VERSION" = "16.04" ] ; then
+    sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-xenial-prod xenial main" > /etc/apt/sources.list.d/dotnetdev.list'
+elif [ "$UBUNTU_VERSION" = "14.04" ] ; then
+    sudo sh -c 'echo "deb [arch=amd64] https://packages.microsoft.com/repos/microsoft-ubuntu-trusty-prod trusty main" > /etc/apt/sources.list.d/dotnetdev.list'
+fi
+
+sudo apt-get update
+sudo apt-get install -y dotnet-sdk-2.1
+
+mkdir ./dotnet_tmp
+cd ./dotnet_tmp
+sudo dotnet new console
+sudo dotnet build #dotnet telemetry
+cd ..
+sudo rm -rf ./dotnet_tmp
 
 if [ -z "$POWERSHELL_CMD" ] ; then
     echo "Powershell not found. Installing.."
@@ -82,11 +78,11 @@ if [ -z "$NODE_CMD" ] ; then
 else
     NODE_VERSION="$($NODE_CMD --version)"
 
-    if [[ ! "$NODE_VERSION" =~ ^v?[89] ]] ; then
+    if [[ ! "$NODE_VERSION" =~ ^v?(8|9|10|11) ]] ; then
         echo "Incompatible version of NodeJS found: $NODE_VERSION. NodeJS 8.x or later is required."
         exit 1
     else
-    echo "Node $NODE_VERSION is installed."
+        echo "Node $NODE_VERSION is installed."
     fi
 fi
 

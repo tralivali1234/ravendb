@@ -23,12 +23,12 @@ using Raven.Client.ServerWide.Commands;
 using Raven.Client.ServerWide.Operations;
 using Raven.Client.Util;
 using Raven.Server.Config;
-using Raven.Server.Extensions;
 using Raven.Server.Json;
 using Raven.Server.NotificationCenter.Notifications;
 using Raven.Server.NotificationCenter.Notifications.Details;
 using Raven.Server.ServerWide;
 using Raven.Server.ServerWide.Context;
+using Raven.Server.Utils;
 using Raven.Server.Web.System;
 using Sparrow.Binary;
 using Sparrow.Json;
@@ -42,10 +42,9 @@ namespace Raven.Server.Commercial
 {
     public class LicenseManager : IDisposable
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<LicenseManager>("LicenseManager");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<LicenseManager>("Server");
         private readonly LicenseStorage _licenseStorage = new LicenseStorage();
-        private readonly LicenseStatus _licenseStatus = new LicenseStatus();
-        private readonly BuildNumber _buildInfo;
+        private LicenseStatus _licenseStatus = new LicenseStatus();
         private Timer _leaseLicenseTimer;
         private bool _disableCalculatingLicenseLimits;
         private RSAParameters? _rsaParameters;
@@ -57,21 +56,22 @@ namespace Raven.Server.Commercial
         private bool _eulaAcceptedButHasPendingRestart;
 
         private readonly object _locker = new object();
+        private LicenseSupportInfo _lastKnownSupportInfo;
 
         public event Action LicenseChanged;
+
+        public static readonly BuildNumber BuildInfo = new BuildNumber
+        {
+            BuildVersion = ServerVersion.Build,
+            ProductVersion = ServerVersion.Version,
+            CommitHash = ServerVersion.CommitHash,
+            FullVersion = ServerVersion.FullVersion
+        };
 
         public LicenseManager(ServerStore serverStore)
         {
             _serverStore = serverStore;
             _skipLeasingErrorsLogging = serverStore.Configuration.Licensing.SkipLeasingErrorsLogging;
-
-            _buildInfo = new BuildNumber
-            {
-                BuildVersion = ServerVersion.Build,
-                ProductVersion = ServerVersion.Version,
-                CommitHash = ServerVersion.CommitHash,
-                FullVersion = ServerVersion.FullVersion
-            };
         }
 
         public bool IsEulaAccepted => _eulaAcceptedButHasPendingRestart || _serverStore.Configuration.Licensing.EulaAccepted;
@@ -145,23 +145,22 @@ namespace Raven.Server.Commercial
             if (license == null)
             {
                 // license is not active
-                _licenseStatus.Attributes = null;
-                _licenseStatus.ErrorMessage = null;
-                _licenseStatus.Id = null;
+                ResetLicense(error: null);
+
+                CreateAgplAlert();
+
                 return;
             }
 
             try
             {
-                _licenseStatus.Attributes = LicenseValidator.Validate(license, RSAParameters);
-                _licenseStatus.ErrorMessage = null;
-                _licenseStatus.Id = license.Id;
+                SetLicense(license.Id, LicenseValidator.Validate(license, RSAParameters));
+
+                RemoveAgplAlert();
             }
             catch (Exception e)
             {
-                _licenseStatus.Attributes = null;
-                _licenseStatus.ErrorMessage = e.Message;
-                _licenseStatus.Id = null;
+                ResetLicense(e.Message);
 
                 if (Logger.IsInfoEnabled)
                     Logger.Info("Could not validate license", e);
@@ -182,25 +181,46 @@ namespace Raven.Server.Commercial
             ReloadLicenseLimits(addPerformanceHint);
         }
 
+        private void CreateAgplAlert()
+        {
+            var alert = AlertRaised.Create(
+                null,
+                "Your server is running without a license",
+                null,
+                AlertType.LicenseManager_AGPL3,
+                NotificationSeverity.Warning);
+
+            _serverStore.NotificationCenter.Add(alert);
+        }
+
+        private void RemoveAgplAlert()
+        {
+            _serverStore.NotificationCenter.Dismiss(AlertRaised.GetKey(AlertType.LicenseManager_AGPL3, null));
+        }
+
         public void ReloadLicenseLimits(bool addPerformanceHint = false)
         {
             try
             {
-                var licenseLimits = _serverStore.LoadLicenseLimits();
-
-                if (licenseLimits?.NodeLicenseDetails != null &&
-                    licenseLimits.NodeLicenseDetails.TryGetValue(_serverStore.NodeTag, out var detailsPerNode))
+                using (var process = Process.GetCurrentProcess())
                 {
-                    var cores = Math.Min(detailsPerNode.UtilizedCores, _licenseStatus.MaxCores);
-
-                    using (var process = Process.GetCurrentProcess())
+                    var licenseLimits = _serverStore.LoadLicenseLimits();
+                    if (licenseLimits?.NodeLicenseDetails != null &&
+                        licenseLimits.NodeLicenseDetails.TryGetValue(_serverStore.NodeTag, out var detailsPerNode))
                     {
+                        var cores = Math.Min(detailsPerNode.UtilizedCores, _licenseStatus.MaxCores);
                         SetAffinity(process, cores, addPerformanceHint);
 
                         var ratio = (int)Math.Ceiling(_licenseStatus.MaxMemory / (double)_licenseStatus.MaxCores);
                         var clusterSize = GetClusterSize();
                         var maxWorkingSet = Math.Min(_licenseStatus.MaxMemory / (double)clusterSize, cores * ratio);
                         SetMaxWorkingSet(process, Math.Max(1, maxWorkingSet));
+                    }
+                    else
+                    {
+                        // set the default values
+                        SetAffinity(process, _licenseStatus.MaxCores, addPerformanceHint);
+                        SetMaxWorkingSet(process, _licenseStatus.MaxMemory);
                     }
                 }
             }
@@ -235,11 +255,13 @@ namespace Raven.Server.Commercial
                 var numberOfCores = -1;
                 double installedMemoryInGb = -1;
                 double usableMemoryInGb = -1;
+                BuildNumber buildInfo = null;
                 if (licenseLimits.NodeLicenseDetails.TryGetValue(nodeTag, out var nodeDetails))
                 {
                     installedMemoryInGb = nodeDetails.InstalledMemoryInGb;
                     usableMemoryInGb = nodeDetails.UsableMemoryInGb;
                     oldAssignedCores = nodeDetails.UtilizedCores;
+                    buildInfo = nodeDetails.BuildInfo;
                 }
 
                 var utilizedCores = licenseLimits.NodeLicenseDetails.Sum(x => x.Value.UtilizedCores) - oldAssignedCores + newAssignedCores;
@@ -267,6 +289,7 @@ namespace Raven.Server.Commercial
                         var memoryInfo = MemoryInformation.GetMemoryInfoInGb();
                         installedMemoryInGb = memoryInfo.InstalledMemory;
                         usableMemoryInGb = memoryInfo.UsableMemory;
+                        buildInfo = BuildInfo;
                     }
                     else
                     {
@@ -280,6 +303,7 @@ namespace Raven.Server.Commercial
                             numberOfCores = nodeInfo.NumberOfCores;
                             installedMemoryInGb = nodeInfo.InstalledMemoryInGb;
                             usableMemoryInGb = nodeInfo.UsableMemoryInGb;
+                            buildInfo = nodeInfo.BuildInfo;
                         }
                     }
 
@@ -294,7 +318,8 @@ namespace Raven.Server.Commercial
                         UtilizedCores = newAssignedCores,
                         NumberOfCores = numberOfCores,
                         InstalledMemoryInGb = installedMemoryInGb,
-                        UsableMemoryInGb = usableMemoryInGb
+                        UsableMemoryInGb = usableMemoryInGb,
+                        BuildInfo = buildInfo
                     };
                 }
 
@@ -387,31 +412,19 @@ namespace Raven.Server.Commercial
             }
         }
 
-        public async Task Activate(License license, bool skipLeaseLicense, bool ensureNotPassive = true)
+        public async Task Activate(License license, bool skipLeaseLicense, bool ensureNotPassive = true, bool forceActivate = false)
         {
             var newLicenseStatus = GetLicenseStatus(license);
-
-            var licenseExpiration = newLicenseStatus.Expiration;
-            if (licenseExpiration.HasValue == false)
+            if (newLicenseStatus.Expiration.HasValue == false)
                 throw new LicenseExpiredException("License doesn't have an expiration date!");
 
-            if (licenseExpiration < DateTime.UtcNow)
+            if (forceActivate == false)
             {
-                if (skipLeaseLicense == false)
-                {
-                    // license expired, we'll try to update it
-                    license = await GetUpdatedLicense(license);
-                    if (license != null)
-                    {
-                        await Activate(license, skipLeaseLicense: true, ensureNotPassive: ensureNotPassive);
-                        return;
-                    }
-                }
-
-                throw new LicenseExpiredException($"License already expired on: {licenseExpiration}");
+                if (await ContinueActivatingLicense(
+                        license, skipLeaseLicense, ensureNotPassive,
+                        newLicenseStatus).ConfigureAwait(false) == false)
+                    return;
             }
-
-            ThrowIfCannotActivateLicense(newLicenseStatus);
 
             using (DisableCalculatingCoresCount())
             {
@@ -420,12 +433,9 @@ namespace Raven.Server.Commercial
 
                 try
                 {
+                    await _serverStore.PutLicenseAsync(license).ConfigureAwait(false);
 
-                    await _serverStore.PutLicenseAsync(license);
-
-                    _licenseStatus.Attributes = newLicenseStatus.Attributes;
-                    _licenseStatus.ErrorMessage = null;
-                    _licenseStatus.Id = license.Id;
+                    SetLicense(license.Id, newLicenseStatus.Attributes);
                 }
                 catch (Exception e)
                 {
@@ -442,6 +452,55 @@ namespace Raven.Server.Commercial
             }
 
             await CalculateLicenseLimits(forceFetchingNodeInfo: true, waitToUpdate: true);
+        }
+
+        private void ResetLicense(string error)
+        {
+            _licenseStatus = new LicenseStatus
+            {
+                FirstServerStartDate = _licenseStatus.FirstServerStartDate,
+                ErrorMessage = error,
+            };
+        }
+
+        private void SetLicense(Guid id, Dictionary<string, object> attributes)
+        {
+            _licenseStatus = new LicenseStatus
+            {
+                Id = id,
+                ErrorMessage = null,
+                Attributes = attributes,
+                FirstServerStartDate = _licenseStatus.FirstServerStartDate
+            };
+        }
+
+        private async Task<bool> ContinueActivatingLicense(License license, bool skipLeaseLicense, bool ensureNotPassive, LicenseStatus newLicenseStatus)
+        {
+            if (newLicenseStatus.Expired)
+            {
+                if (skipLeaseLicense == false)
+                {
+                    // Here we have an expired license, but it was valid once.
+                    // The user might rely on the license features and we want
+                    // to err on the side of the user in this case, so we'll accept
+                    // the features of the license, even before we check with the 
+                    // server
+                    SetLicense(license.Id, newLicenseStatus.Attributes);
+
+                    // license expired, we'll try to update it
+                    license = await GetUpdatedLicenseInternal(license);
+                    if (license != null)
+                    {
+                        await Activate(license, skipLeaseLicense: true, ensureNotPassive: ensureNotPassive);
+                        return false;
+                    }
+                }
+
+                throw new LicenseExpiredException($"License already expired on: {newLicenseStatus.Expiration}");
+            }
+
+            ThrowIfCannotActivateLicense(newLicenseStatus);
+            return true;
         }
 
         public LicenseStatus GetLicenseStatus(License license)
@@ -481,12 +540,12 @@ namespace Raven.Server.Commercial
             });
         }
 
-        public void TryActivateLicense()
+        public void TryActivateLicense(bool throwOnActivationFailure)
         {
             if (_licenseStatus.Type != LicenseType.None)
                 return;
 
-            var license = TryGetLicenseFromString() ?? TryGetLicenseFromPath();
+            var license = TryGetLicenseFromString(throwOnActivationFailure) ?? TryGetLicenseFromPath(throwOnActivationFailure);
             if (license == null)
                 return;
 
@@ -498,10 +557,13 @@ namespace Raven.Server.Commercial
             {
                 if (Logger.IsInfoEnabled)
                     Logger.Info("Failed to activate license", e);
+
+                if (throwOnActivationFailure)
+                    throw new LicenseActivationException("Failed to activate license", e);
             }
         }
 
-        private License TryGetLicenseFromPath()
+        private License TryGetLicenseFromPath(bool throwOnActivationFailure)
         {
             var path = _serverStore.Configuration.Licensing.LicensePath;
 
@@ -514,14 +576,19 @@ namespace Raven.Server.Commercial
             }
             catch (Exception e)
             {
+                var msg = $"Failed to read license from '{path.FullPath}' path.";
+
                 if (Logger.IsInfoEnabled)
-                    Logger.Info($"Failed to read license from '{path.FullPath}' path", e);
+                    Logger.Info(msg, e);
+
+                if (throwOnActivationFailure)
+                    throw new LicenseActivationException(msg, e);
             }
 
             return null;
         }
 
-        private License TryGetLicenseFromString()
+        private License TryGetLicenseFromString(bool throwOnActivationFailure)
         {
             var licenseString = _serverStore.Configuration.Licensing.License;
             if (string.IsNullOrWhiteSpace(licenseString))
@@ -536,8 +603,13 @@ namespace Raven.Server.Commercial
             }
             catch (Exception e)
             {
+                var msg = $"Failed to read license from '{RavenConfiguration.GetKey(x => x.Licensing.License)}' configuration.";
+
                 if (Logger.IsInfoEnabled)
-                    Logger.Info($"Failed to read license from '{RavenConfiguration.GetKey(x => x.Licensing.License)}' configuration", e);
+                    Logger.Info(msg, e);
+
+                if (throwOnActivationFailure)
+                    throw new LicenseActivationException(msg, e);
             }
 
             return null;
@@ -552,14 +624,18 @@ namespace Raven.Server.Commercial
             }
         }
 
-        private async Task<License> GetUpdatedLicense(License license)
+        public async Task<License> GetUpdatedLicense(
+            License currentLicense,
+            Func<HttpResponseMessage, Task> onFailure = null,
+            Func<LeasedLicense, License> onSuccess = null)
         {
             var leaseLicenseInfo = new LeaseLicenseInfo
             {
-                License = license,
-                BuildInfo = _buildInfo,
+                License = currentLicense,
+                BuildInfo = BuildInfo,
                 ClusterId = _serverStore.GetClusterTopology().TopologyId,
-                UtilizedCores = GetUtilizedCores()
+                UtilizedCores = GetUtilizedCores(),
+                NodeTag = _serverStore.NodeTag
             };
 
             var response = await ApiHttpClient.Instance.PostAsync("/api/v2/license/lease",
@@ -568,7 +644,11 @@ namespace Raven.Server.Commercial
 
             if (response.IsSuccessStatusCode == false)
             {
-                await HandleLeaseLicenseFailure(response).ConfigureAwait(false);
+                if (onFailure != null)
+                {
+                    await onFailure(response).ConfigureAwait(false);
+                }
+
                 return null;
             }
 
@@ -578,33 +658,52 @@ namespace Raven.Server.Commercial
                 var json = context.Read(leasedLicenseAsStream, "leased license info");
                 var leasedLicense = JsonDeserializationServer.LeasedLicense(json);
 
-                var newLicense = leasedLicense.License;
-                var licenseChanged =
-                    newLicense.Name != license.Name ||
-                    newLicense.Id != license.Id ||
-                    newLicense.Keys.All(license.Keys.Contains) == false;
+                if (onSuccess == null)
+                    return leasedLicense.License;
 
-                if (string.IsNullOrWhiteSpace(leasedLicense.Message) == false)
-                {
-                    var severity =
-                        leasedLicense.NotificationSeverity == NotificationSeverity.None ?
-                        NotificationSeverity.Info : leasedLicense.NotificationSeverity;
-                    var alert = AlertRaised.Create(
-                        null,
-                        leasedLicense.Title,
-                        leasedLicense.Message,
-                        AlertType.LicenseManager_LicenseUpdateMessage,
-                        severity);
-
-                    _serverStore.NotificationCenter.Add(alert);
-                }
-
-                if (string.IsNullOrWhiteSpace(leasedLicense.ErrorMessage) == false)
-                {
-                    _licenseStatus.ErrorMessage = leasedLicense.ErrorMessage;
-                }
-                return licenseChanged ? leasedLicense.License : null;
+                return onSuccess.Invoke(leasedLicense);
             }
+        }
+
+        private async Task<License> GetUpdatedLicenseInternal(License currentLicense)
+        {
+            return await GetUpdatedLicense(currentLicense,
+                    async response =>
+                    {
+                        var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                        AddLeaseLicenseError($"status code: {response.StatusCode}, response: {responseString}");
+                    },
+                    leasedLicense =>
+                    {
+                        var newLicense = leasedLicense.License;
+                        var licenseChanged =
+                            newLicense.Name != currentLicense.Name ||
+                            newLicense.Id != currentLicense.Id ||
+                            newLicense.Keys.All(currentLicense.Keys.Contains) == false;
+
+                        if (string.IsNullOrWhiteSpace(leasedLicense.Message) == false)
+                        {
+                            var severity =
+                                leasedLicense.NotificationSeverity == NotificationSeverity.None
+                                    ? NotificationSeverity.Info : leasedLicense.NotificationSeverity;
+                            var alert = AlertRaised.Create(
+                                null,
+                                leasedLicense.Title,
+                                leasedLicense.Message,
+                                AlertType.LicenseManager_LicenseUpdateMessage,
+                                severity);
+
+                            _serverStore.NotificationCenter.Add(alert);
+                        }
+
+                        if (string.IsNullOrWhiteSpace(leasedLicense.ErrorMessage) == false)
+                        {
+                            _licenseStatus.ErrorMessage = leasedLicense.ErrorMessage;
+                        }
+
+                        return licenseChanged ? leasedLicense.License : null;
+                    })
+                .ConfigureAwait(false);
         }
 
         private async Task ExecuteTasks()
@@ -638,11 +737,12 @@ namespace Raven.Server.Commercial
                 if (loadedLicense == null)
                     return;
 
-                var updatedLicense = await GetUpdatedLicense(loadedLicense);
+                var updatedLicense = await GetUpdatedLicenseInternal(loadedLicense);
                 if (updatedLicense == null)
                     return;
 
-                await Activate(updatedLicense, skipLeaseLicense: true);
+                // we'll activate the license from the license server
+                await Activate(updatedLicense, skipLeaseLicense: true, forceActivate: true);
 
                 var alert = AlertRaised.Create(
                     null,
@@ -655,18 +755,8 @@ namespace Raven.Server.Commercial
             }
             catch (Exception e)
             {
-                if (Logger.IsInfoEnabled)
-                    Logger.Info("Failed to lease license", e);
-
-                var alert = AlertRaised.Create(
-                    null,
-                    "Failed to lease license",
-                    "Could not lease license",
-                    AlertType.LicenseManager_LeaseLicenseError,
-                    NotificationSeverity.Warning,
-                    details: new ExceptionDetails(e));
-
-                _serverStore.NotificationCenter.Add(alert);
+                var message = e is HttpRequestException ? "failed to connect to api.ravendb.net" : "see exception details";
+                AddLeaseLicenseError(message, e);
 
                 if (forceUpdate)
                     throw;
@@ -693,7 +783,8 @@ namespace Raven.Server.Commercial
                     UtilizedCores = newNodeDetails.AssignedCores,
                     NumberOfCores = newNodeDetails.NumberOfCores,
                     InstalledMemoryInGb = newNodeDetails.InstalledMemoryInGb,
-                    UsableMemoryInGb = newNodeDetails.UsableMemoryInGb
+                    UsableMemoryInGb = newNodeDetails.UsableMemoryInGb,
+                    BuildInfo = newNodeDetails.BuildInfo
                 };
             }
 
@@ -708,6 +799,7 @@ namespace Raven.Server.Commercial
                     int numberOfCores;
                     double installedMemoryInGb;
                     double usableMemoryInGb;
+                    BuildNumber buildInfo;
                     var nodeTag = node.Key;
                     if (nodeTag == _serverStore.NodeTag)
                     {
@@ -715,6 +807,7 @@ namespace Raven.Server.Commercial
                         var memoryInfo = MemoryInformation.GetMemoryInfoInGb();
                         installedMemoryInGb = memoryInfo.InstalledMemory;
                         usableMemoryInGb = memoryInfo.UsableMemory;
+                        buildInfo = BuildInfo;
                     }
                     else
                     {
@@ -728,13 +821,16 @@ namespace Raven.Server.Commercial
                         numberOfCores = nodeInfo.NumberOfCores;
                         installedMemoryInGb = nodeInfo.InstalledMemoryInGb;
                         usableMemoryInGb = nodeInfo.UsableMemoryInGb;
+                        buildInfo = nodeInfo.BuildInfo;
                     }
 
                     var nodeDetailsExist = detailsPerNode.TryGetValue(nodeTag, out var nodeDetails);
                     if (nodeDetailsExist &&
                         nodeDetails.NumberOfCores == numberOfCores &&
                         nodeDetails.UsableMemoryInGb.Equals(usableMemoryInGb) &&
-                        nodeDetails.InstalledMemoryInGb.Equals(installedMemoryInGb))
+                        nodeDetails.InstalledMemoryInGb.Equals(installedMemoryInGb) &&
+                        // using static method here to avoid null checks 
+                        object.Equals(nodeDetails.BuildInfo, buildInfo))
                     {
                         // nodes hardware didn't change
                         continue;
@@ -745,7 +841,8 @@ namespace Raven.Server.Commercial
                     {
                         NumberOfCores = numberOfCores,
                         InstalledMemoryInGb = installedMemoryInGb,
-                        UsableMemoryInGb = usableMemoryInGb
+                        UsableMemoryInGb = usableMemoryInGb,
+                        BuildInfo = buildInfo
                     };
 
                     if (nodeDetailsExist == false)
@@ -849,21 +946,35 @@ namespace Raven.Server.Commercial
             }
         }
 
-        private async Task HandleLeaseLicenseFailure(HttpResponseMessage response)
+        private void AddLeaseLicenseError(string errorMessage, Exception exception = null)
         {
-            if (Logger.IsInfoEnabled == false || _skipLeasingErrorsLogging)
+            if (_skipLeasingErrorsLogging)
                 return;
 
-            var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+            if (_licenseStatus.Expired == false &&
+                _licenseStatus.Expiration != null &&
+                _licenseStatus.Expiration.Value.Subtract(DateTime.UtcNow).TotalDays > 3 &&
+                (exception == null || exception is HttpRequestException))
+            {
+                // ignore the error if the license isn't expired yet
+                // and we don't have access to api.ravendb.net from this machine
+                return;
+            }
+
+            const string title = "Failed to lease license";
+            if (Logger.IsInfoEnabled)
+            {
+                Logger.Info($"{title}, {errorMessage}", exception);
+            }
 
             var alert = AlertRaised.Create(
                 null,
-                "Lease license failure",
+                title,
                 "Could not lease license",
                 AlertType.LicenseManager_LeaseLicenseError,
                 NotificationSeverity.Warning,
                 details: new ExceptionDetails(
-                    new InvalidOperationException($"Status code: {response.StatusCode}, response: {responseString}")));
+                    new InvalidOperationException(errorMessage, exception)));
 
             _serverStore.NotificationCenter.Add(alert);
         }
@@ -922,6 +1033,10 @@ namespace Raven.Server.Commercial
 
                 process.ProcessorAffinity = new IntPtr(bitMask);
 
+                // changing the process affinity resets the thread affinity
+                // we need to change the threads affinity as well
+                PoolOfThreads.GlobalRavenThreadPool.SetThreadsAffinityIfNeeded();
+
                 if (addPerformanceHint &&
                     ProcessorInfo.ProcessorCount > cores)
                 {
@@ -941,18 +1056,21 @@ namespace Raven.Server.Commercial
             {
                 // nothing to do
             }
+            catch (NotSupportedException)
+            {
+                // nothing to do
+            }
             catch (Exception e)
             {
                 Logger.Info($"Failed to set affinity for {cores} cores, error code: {Marshal.GetLastWin32Error()}", e);
             }
         }
 
-       
         private static void SetMaxWorkingSet(Process process, double ramInGb)
         {
             try
             {
-                MemoryExtensions.SetWorkingSet(process, ramInGb, Logger);
+                Raven.Server.Extensions.MemoryExtensions.SetWorkingSet(process, ramInGb, Logger);
             }
             catch (Exception e)
             {
@@ -1237,7 +1355,7 @@ namespace Raven.Server.Commercial
                 return true;
 
             const string message = "Your current license doesn't include the dynamic database distribution feature";
-            GenerateLicenseLimit(LimitType.DynamicNodeDistribution, message, addNotification: true); 
+            GenerateLicenseLimit(LimitType.DynamicNodeDistribution, message, addNotification: true);
             return false;
         }
 
@@ -1259,7 +1377,7 @@ namespace Raven.Server.Commercial
             if (lastResponsibleNode == null)
                 return null;
 
-            if (databaseTopology.AllNodes.Count() > 1 &&
+            if (databaseTopology.Count > 1 &&
                 databaseTopology.Members.Contains(lastResponsibleNode) == false)
             {
                 var taskName = databaseTask.GetTaskName();
@@ -1372,33 +1490,66 @@ namespace Raven.Server.Commercial
             var leaseLicenseInfo = new LeaseLicenseInfo
             {
                 License = license,
-                BuildInfo = _buildInfo,
+                BuildInfo = BuildInfo,
                 ClusterId = _serverStore.GetClusterTopology().TopologyId,
                 UtilizedCores = GetUtilizedCores()
             };
 
-            var response = await ApiHttpClient.Instance.PostAsync("/api/v2/license/support",
-                    new StringContent(JsonConvert.SerializeObject(leaseLicenseInfo), Encoding.UTF8, "application/json"))
-                .ConfigureAwait(false);
-
-            if (response.IsSuccessStatusCode == false)
+            const int timeoutInSec = 5;
+            try
             {
-                var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                using (var cts = new CancellationTokenSource(timeoutInSec * 1000))
+                {
+                    var response = await ApiHttpClient.Instance.PostAsync("/api/v2/license/support",
+                            new StringContent(JsonConvert.SerializeObject(leaseLicenseInfo), Encoding.UTF8, "application/json"), cts.Token)
+                        .ConfigureAwait(false);
 
-                var message = $"Couldn't get license support info, response: {responseString}, status code: {response.StatusCode}";
-                if (Logger.IsInfoEnabled)
+                    if (response.IsSuccessStatusCode == false)
+                    {
+                        var responseString = await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+
+                        var message = $"Couldn't get license support info, response: {responseString}, status code: {response.StatusCode}";
+                        if (_skipLeasingErrorsLogging == false && Logger.IsInfoEnabled)
+                            Logger.Info(message);
+
+                        return GetDefaultLicenseSupportInfo();
+                    }
+
+                    var licenseSupportStream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
+                    using (var context = JsonOperationContext.ShortTermSingleUse())
+                    {
+                        var json = context.Read(licenseSupportStream, "license support info");
+                        return _lastKnownSupportInfo = JsonDeserializationServer.LicenseSupportInfo(json);
+                    }
+                }
+            }
+            catch (Exception e)
+            {
+                if (e is HttpRequestException == false && e is TaskCanceledException == false)
+                    throw;
+
+                // couldn't reach api.ravendb.net
+                if (_skipLeasingErrorsLogging == false && Logger.IsInfoEnabled)
+                {
+                    var message = @"Couldn't reach api.ravendb.net to get the support info";
+                    if (e is TaskCanceledException)
+                        message += $", the request was aborted after {timeoutInSec} seconds";
                     Logger.Info(message);
+                }
 
-                throw new InvalidOperationException(message);
+                return GetDefaultLicenseSupportInfo();
             }
+        }
 
-            var licenseSupportStream = await response.Content.ReadAsStreamAsync().ConfigureAwait(false);
-            using (var context = JsonOperationContext.ShortTermSingleUse())
+        private LicenseSupportInfo GetDefaultLicenseSupportInfo()
+        {
+            if (_lastKnownSupportInfo != null)
+                return _lastKnownSupportInfo;
+
+            return _lastKnownSupportInfo = new LicenseSupportInfo
             {
-                var json = context.Read(licenseSupportStream, "license support info");
-
-                return JsonDeserializationServer.LicenseSupportInfo(json);
-            }
+                Status = Status.NoSupport
+            };
         }
 
         public void AcceptEula()

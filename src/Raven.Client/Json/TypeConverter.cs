@@ -30,7 +30,9 @@ namespace Raven.Client.Json
             if (type == typeof(bool))
                 return value;
 
-            if (type == typeof(int) || type == typeof(long) || type == typeof(double) || type == typeof(decimal) || type == typeof(float))
+            if (type == typeof(int) || type == typeof(long) || type == typeof(double) || 
+                type == typeof(decimal) || type == typeof(float) || type == typeof(uint) || 
+                type == typeof(ulong) || type == typeof(short) || type == typeof(byte))
                 return value;
 
             if (type == typeof(LazyNumberValue))
@@ -45,8 +47,12 @@ namespace Raven.Client.Json
             if (type.GetTypeInfo().IsSubclassOf(typeof(Enum)))
                 return value.ToString();
 
-            var dictionary = value as IDictionary;
-            if (dictionary != null)
+            if (value is byte[] bytes)
+            {
+                return Convert.ToBase64String(bytes);
+            }
+
+            if (value is IDictionary dictionary)
             {
                 var @object = new DynamicJsonValue();
                 foreach (var key in dictionary.Keys)
@@ -55,11 +61,9 @@ namespace Raven.Client.Json
                 return @object;
             }
 
-            var enumerable = value as IEnumerable;
-            if (enumerable != null)
+            if (value is IEnumerable enumerable)
             {
-                var objectEnumerable = value as IEnumerable<object>;
-                var items = objectEnumerable != null
+                var items = value is IEnumerable<object> objectEnumerable
                     ? objectEnumerable.Select(x => ToBlittableSupportedType(x, conventions, context))
                     : enumerable.Cast<object>().Select(x => ToBlittableSupportedType(x, conventions, context));
 
@@ -70,10 +74,17 @@ namespace Raven.Client.Json
             {
                 var serializer = conventions.CreateSerializer();
 
+                writer.WriteStartObject();
+                writer.WritePropertyName("Value");
+
                 serializer.Serialize(writer, value);
+
+                writer.WriteEndObject();
+
                 writer.FinalizeDocument();
 
-                return writer.CreateReader();
+                var reader = writer.CreateReader();
+                return reader["Value"];
             }
         }
     }

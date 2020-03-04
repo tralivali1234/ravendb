@@ -19,17 +19,15 @@ namespace Raven.Client.Documents.Operations.Revisions
 
         public RavenCommand<ConfigureRevisionsOperationResult> GetCommand(DocumentConventions conventions, JsonOperationContext ctx)
         {
-            return new ConfigureRevisionsCommand(conventions, _configuration);
+            return new ConfigureRevisionsCommand(_configuration);
         }
 
         private class ConfigureRevisionsCommand : RavenCommand<ConfigureRevisionsOperationResult>
         {
-            private readonly DocumentConventions _conventions;
             private readonly RevisionsConfiguration _configuration;
 
-            public ConfigureRevisionsCommand(DocumentConventions conventions, RevisionsConfiguration configuration)
+            public ConfigureRevisionsCommand(RevisionsConfiguration configuration)
             {
-                _conventions = conventions;
                 _configuration = configuration;
             }
 
@@ -44,7 +42,7 @@ namespace Raven.Client.Documents.Operations.Revisions
                     Method = HttpMethod.Post,
                     Content = new BlittableJsonContent(stream =>
                     {
-                        var config = EntityToBlittable.ConvertEntityToBlittable(_configuration, _conventions, ctx);
+                        var config = EntityToBlittable.ConvertCommandToBlittable(_configuration, ctx);
                         ctx.Write(stream, config);
                     })
                 };
@@ -64,6 +62,6 @@ namespace Raven.Client.Documents.Operations.Revisions
 
     public class ConfigureRevisionsOperationResult
     {
-        public long? ETag { get; set; }
+        public long? RaftCommandIndex { get; set; }
     }
 }

@@ -38,6 +38,13 @@ namespace Voron
 
     public class StorageEnvironment : IDisposable
     {
+        internal class IndirectReference
+        {
+            public StorageEnvironment Owner;
+        }
+
+        internal IndirectReference SelfReference = new IndirectReference();
+
         public void QueueForSyncDataFile()
         {
             GlobalFlushingBehavior.GlobalFlusher.Value.MaybeSyncEnvironment(this);
@@ -52,7 +59,16 @@ namespace Voron
         /// This is the shared storage where we are going to store all the static constants for names.
         /// WARNING: This context will never be released, so only static constants should be added here.
         /// </summary>
-        public static readonly ByteStringContext LabelsContext = new ByteStringContext(SharedMultipleUseFlag.None, ByteStringContext.MinBlockSizeInBytes);
+        private static readonly ByteStringContext _labelsContext = new ByteStringContext(SharedMultipleUseFlag.None, ByteStringContext.MinBlockSizeInBytes);
+
+        public static IDisposable GetStaticContext(out ByteStringContext ctx)
+        {
+            Monitor.Enter(_labelsContext);
+
+            ctx = _labelsContext;
+
+            return new DisposableAction(() => Monitor.Exit(_labelsContext));
+        }
 
         private readonly StorageEnvironmentOptions _options;
 
@@ -107,6 +123,7 @@ namespace Voron
         {
             try
             {
+                SelfReference.Owner = this;
                 _log = LoggingSource.Instance.GetLogger<StorageEnvironment>(options.BasePath.FullPath);
                 _options = options;
                 _dataPager = options.DataPager;
@@ -402,6 +419,8 @@ namespace Voron
                 var result = Base64.ConvertToBase64ArrayUnpadded(pChars, (byte*)&databseGuidId, 0, 16);
                 Debug.Assert(result == 22);
             }
+
+            _options.SetEnvironmentId(databseGuidId);
         }
 
         public string Base64Id { get; } = new string(' ', 22);
@@ -413,6 +432,9 @@ namespace Voron
             {
                 Options = Options
             };
+
+            if (Options.SimulateFailureOnDbCreation)
+                ThrowSimulateFailureOnDbCreation();
 
             var transactionPersistentContext = new TransactionPersistentContext();
             using (var tx = NewLowLevelTransaction(transactionPersistentContext, TransactionFlags.ReadWrite))
@@ -453,13 +475,14 @@ namespace Voron
 
         public void Dispose()
         {
+
             if (_envDispose.IsSet)
                 return; // already disposed
 
             _cancellationTokenSource.Cancel();
             try
             {
-                GlobalFlushingBehavior.GlobalFlusher.Value.RemoveFromFlushQueues(this);
+                SelfReference.Owner = null;
 
                 if (_journal != null) // error during ctor
                 {
@@ -503,6 +526,9 @@ namespace Voron
             finally
             {
                 var errors = new List<Exception>();
+
+                OnLogsApplied = null;
+
                 foreach (var disposable in new IDisposable[]
                 {
                     _journal,
@@ -563,9 +589,9 @@ namespace Voron
             return new Transaction(newLowLevelTransaction);
         }
 
-        public Transaction WriteTransaction(TransactionPersistentContext transactionPersistentContext, ByteStringContext context = null)
+        public Transaction WriteTransaction(TransactionPersistentContext transactionPersistentContext, ByteStringContext context = null, TimeSpan? timeout = null)
         {
-            var writeTransaction = new Transaction(NewLowLevelTransaction(transactionPersistentContext, TransactionFlags.ReadWrite, context, null));
+            var writeTransaction = new Transaction(NewLowLevelTransaction(transactionPersistentContext, TransactionFlags.ReadWrite, context, timeout));
             return writeTransaction;
         }
 
@@ -613,7 +639,7 @@ namespace Voron
 
                     _cancellationTokenSource.Token.ThrowIfCancellationRequested();
 
-                    _currentWriteTransactionHolder = NativeMemory.ThreadAllocations.Value;
+                    _currentWriteTransactionHolder = NativeMemory.CurrentThreadStats;
                     WriteTransactionStarted();
 
                     if (_endOfDiskSpace != null)
@@ -682,7 +708,7 @@ namespace Voron
         {
             var currentWriteTransactionHolder = _currentWriteTransactionHolder;
             if (currentWriteTransactionHolder != null && 
-                currentWriteTransactionHolder == NativeMemory.ThreadAllocations.Value)
+                currentWriteTransactionHolder == NativeMemory.CurrentThreadStats)
             {
                 throw new InvalidOperationException($"A write transaction is already opened by thread name: " +
                                                     $"{currentWriteTransactionHolder.Name}, Id: {currentWriteTransactionHolder.Id}");
@@ -717,7 +743,7 @@ namespace Voron
                 throw new TimeoutException("Tried and failed to get the tx lock with no timeout, someone else is holding the lock, will retry later...");
 
             var copy = _currentWriteTransactionHolder;
-            if (copy == NativeMemory.ThreadAllocations.Value)
+            if (copy == NativeMemory.CurrentThreadStats)
             {
                 throw new InvalidOperationException("A write transaction is already opened by this thread");
             }
@@ -733,7 +759,7 @@ namespace Voron
         private void ThrowOnTimeoutWaitingForReadFlushingInProgressLock(TimeSpan wait)
         {
             var copy = Journal.CurrentFlushingInProgressHolder;
-            if (copy == NativeMemory.ThreadAllocations.Value)
+            if (copy == NativeMemory.CurrentThreadStats)
             {
                 throw new InvalidOperationException("Flushing is already being performed by this thread");
             }
@@ -888,7 +914,9 @@ namespace Voron
                 NextPageNumber = NextPageNumber,
                 CountOfTrees = countOfTrees,
                 CountOfTables = countOfTables,
-                Journals = Journal.Files.ToList()
+                Journals = Journal.Files.ToList(),
+                TempPath = Options.TempPath,
+                JournalPath = (Options as StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)?.JournalPath
             });
         }
 
@@ -952,7 +980,9 @@ namespace Voron
                 FixedSizeTrees = fixedSizeTrees,
                 Tables = tables,
                 CalculateExactSizes = calculateExactSizes,
-                ScratchBufferPoolInfo = _scratchBufferPool.InfoForDebug(PossibleOldestReadTransaction(tx.LowLevelTransaction))
+                ScratchBufferPoolInfo = _scratchBufferPool.InfoForDebug(PossibleOldestReadTransaction(tx.LowLevelTransaction)),
+                TempPath = Options.TempPath,
+                JournalPath = (Options as StorageEnvironmentOptions.DirectoryStorageEnvironmentOptions)?.JournalPath
             });
         }
 
@@ -1056,6 +1086,9 @@ namespace Voron
             // No need to call EnsureMapped here. ValidatePageChecksum is only called for pages in the datafile, 
             // which we already got using AcquirePagePointerWithOverflowHandling()
 
+            if (pageNumber != current->PageNumber)
+                ThrowInvalidPageNumber(pageNumber, current);
+
             ulong checksum = CalculatePageChecksum((byte*)current, current->PageNumber, current->Flags, current->OverflowSize);
 
             if (checksum == current->Checksum)
@@ -1064,10 +1097,35 @@ namespace Voron
             ThrowInvalidChecksum(pageNumber, current, checksum);
         }
 
+        private static unsafe void ThrowInvalidPageNumber(long pageNumber, PageHeader* current)
+        {
+            var message = $"When reading page {pageNumber}, we read a page with header of page {current->PageNumber}. ";
+
+            message += $"Page flags: {current->Flags}. ";
+
+            if ((current->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                message += $"Overflow size: {current->OverflowSize}. ";
+
+            throw new InvalidDataException(message);
+        }
+
         private unsafe void ThrowInvalidChecksum(long pageNumber, PageHeader* current, ulong checksum)
         {
-            throw new InvalidDataException(
-                $"Invalid checksum for page {pageNumber}, data file {_options.DataPager} might be corrupted, expected hash to be {current->Checksum} but was {checksum}");
+            var message = $"Invalid checksum for page {pageNumber}, data file {_options.DataPager} might be corrupted, expected hash to be {current->Checksum} but was {checksum}. ";
+
+            message += $"Page flags: {current->Flags}. ";
+
+            if ((current->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                message += $"Overflow size: {current->OverflowSize}. ";
+
+            throw new InvalidDataException(message);
+        }
+
+        public static unsafe ulong CalculatePageChecksum(byte* ptr, long pageNumber, out ulong expectedChecksum)
+        {
+            var header = (PageHeader*)(ptr);
+            expectedChecksum = header->Checksum;
+            return CalculatePageChecksum(ptr, pageNumber, header->Flags, header->OverflowSize);
         }
 
         public static unsafe ulong CalculatePageChecksum(byte* ptr, long pageNumber, PageFlags flags, int overflowSize)
@@ -1221,6 +1279,11 @@ namespace Voron
             Debug.Assert(tx.Flags == TransactionFlags.Read);
             _envDispose.Signal();
             tx.AlreadyAllowedDisposeWithLazyTransactionRunning = true;
+        }
+
+        private static void ThrowSimulateFailureOnDbCreation()
+        {
+            throw new InvalidOperationException("Simulation of db creation failure");
         }
     }
 }

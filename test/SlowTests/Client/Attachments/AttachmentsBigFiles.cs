@@ -5,6 +5,7 @@ using Raven.Client.Documents.Operations;
 using Raven.Client.Documents.Operations.Attachments;
 using Raven.Server.Utils;
 using Raven.Tests.Core.Utils.Entities;
+using Sparrow.Platform;
 using Xunit;
 
 namespace SlowTests.Client.Attachments
@@ -23,7 +24,7 @@ namespace SlowTests.Client.Attachments
                 using (var session = store.OpenSession())
                 using (var stream = new BigDummyStream(size))
                 {
-                    var user = new User {Name = "Fitzchak"};
+                    var user = new User { Name = "Fitzchak" };
                     session.Store(user, "users/1");
 
                     session.Advanced.Attachments.Store(user, "big-file", stream);
@@ -38,13 +39,14 @@ namespace SlowTests.Client.Attachments
                     using (var bigStream = new BigDummyStream(size))
                     using (var attachment = session.Advanced.Attachments.Get(user, "big-file"))
                     {
-                        attachment.Stream.CopyTo(bigStream);
                         Assert.Contains("A:2", attachment.Details.ChangeVector);
                         Assert.Equal("big-file", attachment.Details.Name);
                         Assert.Equal(hash, attachment.Details.Hash);
-                        Assert.Equal(size, bigStream.Position);
                         Assert.Equal(size, attachment.Details.Size);
                         Assert.Equal("", attachment.Details.ContentType);
+
+                        attachment.Stream.CopyTo(bigStream);
+                        Assert.Equal(size, bigStream.Position);
                     }
                 }
             }
@@ -61,7 +63,7 @@ namespace SlowTests.Client.Attachments
 
                 using (var session = store.OpenSession())
                 {
-                    session.Store(new User {Name = "Fitzchak"}, "users/1");
+                    session.Store(new User { Name = "Fitzchak" }, "users/1");
                     session.SaveChanges();
                 }
 

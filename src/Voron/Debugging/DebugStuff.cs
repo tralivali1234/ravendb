@@ -1,6 +1,7 @@
 ﻿using System;
 using System.Diagnostics;
 using System.IO;
+using Sparrow.Platform;
 using Voron.Data;
 using Voron.Data.BTrees;
 using Voron.Data.Fixed;
@@ -136,37 +137,42 @@ namespace Voron.Debugging
             var tree = fst.Parent;
             RenderHtmlTreeView(writer =>
             {
-                var ptr = tree.DirectRead(name);
-                if (ptr == null)
-                {
-                    writer.WriteLine("<p>empty fixed size tree</p>");
-                }
-                else if (((FixedSizeTreeHeader.Embedded*)ptr)->RootObjectType == RootObjectType.EmbeddedFixedSizeTree)
-                {
-                    var header = ((FixedSizeTreeHeader.Embedded*)ptr);
-                    writer.WriteLine("<p>Number of entries: {0:#,#;;0}, val size: {1:#,#;;0}.</p>", header->NumberOfEntries, header->ValueSize);
-                    writer.WriteLine("<ul>");
-                    var dataStart = ptr + sizeof(FixedSizeTreeHeader.Embedded);
-                    for (int i = 0; i < header->NumberOfEntries; i++)
-                    {
-                        var key = *(long*)(dataStart + ((sizeof(long) + header->ValueSize) * i));
-                        writer.WriteLine("<li>{0:#,#;;0}</li>", key);
-                    }
-                    writer.WriteLine("</ul>");
-                }
-                else
-                {
-                    var header = (FixedSizeTreeHeader.Large*)ptr;
-                    writer.WriteLine("<p>Number of entries: {0:#,#;;0}, val size: {1:#,#;;0}.</p>", header->NumberOfEntries, header->ValueSize);
-                    writer.WriteLine("<div class='css-treeview'><ul>");
-
-                    var page = fst.GetReadOnlyPage(header->RootPageNumber);
-
-                    RenderFixedSizeTreePage(tx, page, writer, header, "Root", true);
-
-                    writer.WriteLine("</ul></div>");
-                }
+                DumpFixedSizeTreeToStream(tx, fst, writer, name, tree);
             });
+        }
+
+        private static unsafe void DumpFixedSizeTreeToStream(LowLevelTransaction tx, FixedSizeTree fst, TextWriter writer, Slice name, Tree tree)
+        {
+            var ptr = tree.DirectRead(name);
+            if (ptr == null)
+            {
+                writer.WriteLine("<p>empty fixed size tree</p>");
+            }
+            else if (((FixedSizeTreeHeader.Embedded*)ptr)->RootObjectType == RootObjectType.EmbeddedFixedSizeTree)
+            {
+                var header = ((FixedSizeTreeHeader.Embedded*)ptr);
+                writer.WriteLine("<p>Number of entries: {0:#,#;;0}, val size: {1:#,#;;0}.</p>", header->NumberOfEntries, header->ValueSize);
+                writer.WriteLine("<ul>");
+                var dataStart = ptr + sizeof(FixedSizeTreeHeader.Embedded);
+                for (int i = 0; i < header->NumberOfEntries; i++)
+                {
+                    var key = *(long*)(dataStart + ((sizeof(long) + header->ValueSize) * i));
+                    writer.WriteLine("<li>{0:#,#;;0}</li>", key);
+                }
+                writer.WriteLine("</ul>");
+            }
+            else
+            {
+                var header = (FixedSizeTreeHeader.Large*)ptr;
+                writer.WriteLine("<p>Number of entries: {0:#,#;;0}, val size: {1:#,#;;0}.</p>", header->NumberOfEntries, header->ValueSize);
+                writer.WriteLine("<div class='css-treeview'><ul>");
+
+                var page = fst.GetReadOnlyPage(header->RootPageNumber);
+
+                RenderFixedSizeTreePage(tx, page, writer, header, "Root", true);
+
+                writer.WriteLine("</ul></div>");
+            }
         }
 
         private static void RenderHtmlTreeView(Action<TextWriter> action)
@@ -183,18 +189,33 @@ namespace Voron.Debugging
                 sw.WriteLine("</body></html>");
                 sw.Flush();
             }
-            var process = new Process
+
+            if (PlatformDetails.RunningOnPosix == false)
             {
-                StartInfo =
+                var process = new Process
                 {
-                    FileName = @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-                    Arguments = output,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    RedirectStandardError = true,
-                }
-            };
-            process.Start();
+                    StartInfo =
+                    {
+                        FileName = @"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                        Arguments = output,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        RedirectStandardError = true,
+                    }
+                };
+                process.Start();
+                return;
+            }
+
+            if (PlatformDetails.RunningOnMacOsx)
+            {
+                Process.Start("open", output);
+            }
+            else
+            {
+                Process.Start("xdg-open", output);
+            }
+
         }
 
         private unsafe static void RenderFixedSizeTreePage(LowLevelTransaction tx, FixedSizeTreePage page, TextWriter sw, FixedSizeTreeHeader.Large* header, string text, bool open)
@@ -271,6 +292,22 @@ namespace Voron.Debugging
                 writer.WriteLine("</ul></div>");
             });
         }
+
+        public static void DumpFixedSizedTreeToStream(LowLevelTransaction tx, FixedSizeTree tree, Stream stream)
+        {
+            var headerData = $"{tree.Name} ({tree.Type}) {tree.NumberOfEntries} entries, depth: {tree.Depth}, {tree.PageCount} pages.";
+
+            WriteHtml(new StreamWriter(stream), writer =>
+            {
+                writer.WriteLine(headerData);
+                writer.WriteLine("<div class='css-treeview'><ul>");
+
+                DumpFixedSizeTreeToStream(tx, tree, writer, tree.Name, tree.Parent);
+
+                writer.WriteLine("</ul></div>");
+            });
+        }
+
 
         private static void WriteHtml(TextWriter sw, Action<TextWriter> action)
         {

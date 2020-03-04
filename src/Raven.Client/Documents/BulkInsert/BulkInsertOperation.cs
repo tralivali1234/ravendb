@@ -46,7 +46,7 @@ namespace Raven.Client.Documents.BulkInsert
             {
                 if (_done.TrySetResult(null) == false)
                 {
-                    throw new BulkInsertProtocolViolationException("Unable to close the stream");
+                    throw new BulkInsertProtocolViolationException("Unable to close the stream", _done.Task.Exception);
                 }
             }
 
@@ -189,20 +189,7 @@ namespace Raven.Client.Documents.BulkInsert
                         }
                         catch (Exception e)
                         {
-                            var errors = new List<Exception>(3)
-                            {
-                                e
-                            };
-                            if (flushEx != null)
-                                errors.Add(flushEx);
-                            var error = await GetExceptionFromOperation().ConfigureAwait(false);
-                            if (error != null)
-                            {
-                                errors.Add(error);
-                            }
-
-                            errors.Reverse();
-                            throw new BulkInsertAbortedException("Failed to execute bulk insert", new AggregateException(errors));
+                            await ThrowBulkInsertAborted(e, flushEx).ConfigureAwait(false);
                         }
                     }
                 }
@@ -226,6 +213,23 @@ namespace Raven.Client.Documents.BulkInsert
 
             _generateEntityIdOnTheClient = new GenerateEntityIdOnTheClient(_requestExecutor.Conventions,
                 entity => AsyncHelpers.RunSync(() => _requestExecutor.Conventions.GenerateDocumentIdAsync(database, entity)));
+        }
+
+        private async Task ThrowBulkInsertAborted(Exception e, Exception flushEx = null)
+        {
+            var errors = new List<Exception>(3);
+
+            var error = await GetExceptionFromOperation().ConfigureAwait(false);
+
+            if (error != null)
+                errors.Add(error);
+
+            if (flushEx != null)
+                errors.Add(flushEx);
+
+            errors.Add(e);
+
+            throw new BulkInsertAbortedException("Failed to execute bulk insert", new AggregateException(errors));
         }
 
         private async Task WaitForId()
@@ -273,6 +277,18 @@ namespace Raven.Client.Documents.BulkInsert
                     await EnsureStream().ConfigureAwait(false);
                 }
 
+                if (_bulkInsertExecuteTask.IsFaulted)
+                {
+                    try
+                    {
+                        await _bulkInsertExecuteTask.ConfigureAwait(false);
+                    }
+                    catch (Exception e)
+                    {
+                        await ThrowBulkInsertAborted(e).ConfigureAwait(false);
+                    }
+                }
+
                 if (metadata == null)
                     metadata = new MetadataAsDictionary();
 
@@ -298,9 +314,9 @@ namespace Raven.Client.Documents.BulkInsert
                 _first = false;
                 try
                 {
-                    _currentWriter.Write("{'Id':'");
-                    _currentWriter.Write(id);
-                    _currentWriter.Write("','Type':'PUT','Document':");
+                    _currentWriter.Write("{\"Id\":\"");
+                    WriteId(_currentWriter, id);
+                    _currentWriter.Write("\",\"Type\":\"PUT\",\"Document\":");
 
                     if (_customEntitySerializer == null || _customEntitySerializer(entity, metadata, _currentWriter) == false)
                     {
@@ -346,6 +362,21 @@ namespace Raven.Client.Documents.BulkInsert
             finally
             {
                 Interlocked.CompareExchange(ref _concurrentCheck, 0, 1);
+            }
+
+            void WriteId(StreamWriter writer, string input)
+            {
+                for (var i = 0; i < input.Length; i++)
+                {
+                    var c = input[i];
+                    if (c == '"')
+                    {
+                        if (i == 0 || input[i - 1] != '\\')
+                            writer.Write("\\");
+                    }
+
+                    writer.Write(c);
+                }
             }
         }
 

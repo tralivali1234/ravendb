@@ -8,8 +8,8 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using Newtonsoft.Json;
-using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Session;
+using Raven.Client.Exceptions.Security;
 using Raven.Server.Documents;
 using Raven.Server.Json;
 using Raven.Server.ServerWide.Context;
@@ -62,7 +62,7 @@ namespace Raven.Server.Smuggler.Migration
         {
             using (Database.ServerStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
             {
-                var operationStateBlittable = EntityToBlittable.ConvertEntityToBlittable(lastEtagsInfo, DocumentConventions.Default, context);
+                var operationStateBlittable = EntityToBlittable.ConvertCommandToBlittable(lastEtagsInfo, context);
                 await SaveLastOperationState(operationStateBlittable);
             }
         }
@@ -85,7 +85,7 @@ namespace Raven.Server.Smuggler.Migration
             }, apiKey, serverUrl, enableBasicAuthenticationOverUnsecuredHttp, httpClient, isLegacyOAuthToken);
             
             if (response.StatusCode == HttpStatusCode.Unauthorized)
-                throw new UnauthorizedAccessException();
+                throw new AuthorizationException();
 
             if (response.IsSuccessStatusCode == false)
             {

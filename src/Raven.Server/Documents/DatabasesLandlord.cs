@@ -41,8 +41,11 @@ namespace Raven.Server.Documents
             _serverStore = serverStore;
             _databaseSemaphore = new SemaphoreSlim(_serverStore.Configuration.Databases.MaxConcurrentLoads);
             _concurrentDatabaseLoadTimeout = _serverStore.Configuration.Databases.ConcurrentLoadTimeout.AsTimeSpan;
-            _logger = LoggingSource.Instance.GetLogger<DatabasesLandlord>("Raven/Server");
+            _logger = LoggingSource.Instance.GetLogger<DatabasesLandlord>("Server");
+            CatastrophicFailureHandler = new CatastrophicFailureHandler(this, _serverStore);
         }
+
+        public CatastrophicFailureHandler CatastrophicFailureHandler { get; }
 
         public void ClusterOnDatabaseChanged(object sender, (string DatabaseName, long Index, string Type) t)
         {
@@ -195,17 +198,17 @@ namespace Raven.Server.Documents
                     {
                         DatabaseHelper.DeleteDatabaseFiles(configuration);
                     }
+                }
 
-                    // At this point the db record still exists but the db was effectively deleted 
-                    // from this node so we can also remove its secret key from this node.
-                    if (record.Encrypted)
+                // At this point the db record still exists but the db was effectively deleted 
+                // from this node so we can also remove its secret key from this node.
+                if (record.Encrypted)
+                {
+                    using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
+                    using (var tx = context.OpenWriteTransaction())
                     {
-                        using (_serverStore.ContextPool.AllocateOperationContext(out TransactionOperationContext context))
-                        using (var tx = context.OpenWriteTransaction())
-                        {
-                            _serverStore.DeleteSecretKey(context, dbName);
-                            tx.Commit();
-                        }
+                        _serverStore.DeleteSecretKey(context, dbName);
+                        tx.Commit();
                     }
                 }
 
@@ -593,7 +596,7 @@ namespace Raven.Server.Documents
         protected RavenConfiguration CreateConfiguration(DatabaseRecord record)
         {
             Debug.Assert(_serverStore.Disposed == false);
-            var config = RavenConfiguration.CreateFrom(_serverStore.Configuration, record.DatabaseName, ResourceType.Database);
+            var config = RavenConfiguration.CreateForDatabase(_serverStore.Configuration, record.DatabaseName);
 
             foreach (var setting in record.Settings)
                 config.SetSetting(setting.Key, setting.Value);
@@ -622,38 +625,6 @@ namespace Raven.Server.Documents
             }
 
             return maxLastWork.AddMilliseconds(dbSize / 1024L);
-        }
-
-        public void UnloadResourceOnCatastrophicFailure(string databaseName, Exception e)
-        {
-            Task.Run(async () =>
-            {
-                var title = $"Critical error in '{databaseName}'";
-                const string message = "Database is about to be unloaded due to an encountered error";
-
-                try
-                {
-                    _serverStore.NotificationCenter.Add(AlertRaised.Create(
-                        databaseName,
-                        title,
-                        message,
-                        AlertType.CatastrophicDatabaseFailure,
-                        NotificationSeverity.Error,
-                        key: databaseName,
-                        details: new ExceptionDetails(e)));
-                }
-                catch (Exception)
-                {
-                    // exception in raising an alert can't prevent us from unloading a database
-                }
-
-                if (_logger.IsOperationsEnabled)
-                    _logger.Operations($"{title}. {message}", e);
-
-                await Task.Delay(2000); // let it propagate the exception to the client first
-
-                (await UnloadAndLockDatabase(databaseName, "CatastrophicFailure"))?.Dispose();
-            });
         }
 
         public async Task<IDisposable> UnloadAndLockDatabase(string dbName, string reason)

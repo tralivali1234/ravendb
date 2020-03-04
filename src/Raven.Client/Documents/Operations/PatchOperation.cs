@@ -51,7 +51,12 @@ namespace Raven.Client.Documents.Operations
 
         public RavenCommand<PatchResult> GetCommand(IDocumentStore store, DocumentConventions conventions, JsonOperationContext context, HttpCache cache)
         {
-            return new PatchCommand(conventions, context, _id, _changeVector, _patch, _patchIfMissing, _skipPatchIfChangeVectorMismatch, returnDebugInformation: false, test: false);
+            return new PatchCommand(conventions, context, _id, _changeVector, _patch, _patchIfMissing, _skipPatchIfChangeVectorMismatch, returnDebugInformation:false, test: false);
+        }
+
+        public RavenCommand<PatchResult> GetCommand(IDocumentStore store, DocumentConventions conventions, JsonOperationContext context, HttpCache cache, bool returnDebugInformation , bool test)
+        {
+            return new PatchCommand(conventions, context, _id, _changeVector, _patch, _patchIfMissing, _skipPatchIfChangeVectorMismatch, returnDebugInformation, test);
         }
 
         internal class PatchCommand : RavenCommand<PatchResult>
@@ -77,11 +82,11 @@ namespace Raven.Client.Documents.Operations
                     throw new ArgumentNullException(nameof(context));
                 _id = id ?? throw new ArgumentNullException(nameof(id));
                 _changeVector = changeVector;
-                _patch = EntityToBlittable.ConvertEntityToBlittable(new
+                _patch = EntityToBlittable.ConvertCommandToBlittable(new
                 {
                     Patch = patch,
                     PatchIfMissing = patchIfMissing
-                }, conventions, context);
+                },context);
                 _skipPatchIfChangeVectorMismatch = skipPatchIfChangeVectorMismatch;
                 _returnDebugInformation = returnDebugInformation;
                 _test = test;

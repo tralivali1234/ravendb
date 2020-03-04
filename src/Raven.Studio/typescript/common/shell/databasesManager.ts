@@ -129,7 +129,6 @@ class databasesManager {
         this.fetchClientBuildVersion();
         shell.fetchLicenseStatus();
         this.fetchSupportCoverage();
-        this.loadServerConfig();
         this.fetchClusterTopology();
         */
 
@@ -213,6 +212,18 @@ class databasesManager {
                     if (xhr.status === 404) {
                         this.onDatabaseDeleted(db);
                     }
+                })
+                .done((info: Raven.Client.ServerWide.Operations.DatabaseInfo) => {
+                    // check if database if still relevant on this node
+                    const localTag = clusterTopologyManager.default.localNodeTag();
+                    
+                    const relevant = !!info.NodesTopology.Members.find(x => x.NodeTag === localTag)
+                        || !!info.NodesTopology.Promotables.find(x => x.NodeTag === localTag)
+                        || !!info.NodesTopology.Rehabs.find(x => x.NodeTag === localTag);
+                    
+                    if (!relevant) {
+                        this.onNoLongerRelevant(db);
+                    }
                 });
 
         } else if (event.ChangeType === "Put") {
@@ -247,6 +258,10 @@ class databasesManager {
         this.onDatabaseDeletedCallbacks.forEach(callback => {
             callback(db.qualifier, db.name);
         });
+    }
+    
+    private onNoLongerRelevant(db: database) {
+        changesContext.default.disconnectIfCurrent(db, "DatabaseIsNotRelevant");
     }
    
 }

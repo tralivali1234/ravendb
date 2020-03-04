@@ -3,7 +3,6 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Threading;
 using FastTests;
-using Raven.Client.Documents.Conventions;
 using Raven.Client.Documents.Operations.Revisions;
 using Raven.Client.Documents.Session;
 using Raven.Client.Documents.Subscriptions;
@@ -35,7 +34,9 @@ select project(d)
 "
                 });
 
-                var subscription = store.Subscriptions.GetSubscriptionWorker<User>(new SubscriptionWorkerOptions(subscriptionId));
+                var subscription = store.Subscriptions.GetSubscriptionWorker<User>(new SubscriptionWorkerOptions(subscriptionId) {
+                    TimeToWaitBeforeConnectionRetry = TimeSpan.FromSeconds(5)
+                });
 
                 var exceptions = new List<Exception>();
 
@@ -107,8 +108,7 @@ select project(d)
 
                     AsyncHelpers.RunSync(() => Server.ServerStore.ModifyDatabaseRevisions(context,
                         store.Database,
-                        EntityToBlittable.ConvertEntityToBlittable(configuration,
-                            new DocumentConventions(),
+                        EntityToBlittable.ConvertCommandToBlittable(configuration,
                             context)));
                 }
 
@@ -124,7 +124,9 @@ select project(d)
 "
                 });
 
-                var subscription = store.Subscriptions.GetSubscriptionWorker<User>(new SubscriptionWorkerOptions(subscriptionId));
+                var subscription = store.Subscriptions.GetSubscriptionWorker<User>(new SubscriptionWorkerOptions(subscriptionId) {
+                    TimeToWaitBeforeConnectionRetry = TimeSpan.FromSeconds(5)
+                });
 
                 var exceptions = new List<Exception>();
 

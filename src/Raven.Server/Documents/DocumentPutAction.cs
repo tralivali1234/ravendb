@@ -11,9 +11,9 @@ using Sparrow.Json;
 using Sparrow.Json.Parsing;
 using Voron;
 using Voron.Data.Tables;
-using Voron.Exceptions;
 using System.Linq;
 using Raven.Client.Documents.Operations.Revisions;
+using Raven.Client.Exceptions;
 using Sparrow;
 using static Raven.Server.Documents.DocumentsStorage;
 
@@ -41,7 +41,7 @@ namespace Raven.Server.Documents
             if (context.Transaction == null)
             {
                 ThrowRequiresTransaction();
-                return default(PutOperationResults); // never hit
+                return default; // never hit
             }
 
 #if DEBUG
@@ -59,7 +59,7 @@ namespace Raven.Server.Documents
             {
                 var collectionName = _documentsStorage.ExtractCollectionName(context, document);
                 var table = context.Transaction.InnerTransaction.OpenTable(DocsSchema, collectionName.GetTableName(CollectionTableType.Documents));
-            
+
                 var oldValue = default(TableValueReader);
                 if (knownNewId == false)
                 {
@@ -83,7 +83,7 @@ namespace Raven.Server.Documents
                     // null - means, don't care, don't check
                     // "" / empty - means, must be new
                     // anything else - must match exactly
-                    if (expectedChangeVector != null) 
+                    if (expectedChangeVector != null)
                     {
                         var oldChangeVector = TableValueToChangeVector(context, (int)DocumentsTable.ChangeVector, ref oldValue);
                         if (string.Compare(expectedChangeVector, oldChangeVector, StringComparison.Ordinal) != 0)
@@ -140,9 +140,9 @@ namespace Raven.Server.Documents
                         AttachmentsStorage.AssertAttachments(document, flags);
 #endif
                     }
-                    
-                    if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false && 
-                        (flags.Contain(DocumentFlags.Resolved) || 
+
+                    if (nonPersistentFlags.Contain(NonPersistentDocumentFlags.FromReplication) == false &&
+                        (flags.Contain(DocumentFlags.Resolved) ||
                         _documentDatabase.DocumentsStorage.RevisionsStorage.Configuration != null
                         ))
                     {
@@ -150,8 +150,7 @@ namespace Raven.Server.Documents
                             ref flags, out RevisionsCollectionConfiguration configuration);
                         if (shouldVersion)
                         {
-                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, document, flags, nonPersistentFlags,
-                                changeVector, modifiedTicks, configuration, collectionName);
+                            _documentDatabase.DocumentsStorage.RevisionsStorage.Put(context, id, document, flags, nonPersistentFlags, changeVector, modifiedTicks, configuration, collectionName);
                         }
                     }
                 }
@@ -281,7 +280,7 @@ namespace Raven.Server.Documents
                 }
 
                 if (lastChar == '/')
-                {                    
+                {
                     string nodeTag = _documentDatabase.ServerStore.NodeTag;
 
                     // PERF: we are creating an string and mutating it for performance reasons.
@@ -463,17 +462,28 @@ namespace Raven.Server.Documents
         [Conditional("DEBUG")]
         public static void AssertMetadataWasFiltered(BlittableJsonReaderObject data)
         {
-            if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false)
-                return;
+            var originalNoCacheValue = data.NoCache;
 
-            var names = metadata.GetPropertyNames();
-            if (names.Contains(Constants.Documents.Metadata.Id, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.LastModified, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.IndexScore, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.ChangeVector, StringComparer.OrdinalIgnoreCase) ||
-                names.Contains(Constants.Documents.Metadata.Flags, StringComparer.OrdinalIgnoreCase))
+            data.NoCache = true;
+
+            try
             {
-                throw new InvalidOperationException("Document's metadata should filter properties on before put to storage." + Environment.NewLine + data);
+                if (data.TryGet(Constants.Documents.Metadata.Key, out BlittableJsonReaderObject metadata) == false)
+                    return;
+
+                var names = metadata.GetPropertyNames();
+                if (names.Contains(Constants.Documents.Metadata.Id, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.LastModified, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.IndexScore, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.ChangeVector, StringComparer.OrdinalIgnoreCase) ||
+                    names.Contains(Constants.Documents.Metadata.Flags, StringComparer.OrdinalIgnoreCase))
+                {
+                    throw new InvalidOperationException("Document's metadata should filter properties on before put to storage." + Environment.NewLine + data);
+                }
+            }
+            finally
+            {
+                data.NoCache = originalNoCacheValue;
             }
         }
     }

@@ -13,6 +13,7 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Threading;
 using System.Threading.Tasks;
+using Lambda2Js;
 using Newtonsoft.Json;
 using Raven.Client.Documents.Commands;
 using Raven.Client.Documents.Commands.Batches;
@@ -73,7 +74,7 @@ namespace Raven.Client.Documents.Session
         /// <summary>
         /// Entities whose id we already know do not exists, because they are a missing include, or a missing load, etc.
         /// </summary>
-        private readonly HashSet<string> _knownMissingIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        protected readonly HashSet<string> _knownMissingIds = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         private Dictionary<string, object> _externalState;
 
@@ -205,6 +206,11 @@ namespace Raven.Client.Documents.Session
             GenerateEntityIdOnTheClient = new GenerateEntityIdOnTheClient(_requestExecutor.Conventions, GenerateId);
             EntityToBlittable = new EntityToBlittable(this);
             SessionInfo = new SessionInfo(_clientSessionId, false);
+
+            _javascriptCompilationOptions = new JavascriptCompilationOptions
+            {
+                CustomMetadataProvider = new PropertyNameConventionJSMetadataProvider(_documentStore.Conventions)
+            };
         }
 
         /// <summary>
@@ -285,7 +291,7 @@ namespace Raven.Client.Documents.Session
 
         internal bool IsLoadedOrDeleted(string id)
         {
-            return DocumentsById.TryGetValue(id, out DocumentInfo documentInfo) && documentInfo.Document != null ||
+            return DocumentsById.TryGetValue(id, out DocumentInfo documentInfo) && (documentInfo.Document != null || documentInfo.Entity != null) ||
                    IsDeleted(id) ||
                    IncludedDocumentsById.ContainsKey(id);
         }
@@ -713,7 +719,7 @@ more responsive application.
             PrepareForEntitiesDeletion(result, null);
             PrepareForEntitiesPuts(result);
 
-            if(DeferredCommands.Count > 0)
+            if (DeferredCommands.Count > 0)
             {
                 // this allow OnBeforeStore to call Defer during the call to include
                 // additional values during the same SaveChanges call
@@ -807,9 +813,12 @@ more responsive application.
         {
             foreach (var entity in DocumentsByEntity)
             {
+                if (entity.Value.IgnoreChanges)
+                    continue;
+
                 var metadataUpdated = UpdateMetadataModifications(entity.Value);
                 var document = EntityToBlittable.ConvertEntityToBlittable(entity.Key, entity.Value);
-                if (entity.Value.IgnoreChanges || EntityChanged(document, entity.Value, null) == false)
+                if (EntityChanged(document, entity.Value, null) == false)
                     continue;
 
                 if (result.DeferredCommandsDictionary.TryGetValue((entity.Value.Id, CommandType.ClientNotAttachment, null), out ICommandData command))
@@ -820,7 +829,7 @@ more responsive application.
                 {
                     var beforeStoreEventArgs = new BeforeStoreEventArgs(this, entity.Value.Id, entity.Key);
                     onOnBeforeStore(this, beforeStoreEventArgs);
-                    if (beforeStoreEventArgs.MetadataAccessed)
+                    if (metadataUpdated || beforeStoreEventArgs.MetadataAccessed)
                         metadataUpdated |= UpdateMetadataModifications(entity.Value);
                     if (beforeStoreEventArgs.MetadataAccessed ||
                         EntityChanged(document, entity.Value, null))
@@ -1039,7 +1048,7 @@ more responsive application.
         {
             DeferredCommandsDictionary[(command.Id, command.Type, command.Name)] = command;
             DeferredCommandsDictionary[(command.Id, CommandType.ClientAnyCommand, null)] = command;
-            if (command.Type != CommandType.AttachmentPUT && 
+            if (command.Type != CommandType.AttachmentPUT &&
                 command.Type != CommandType.AttachmentDELETE)
                 DeferredCommandsDictionary[(command.Id, CommandType.ClientNotAttachment, null)] = command;
         }
@@ -1078,22 +1087,7 @@ more responsive application.
         public virtual void Dispose()
         {
             Dispose(true);
-        }
-
-        ~InMemoryDocumentSessionOperations()
-        {
-            try
-            {
-                Dispose(false);
-            }
-            catch (ObjectDisposedException)
-            {
-                // nothing can be done here
-            }
-#if DEBUG
-            Debug.WriteLine("Disposing a session for finalizer! It should be disposed by calling session.Dispose()!");
-#endif
-        }
+        }      
 
         public void RegisterMissing(string id)
         {
@@ -1362,7 +1356,7 @@ more responsive application.
                     $"Parameters '{nameof(indexName)}' and '{nameof(collectionName)}' are mutually exclusive. Please specify only one of them.");
 
             if (isIndex == false && isCollection == false)
-                collectionName = Conventions.GetCollectionName(type);
+                collectionName = Conventions.GetCollectionName(type) ?? Constants.Documents.Collections.AllDocumentsCollection;
 
             return (indexName, collectionName);
         }

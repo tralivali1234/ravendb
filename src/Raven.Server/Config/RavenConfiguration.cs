@@ -1,5 +1,6 @@
 ﻿using System;
 using System.Collections;
+using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.ComponentModel;
 using System.IO;
@@ -7,6 +8,7 @@ using System.Linq;
 using System.Linq.Expressions;
 using System.Reflection;
 using System.Text;
+using System.Threading;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Configuration.CommandLine;
 using Microsoft.Extensions.Configuration.Memory;
@@ -16,6 +18,7 @@ using Raven.Server.Config.Categories;
 using Raven.Server.Config.Settings;
 using Raven.Server.Extensions;
 using Raven.Server.ServerWide;
+using Raven.Server.Utils;
 using Voron.Util.Settings;
 
 namespace Raven.Server.Config
@@ -82,7 +85,7 @@ namespace Raven.Server.Config
         internal CommandLineConfigurationSource CommandLineSettings =>
             _configBuilder.Sources.OfType<CommandLineConfigurationSource>().FirstOrDefault();
 
-        public RavenConfiguration(string resourceName, ResourceType resourceType, string customConfigPath = null)
+        private RavenConfiguration(string resourceName, ResourceType resourceType, string customConfigPath = null)
         {
             ResourceName = resourceName;
             ResourceType = resourceType;
@@ -181,8 +184,6 @@ namespace Raven.Server.Config
 
         public void PostInit()
         {
-            CheckDirectoryPermissions();
-
             if (ResourceType != ResourceType.Server)
                 return;
 
@@ -230,6 +231,7 @@ namespace Raven.Server.Config
 
             return results;
         });
+        
 
         public static bool ContainsKey(string key)
         {
@@ -264,11 +266,16 @@ namespace Raven.Server.Config
             return dataDirectoryPath;
         }
 
-        public static RavenConfiguration CreateFrom(RavenConfiguration parent, string name, ResourceType type)
+        public static RavenConfiguration CreateForServer(string name, string customConfigPath = null)
         {
-            var dataDirectoryPath = GetDataDirectoryPath(parent.Core, name, type);
+            return new RavenConfiguration(name, ResourceType.Server, customConfigPath);
+        }
 
-            var result = new RavenConfiguration(name, type)
+        public static RavenConfiguration CreateForDatabase(RavenConfiguration parent, string name)
+        {
+            var dataDirectoryPath = GetDataDirectoryPath(parent.Core, name, ResourceType.Database);
+
+            var result = new RavenConfiguration(name, ResourceType.Database)
             {
                 ServerWideSettings = parent.Settings,
                 Settings = new ConfigurationRoot(new List<IConfigurationProvider> { new MemoryConfigurationProvider(new MemoryConfigurationSource()) })
@@ -279,6 +286,14 @@ namespace Raven.Server.Config
             };
 
             return result;
+        }
+
+        /// <summary>
+        /// This method should only be used for testing purposes
+        /// </summary>
+        internal static RavenConfiguration CreateForTesting(string name, ResourceType resourceType, string customConfigPath = null)
+        {
+            return new RavenConfiguration(name, resourceType, customConfigPath);
         }
 
         private static string GenerateDefaultDataDirectory(string template, ResourceType type, string name)
@@ -292,8 +307,10 @@ namespace Raven.Server.Config
             _configBuilder.AddCommandLine(args);
             Settings = _configBuilder.Build();
         }
+        
+        private static int _pathCounter = 0;
 
-        private void CheckDirectoryPermissions()
+        public void CheckDirectoryPermissions()
         {
             if (Core.RunInMemory)
                 return;
@@ -320,6 +337,8 @@ namespace Raven.Server.Config
                         continue;
 
                     var fileName = Guid.NewGuid().ToString("N");
+                    
+                    
                     var path = pathSettingValue.ToFullPath();
                     var fullPath = Path.Combine(path, fileName);
 
@@ -327,27 +346,52 @@ namespace Raven.Server.Config
                         .OrderBy(x => x.Order)
                         .First();
 
-                    if (configEntry.Scope == ConfigurationEntryScope.ServerWideOnly && 
-                        ResourceType==ResourceType.Database)
+                    if (configEntry.Scope == ConfigurationEntryScope.ServerWideOnly &&
+                        ResourceType == ResourceType.Database)
                         continue;
 
                     var configurationKey = configEntry.Key;
 
+                    string createdDirectory = null;
                     try
                     {
+                        // if there is no 'path' directory, we are going to create a directory with a similiar name, in order to avoid deleting a directory in use afterwards,
+                        // and write a sample file inside it, in order to check write permissions.
                         if (Directory.Exists(path) == false)
-                            Directory.CreateDirectory(path);
-
-                        File.WriteAllText(fullPath, string.Empty);
-                        File.Delete(fullPath);
+                        {
+                            var curPathCounterVal = Interlocked.Increment(ref _pathCounter);
+                            // test that we can create the directory, but
+                            // not actually create it
+                            createdDirectory = path + "$" + curPathCounterVal.ToString();
+                            Directory.CreateDirectory(createdDirectory);
+                            var createdFile = Path.Combine(createdDirectory, "test.file");
+                            File.WriteAllText(createdFile, string.Empty);
+                            File.Delete(createdFile);
+                        }
+                        // in case there is a 'path' directory, we are going to try and write to it some file, in order to check write permissions
+                        else
+                        {
+                            File.WriteAllText(fullPath, string.Empty);
+                            File.Delete(fullPath);
+                        }
                     }
                     catch (Exception e)
                     {
                         if (results == null)
                             results = new Dictionary<string, KeyValuePair<string, string>>();
 
-                        results[configurationKey] = new KeyValuePair<string, string>(path, e.Message);
+                        var errorousDirPath = createdDirectory ?? path;
+                        results[configurationKey] = new KeyValuePair<string, string>(errorousDirPath, e.Message);
                     }
+                    finally
+                    {
+                        if (createdDirectory != null)
+                        {
+                            Interlocked.Decrement(ref _pathCounter);
+                            IOExtensions.DeleteDirectory(createdDirectory);
+                        }
+                    }
+                    
                 }
             }
 
@@ -376,7 +420,7 @@ namespace Raven.Server.Config
 
             public override void Load()
             {
-                Data = new Dictionary<string, string>();
+                Data = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
 
                 var envs = Environment.GetEnvironmentVariables().Cast<DictionaryEntry>();
                 foreach (var env in envs)

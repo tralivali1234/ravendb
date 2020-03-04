@@ -429,15 +429,8 @@ namespace Sparrow.Json
                 case JsonParserToken.Float:
                     if ((_mode & UsageMode.ValidateDouble) == UsageMode.ValidateDouble)
                         _reader.ValidateFloat();
-                                
-                    if (typeof(TWriteStrategy) == typeof(WriteNone))
-                    {
-                        start = _writer.WriteValue(_state.StringBuffer, _state.StringSize);
-                    }
-                    else
-                    {
-                        start = _writer.WriteValue(_state.StringBuffer, _state.StringSize, out _, _mode, _state.CompressedSize);
-                    }
+
+                    start = _writer.WriteValue(_state.StringBuffer, _state.StringSize);
 
                     _state.CompressedSize = null;
                     _writeToken = new WriteToken(start, BlittableJsonToken.LazyNumber);
@@ -580,6 +573,11 @@ namespace Sparrow.Json
         public override string ToString()
         {
             return "Building json for " + _debugTag;
+        }
+
+        public bool NeedResetPropertiesCache()
+        {
+            return _context.CachedProperties.PropertiesDiscovered > CachedProperties.CachedPropertiesSize;
         }
     }
 

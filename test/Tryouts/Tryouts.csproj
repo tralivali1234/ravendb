@@ -1,7 +1,7 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
-    <TargetFramework>netcoreapp2.0</TargetFramework>
-    <RuntimeFrameworkVersion>2.0.6</RuntimeFrameworkVersion>
+    <TargetFramework>netcoreapp2.1</TargetFramework>
+    <RuntimeFrameworkVersion>2.1.8</RuntimeFrameworkVersion>
     <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <AssemblyName>Tryouts</AssemblyName>
     <OutputType>Exe</OutputType>
@@ -18,19 +18,15 @@
     <Compile Include="..\..\src\CommonAssemblyInfo.cs" Link="Properties\CommonAssemblyInfo.cs" />
   </ItemGroup>
   <ItemGroup>
-    <Reference Include="Lambda2Js.Signed.Custom">
-      <HintPath>..\..\libs\Lambda2Js.Signed.Custom.dll</HintPath>
-    </Reference>
-  </ItemGroup>
-  <ItemGroup>
     <ProjectReference Include="..\..\src\Raven.Client\Raven.Client.csproj" />
     <ProjectReference Include="..\..\src\Voron\Voron.csproj" />
     <ProjectReference Include="..\RachisTests\RachisTests.csproj" />
     <ProjectReference Include="..\SlowTests\SlowTests.csproj" />
     <ProjectReference Include="..\FastTests\FastTests.csproj" />
+    <ProjectReference Include="..\StressTests\StressTests.csproj" />
   </ItemGroup>
   <ItemGroup>
-    <PackageReference Include="Microsoft.CSharp" Version="4.4.1" />
+    <PackageReference Include="Microsoft.CSharp" Version="4.5.0" />
   </ItemGroup>
   <ItemGroup>
     <Service Include="{82a7f48d-3b50-4b1e-b82e-3ada8210c358}" />

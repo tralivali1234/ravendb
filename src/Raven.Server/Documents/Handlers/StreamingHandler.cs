@@ -118,13 +118,17 @@ namespace Raven.Server.Documents.Handlers
             {
                 var stream = TryGetRequestFromStream("ExportOptions") ?? RequestBodyStream();
                 var queryJson = await context.ReadForMemoryAsync(stream, "index/query");
-                var query = IndexQueryServerSide.Create(queryJson, context, Database.QueryMetadataCache);
+                var query = IndexQueryServerSide.Create(queryJson, Database.QueryMetadataCache);
                 tracker.Query = query.Query;
 
                 var format = GetStringQueryString("format", false);
                 var properties = GetStringValuesQueryString("field", false);
                 var propertiesArray = properties.Count == 0 ? null : properties.ToArray();
-                using (var writer = GetQueryResultWriter(format, HttpContext.Response, context, ResponseBodyStream(), propertiesArray))
+
+                // set the exported file name
+                string fileName = query.Metadata.IsCollectionQuery ? query.Metadata.CollectionName : "query_result";
+                
+                using (var writer = GetQueryResultWriter(format, HttpContext.Response, context, ResponseBodyStream(), propertiesArray, fileName))
                 {
                     try
                     {
@@ -140,11 +144,11 @@ namespace Raven.Server.Documents.Handlers
         }
 
         private IStreamDocumentQueryResultWriter GetQueryResultWriter(string format, HttpResponse response, DocumentsOperationContext context, Stream responseBodyStream,
-            string[] propertiesArray)
+            string[] propertiesArray, string fileName = null)
         {
             if (string.IsNullOrEmpty(format) == false && format.StartsWith("csv"))
             {
-                return new StreamCsvDocumentQueryResultWriter(response, responseBodyStream, context, propertiesArray);
+                return new StreamCsvDocumentQueryResultWriter(response, responseBodyStream, propertiesArray, fileName);
             }
 
             if (propertiesArray != null)

@@ -34,7 +34,12 @@ namespace Sparrow.Utils
                         {
                             result.callback(result.state);
                         }
-                        catch { }
+                        catch
+                        {
+                            // there is nothing that we _can_ do here that would be right
+                            // and there is no meaningful error handling. Ignoring this because
+                            // callers are expected to do their own exception catching
+                        }
                     }
 
                     // PERF: Entering a kernel lock even if the ManualResetEventSlim will try to avoid that doing some spin locking
@@ -73,12 +78,10 @@ namespace Sparrow.Utils
             }
         }
 
-        private static void TaskCompletionCallback(object state) => ((TaskCompletionSource<object>)state).TrySetResult(null);
-
         public static void CompleteAndReplace(ref TaskCompletionSource<object> task)
         {
             var task2 = Interlocked.Exchange(ref task, new TaskCompletionSource<object>(TaskCreationOptions.RunContinuationsAsynchronously));
-            Execute(TaskCompletionCallback, task2);
+            task2.TrySetResult(null);
         }
 
         public static void CompleteReplaceAndExecute(ref TaskCompletionSource<object> task, Action act)
@@ -94,7 +97,7 @@ namespace Sparrow.Utils
 
         public static void Complete(TaskCompletionSource<object> task)
         {
-            Execute(TaskCompletionCallback, task);
+            task.TrySetResult(null);
         }
 
         private class RunOnce

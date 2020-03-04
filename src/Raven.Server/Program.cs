@@ -1,4 +1,6 @@
 using System;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Runtime.Loader;
 using System.Threading;
@@ -6,19 +8,25 @@ using System.Threading.Tasks;
 using Microsoft.Extensions.CommandLineUtils;
 using Raven.Server.Commercial;
 using Raven.Server.Config;
+using Raven.Server.Config.Settings;
 using Raven.Server.ServerWide;
 using Raven.Server.Utils;
 using Raven.Server.Utils.Cli;
 using Sparrow.Logging;
+using Sparrow.Platform;
 
 namespace Raven.Server
 {
     public class Program
     {
-        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<Program>("Raven/Server");
+        private static readonly Logger Logger = LoggingSource.Instance.GetLogger<Program>("Server");
 
         public static int Main(string[] args)
         {
+            UseOnlyInvariantCultureInRavenDB();
+
+            SetCurrentDirectoryToServerPath();
+
             string[] configurationArgs;
             try
             {
@@ -45,7 +53,19 @@ namespace Raven.Server
 
             new WelcomeMessage(Console.Out).Print();
 
-            var configuration = new RavenConfiguration(null, ResourceType.Server, CommandLineSwitches.CustomConfigPath);
+            var targetSettingsFile = new PathSetting(string.IsNullOrEmpty(CommandLineSwitches.CustomConfigPath)
+                ? "settings.json"
+                : CommandLineSwitches.CustomConfigPath);
+
+            var destinationSettingsFile = new PathSetting("settings.default.json");
+
+            if (File.Exists(targetSettingsFile.FullPath) == false &&
+                File.Exists(destinationSettingsFile.FullPath)) //just in case
+            {
+                File.Copy(destinationSettingsFile.FullPath, targetSettingsFile.FullPath);
+            }
+
+            var configuration = RavenConfiguration.CreateForServer(null, CommandLineSwitches.CustomConfigPath);
 
             if (configurationArgs != null)
                 configuration.AddCommandLine(configurationArgs);
@@ -53,10 +73,12 @@ namespace Raven.Server
             configuration.Initialize();
 
             LoggingSource.Instance.SetupLogMode(configuration.Logs.Mode, configuration.Logs.Path.FullPath);
+            LoggingSource.UseUtcTime = configuration.Logs.UseUtcTime;
+
             if (Logger.IsInfoEnabled)
                 Logger.Info($"Logging to {configuration.Logs.Path} set to {configuration.Logs.Mode} level.");
 
-            if(Logger.IsOperationsEnabled)
+            if (Logger.IsOperationsEnabled)
                 Logger.Operations(RavenCli.GetInfoText());
 
             if (WindowsServiceRunner.ShouldRunAsWindowsService())
@@ -91,7 +113,7 @@ namespace Raven.Server
                     Console.WriteLine("\nRestarting Server...");
                     rerun = false;
 
-                    configuration = new RavenConfiguration(null, ResourceType.Server, CommandLineSwitches.CustomConfigPath);
+                    configuration = RavenConfiguration.CreateForServer(null, CommandLineSwitches.CustomConfigPath);
 
                     if (configurationArgs != null)
                     {
@@ -119,7 +141,7 @@ namespace Raven.Server
                             {
                                 if (Logger.IsInfoEnabled)
                                     Logger.Info("Unable to OpenPipe. Admin Channel will not be available to the user", e);
-                                Console.WriteLine("Warning: Admin Channel is not available");
+                                Console.WriteLine("Warning: Admin Channel is not available:" + e);
                             }
 
                             server.Initialize();
@@ -153,6 +175,24 @@ namespace Raven.Server
                             Console.ForegroundColor = ConsoleColor.DarkGray;
                             Console.WriteLine("TIP: type 'help' to list the available commands.");
                             Console.ForegroundColor = prevColor;
+
+                            if (configuration.Storage.IgnoreInvalidJournalErrors == true)
+                            {
+                                var message =
+                                    $"Server is running in dangerous mode because {RavenConfiguration.GetKey(x => x.Storage.IgnoreInvalidJournalErrors)} was set. " +
+                                    "It means that storages of databases, indexes and system one will be loaded regardless missing or corrupted journal files which " +
+                                    "are mandatory to properly load the storage. " +
+                                    "This switch is meant to be use only for recovery purposes. Please make sure that you won't use it on regular basis. ";
+
+                                if (Logger.IsOperationsEnabled)
+                                    Logger.Operations(message);
+
+                                prevColor = Console.ForegroundColor;
+                                Console.ForegroundColor = ConsoleColor.Red;
+                                Console.WriteLine(message);
+                                Console.ForegroundColor = prevColor;
+
+                            }
 
                             IsRunningNonInteractive = false;
                             rerun = CommandLineSwitches.NonInteractive ||
@@ -190,6 +230,28 @@ namespace Raven.Server
             } while (rerun);
 
             return 0;
+        }
+
+        private static void UseOnlyInvariantCultureInRavenDB()
+        {
+            Thread.CurrentThread.CurrentCulture = CultureInfo.InvariantCulture;
+            Thread.CurrentThread.CurrentUICulture = CultureInfo.InvariantCulture;
+            CultureInfo.DefaultThreadCurrentCulture = CultureInfo.InvariantCulture;
+            CultureInfo.DefaultThreadCurrentUICulture = CultureInfo.InvariantCulture;
+        }
+
+        private static void SetCurrentDirectoryToServerPath()
+        {
+            try
+            {
+                Directory.SetCurrentDirectory(AppContext.BaseDirectory);
+            }
+            catch (Exception exception)
+            {
+                var msg = $"Error setting current directory: {AppContext.BaseDirectory}.";
+                Logger.Operations(msg, exception);
+                Console.WriteLine($"{msg} Exception: {exception}");
+            }
         }
 
         public static ManualResetEvent ShutdownServerMre = new ManualResetEvent(false);
@@ -231,21 +293,17 @@ namespace Raven.Server
 
         private static bool RunInteractive(RavenServer server)
         {
-            var configuration = server.Configuration;
-
             //stop dumping logs
             LoggingSource.Instance.DisableConsoleLogging();
-            
-            // set log mode to the previous original mode:
-            LoggingSource.Instance.SetupLogMode(configuration.Logs.Mode, configuration.Logs.Path.FullPath);
 
             return new RavenCli().Start(server, Console.Out, Console.In, true);
         }
 
         public static void WriteServerStatsAndWaitForEsc(RavenServer server)
         {
+            var workingSetText = PlatformDetails.RunningOnPosix == false ? "working set" : "    RSS    ";
             Console.WriteLine("Showing stats, press any key to close...");
-            Console.WriteLine("    working set     | native mem      | managed mem     | mmap size         | reqs/sec       | docs (all dbs)");
+            Console.WriteLine($"    {workingSetText}     | native mem      | managed mem     | mmap size         | reqs/sec       | docs (all dbs)");
             var i = 0;
             while (Console.KeyAvailable == false)
             {
@@ -262,14 +320,15 @@ namespace Raven.Server
                 Console.Write($"| {Math.Round(reqCounter.OneSecondRate, 1),-14:#,#.#;;0} ");
 
                 long allDocs = 0;
-                foreach (var value in server.ServerStore.DatabasesLandlord.DatabasesCache.Values)
+                foreach (var kvp in server.ServerStore.DatabasesLandlord.DatabasesCache)
                 {
-                    if (value.Status != TaskStatus.RanToCompletion)
+                    var task = kvp.Value;
+                    if (task.Status != TaskStatus.RanToCompletion)
                         continue;
 
                     try
                     {
-                        allDocs += value.Result.DocumentsStorage.GetNumberOfDocuments();
+                        allDocs += task.Result.DocumentsStorage.GetNumberOfDocuments();
                     }
                     catch (Exception)
                     {

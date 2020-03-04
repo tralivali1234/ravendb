@@ -25,6 +25,8 @@ using Voron.Impl.FileHeaders;
 using Voron.Impl.Paging;
 using Voron.Util;
 using Voron.Global;
+using System.Buffers;
+using Sparrow.Platform;
 
 namespace Voron.Impl.Journal
 {
@@ -39,7 +41,6 @@ namespace Voron.Impl.Journal
         private long _journalIndex = -1;
 
         private readonly JournalApplicator _journalApplicator;
-        private readonly ModifyHeaderAction _updateLogInfo;
 
         private ImmutableAppendOnlyList<JournalFile> _files = ImmutableAppendOnlyList<JournalFile>.Empty;
         internal JournalFile CurrentFile;
@@ -56,27 +57,19 @@ namespace Voron.Impl.Journal
 
         private readonly object _writeLock = new object();
         private int _maxNumberOfPagesRequiredForCompressionBuffer;
-        
+
         internal NativeMemory.ThreadStats CurrentFlushingInProgressHolder;
 
         private readonly DisposeOnce<SingleAttempt> _disposeRunner;
 
-
         public WriteAheadJournal(StorageEnvironment env)
         {
             _env = env;
+            _is32Bit = env.Options.ForceUsing32BitsPager || PlatformDetails.Is32Bits;
             _logger = LoggingSource.Instance.GetLogger<WriteAheadJournal>(Path.GetFileName(env.ToString()));
             _dataPager = _env.Options.DataPager;
             _currentJournalFileSize = env.Options.InitialLogFileSize;
             _headerAccessor = env.HeaderAccessor;
-            _updateLogInfo = header =>
-            {
-                var journalFilesCount = _files.Count;
-                var currentJournal = journalFilesCount > 0 ? _journalIndex : -1;
-                header->Journal.CurrentJournal = currentJournal;
-                header->Journal.JournalFilesCount = journalFilesCount;
-                header->IncrementalBackup.LastCreatedJournal = _journalIndex;
-            };
 
             _compressionPager = CreateCompressionPager(_env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize);
             _journalApplicator = new JournalApplicator(this);
@@ -140,7 +133,11 @@ namespace Voron.Impl.Journal
 
             _files = _files.Append(journal);
 
-            _headerAccessor.Modify(_updateLogInfo);
+            _headerAccessor.Modify(header =>
+            {
+                header->Journal.CurrentJournal = journal.Number;
+                header->IncrementalBackup.LastCreatedJournal = journal.Number;
+            });
 
             return journal;
         }
@@ -151,19 +148,13 @@ namespace Voron.Impl.Journal
             var requireHeaderUpdate = false;
 
             var logInfo = _headerAccessor.Get(ptr => ptr->Journal);
-
-            if (logInfo.JournalFilesCount == 0)
-            {
-                _journalIndex = logInfo.LastSyncedJournal;
-                return false;
-            }
-
-            var oldestLogFileStillInUse = logInfo.CurrentJournal - logInfo.JournalFilesCount + 1;
-            if (_env.Options.IncrementalBackupEnabled == false)
+            
+            if (_env.Options.IncrementalBackupEnabled == false && _env.Options.CopyOnWriteMode == false)
             {
                 // we want to check that we cleanup old log files if they aren't needed
                 // this is more just to be safe than anything else, they shouldn't be there.
-                var unusedfiles = oldestLogFileStillInUse;
+                var unusedfiles = logInfo.LastSyncedJournal;
+
                 while (true)
                 {
                     unusedfiles--;
@@ -173,57 +164,122 @@ namespace Voron.Impl.Journal
 
             }
 
-            var lastSyncedTransactionId = logInfo.LastSyncedTransactionId;
-
+            var modifiedPages = new HashSet<long>();
             var journalFiles = new List<JournalFile>();
-            long lastSyncedTxId = -1;
-            long lastSyncedJournal = logInfo.LastSyncedJournal;
-            for (var journalNumber = oldestLogFileStillInUse; journalNumber <= logInfo.CurrentJournal; journalNumber++)
+
+            long lastSyncedTxId = logInfo.LastSyncedTransactionId;
+            long lastSyncJournal = logInfo.LastSyncedJournal;
+
+            // the last sync journal is allowed to be deleted, it might have been fully synced, which is fine
+            // we rely on the lastSyncedTxId to verify correctness.
+            var journalToStartReadingFrom = logInfo.LastSyncedJournal;
+            if (_env.Options.JournalExists(journalToStartReadingFrom) == false &&
+                logInfo.Flags.HasFlag(JournalInfoFlags.IgnoreMissingLastSyncJournal) ||
+                journalToStartReadingFrom == -1)
+                journalToStartReadingFrom++;
+
+            for (var journalNumber = journalToStartReadingFrom; journalNumber <= logInfo.CurrentJournal; journalNumber++)
             {
                 addToInitLog?.Invoke($"Recovering journal {journalNumber} (upto last journal {logInfo.CurrentJournal})");
                 var initialSize = _env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize;
                 var journalRecoveryName = StorageEnvironmentOptions.JournalRecoveryName(journalNumber);
-                using (var recoveryPager = _env.Options.CreateTemporaryBufferPager(journalRecoveryName, initialSize))
-                using (var pager = _env.Options.OpenJournalPager(journalNumber))
+
+                try
                 {
-                    RecoverCurrentJournalSize(pager);
-
-                    var transactionHeader = txHeader->TransactionId == 0 ? null : txHeader;
-                    using (
-                        var journalReader = new JournalReader(pager, _dataPager, recoveryPager, lastSyncedTransactionId,
-                            transactionHeader))
+                    using (var recoveryPager = _env.Options.CreateTemporaryBufferPager(journalRecoveryName, initialSize))
+                    using (var pager = _env.Options.OpenJournalPager(journalNumber, logInfo))
                     {
-                        journalReader.RecoverAndValidate(_env.Options);
+                        RecoverCurrentJournalSize(pager);
 
-                        var lastReadHeaderPtr = journalReader.LastTransactionHeader;
-
-                        if (lastReadHeaderPtr != null)
+                        var transactionHeader = txHeader->TransactionId == 0 ? null : txHeader;
+                        using (
+                            var journalReader = new JournalReader(pager, _dataPager, recoveryPager, modifiedPages, logInfo,
+                                transactionHeader))
                         {
-                            *txHeader = *lastReadHeaderPtr;
-                            lastSyncedTxId = txHeader->TransactionId;
-                            lastSyncedJournal = journalNumber;
-                        }
+                            var transactionHeaders = ArrayPool<TransactionHeader>.Shared.Rent((int)journalReader.NumberOfAllocated4Kb);
+                            try
+                            {
+                                var transactionCount = journalReader.RecoverAndValidate(_env.Options, transactionHeaders);
 
-                        pager.Dispose(); // need to close it before we open the journal writer
+                                var lastReadHeaderPtr = journalReader.LastTransactionHeader;
 
-                        if (lastSyncedTxId != -1 && (journalReader.RequireHeaderUpdate || journalNumber == logInfo.CurrentJournal))
-                        {
-                            var jrnlWriter = _env.Options.CreateJournalWriter(journalNumber,
-                                pager.NumberOfAllocatedPages * Constants.Storage.PageSize);
-                            var jrnlFile = new JournalFile(_env, jrnlWriter, journalNumber);
-                            jrnlFile.InitFrom(journalReader);
-                            jrnlFile.AddRef(); // creator reference - write ahead log
+                                if (lastReadHeaderPtr != null)
+                                {
+                                    *txHeader = *lastReadHeaderPtr;
+                                    lastSyncedTxId = txHeader->TransactionId;
+                                    lastSyncJournal = journalNumber;
+                                }
 
-                            journalFiles.Add(jrnlFile);
-                        }
+                                pager.Dispose(); // need to close it before we open the journal writer
 
-                        if (journalReader.RequireHeaderUpdate) //this should prevent further loading of transactions
-                        {
-                            requireHeaderUpdate = true;
-                            break;
+                                var jrnlWriter = _env.Options.CreateJournalWriter(journalNumber,
+                                    pager.NumberOfAllocatedPages * Constants.Storage.PageSize);
+                                var jrnlFile = new JournalFile(_env, jrnlWriter, journalNumber);
+                                jrnlFile.InitFrom(journalReader, transactionHeaders, transactionCount);
+                                jrnlFile.AddRef(); // creator reference - write ahead log
+
+                                journalFiles.Add(jrnlFile);
+
+                                if (journalReader.RequireHeaderUpdate) //this should prevent further loading of transactions
+                                {
+                                    requireHeaderUpdate = true;
+                                    break;
+                                }
+                            }
+                            finally
+                            {
+                                ArrayPool<TransactionHeader>.Shared.Return(transactionHeaders);
+                            }
                         }
                     }
+                }
+                catch (InvalidJournalException)
+                {
+                    if (_env.Options.IgnoreInvalidJournalErrors == true)
+                    {
+                        addToInitLog?.Invoke($"Encountered invalid journal {journalNumber} @ {_env.Options}. Skipping this journal and keep going the recovery operation because '{nameof(_env.Options.IgnoreInvalidJournalErrors)}' options is set");
+                        continue;
+                    }
 
+                    throw;
+                }
+            }
+
+
+            if (_env.Options.EncryptionEnabled == false) // for encryption, we already use AEAD, so no need
+            {
+                // here we want to check that the checksum on all the modified pages is valid
+                // we can't do that during the journal application process because we may have modifications
+                // to pages that overwrite one another. So we have to do this at the end, this will detect
+                // corruption when applying journals at recovery time rather than at usage.
+                var tempTx = new TempPagerTransaction();
+
+                var sortedPages = modifiedPages.ToArray();
+                Array.Sort(sortedPages);
+
+                long minPageChecked = -1;
+
+                // we need to iterate from the end in order to filter out pages that was overwritten by later transaction
+
+                for (var i = sortedPages.Length - 1; i >= 0; i--)
+                {
+                    using (tempTx) // release any resources, we just wanted to validate things
+                    {
+                        var modifiedPage = sortedPages[i];
+
+                        var ptr = (PageHeader*)_dataPager.AcquirePagePointerWithOverflowHandling(tempTx, modifiedPage, null);
+
+                        var maxPageRange = modifiedPage + VirtualPagerLegacyExtensions.GetNumberOfPages(ptr) - 1;
+
+                        if (minPageChecked != -1 && maxPageRange >= minPageChecked)
+                        {
+                            continue;
+                        }
+
+                        _env.ValidatePageChecksum(modifiedPage, ptr);
+
+                        minPageChecked = modifiedPage;
+                    }
                 }
             }
 
@@ -234,20 +290,14 @@ namespace Voron.Impl.Journal
                     "First transaction initializing the structure of Voron database is corrupted. Cannot access internal database metadata. Create a new database to recover.");
 
             Debug.Assert(lastSyncedTxId >= 0);
-            Debug.Assert(lastSyncedJournal >= 0);
+            Debug.Assert(lastSyncJournal >= 0);
 
-            _journalIndex = lastSyncedJournal;
+            _journalIndex = lastSyncJournal;
 
-            _headerAccessor.Modify(
-                header =>
-                {
-                    header->Journal.CurrentJournal = lastSyncedJournal;
-                    header->Journal.JournalFilesCount = _files.Count;
-                    header->IncrementalBackup.LastCreatedJournal = _journalIndex;
-                });
-
-            CleanupInvalidJournalFiles(lastSyncedJournal);
-            CleanupUnusedJournalFiles(oldestLogFileStillInUse, lastSyncedJournal);
+            if (_env.Options.CopyOnWriteMode == false)
+            {
+                CleanupNewerInvalidJournalFiles(lastSyncJournal);
+            }
 
             if (_files.Count > 0)
             {
@@ -260,17 +310,7 @@ namespace Voron.Impl.Journal
             return requireHeaderUpdate;
         }
 
-        private void CleanupUnusedJournalFiles(long oldestLogFileStillInUse, long lastSyncedJournal)
-        {
-            var logFile = oldestLogFileStillInUse;
-            while (logFile < lastSyncedJournal)
-            {
-                _env.Options.TryDeleteJournal(logFile);
-                logFile++;
-            }
-        }
-
-        private void CleanupInvalidJournalFiles(long lastSyncedJournal)
+        private void CleanupNewerInvalidJournalFiles(long lastSyncedJournal)
         {
             // we want to check that we cleanup newer log files, since everything from
             // the current file is considered corrupted
@@ -391,31 +431,6 @@ namespace Voron.Impl.Journal
                                                             " to the transaction, because it already exists in a snapshot collection");
                     }
                 }
-            }
-        }
-
-        public void Clear(LowLevelTransaction tx)
-        {
-            if (tx.Flags != TransactionFlags.ReadWrite)
-                throw new InvalidOperationException("Clearing of write ahead journal should be called only from a write transaction");
-
-            foreach (var journalFile in _files)
-            {
-                journalFile.Release();
-            }
-            _files = ImmutableAppendOnlyList<JournalFile>.Empty;
-            CurrentFile = null;
-        }
-
-
-
-        public class JournalSyncEventArgs : EventArgs
-        {
-            public long OldestTransactionId { get; private set; }
-
-            public JournalSyncEventArgs(long oldestTransactionId)
-            {
-                OldestTransactionId = oldestTransactionId;
             }
         }
 
@@ -621,7 +636,7 @@ namespace Voron.Impl.Journal
                 // we don't actually have to do that in our own transaction, what we'll do is to setup things so if there is a running
                 // write transaction, we'll piggy back on its commit to complete our process, without interrupting its work
                 _waj._env.FlushInProgressLock.EnterWriteLock();
-                _waj.CurrentFlushingInProgressHolder = NativeMemory.ThreadAllocations.Value;
+                _waj.CurrentFlushingInProgressHolder = NativeMemory.CurrentThreadStats;
 
                 try
                 {
@@ -852,6 +867,8 @@ namespace Voron.Impl.Journal
 
                 public Task Task => _tcs.Task;
 
+                internal Action AfterGatherInformationAction;
+
                 public bool SyncDataFile()
                 {
                     if (TryGatherInformationToStartSync(out var syncCounter) == false)
@@ -859,6 +876,8 @@ namespace Voron.Impl.Journal
 
                     if (_parent._waj._env.Disposed)
                         return false;
+
+                    AfterGatherInformationAction?.Invoke();
 
                     CallPagerSync();
 
@@ -916,10 +935,26 @@ namespace Voron.Impl.Journal
                         }
 
                         Interlocked.Add(ref _parent._totalWrittenButUnsyncedBytes, -_currentTotalWrittenBytes);
-                        _parent.UpdateFileHeaderAfterDataFileSync(_lastSyncedJournal, _lastSyncedTransactionId, ref _transactionHeader);
+
+                        var ignoreLastSyncJournalMissing = false;
+
+                        foreach (var item in _journalsToDelete)
+                        {
+                            if (item.Value.Number == _lastSyncedJournal)
+                            {
+                                // we are about to delete it, so safe to ignore this
+                                ignoreLastSyncJournalMissing = true;
+                                break;
+                            }
+                        }
+
+                        _parent.UpdateFileHeaderAfterDataFileSync(_lastSyncedJournal, _lastSyncedTransactionId, ignoreLastSyncJournalMissing, ref _transactionHeader);
 
                         foreach (var toDelete in _journalsToDelete)
                         {
+                            if (toDelete.Value.Number > _lastSyncedJournal) // precaution
+                                continue;
+
                             if (_parent._waj._env.Options.IncrementalBackupEnabled == false)
                                 toDelete.Value.DeleteOnClose = true;
 
@@ -986,7 +1021,7 @@ namespace Voron.Impl.Journal
                         _currentTotalWrittenBytes = Interlocked.Read(ref _parent._totalWrittenButUnsyncedBytes);
                         _lastSyncedJournal = _parent._lastFlushedJournalId;
                         _lastSyncedTransactionId = _parent._lastFlushedTransactionId;
-                        _parent.SetLastReadTxHeader(_parent._lastFlushedJournal, _lastSyncedTransactionId, ref _transactionHeader);
+                        _parent._lastFlushedJournal.SetLastReadTxHeader(_lastSyncedTransactionId, ref _transactionHeader);
                         if (_lastSyncedTransactionId != _transactionHeader.TransactionId)
                         {
                             VoronUnrecoverableErrorException.Raise(_parent._waj._env,
@@ -1005,7 +1040,7 @@ namespace Voron.Impl.Journal
                         }
 
                         _parent._waj._env.Options.SetLastReusedJournalCountOnSync(_journalsToDelete.Count);
-                        
+
                         foreach (var kvp in _journalsToDelete)
                         {
                             _parent._journalsToDelete.Remove(kvp.Key);
@@ -1040,16 +1075,27 @@ namespace Voron.Impl.Journal
                     {
                         using (var batchWrites = _waj._dataPager.BatchWriter())
                         {
+                            var tempTx = new TempPagerTransaction();
                             foreach (var pagePosition in pagesToWrite.Values)
                             {
                                 var scratchNumber = pagePosition.ScratchNumber;
-                                PagerState pagerState;
-                                if (scratchPagerStates.TryGetValue(scratchNumber, out pagerState) == false)
+                                if (scratchPagerStates.TryGetValue(scratchNumber, out var pagerState) == false)
                                 {
                                     pagerState = scratchBufferPool.GetPagerState(scratchNumber);
                                     pagerState.AddRef();
 
                                     scratchPagerStates.Add(scratchNumber, pagerState);
+                                }
+
+                                if (_waj._env.Options.EncryptionEnabled == false)
+                                {
+                                    using (tempTx) // release any resources, we just wanted to validate things
+                                    {
+                                        var page = (PageHeader*)scratchBufferPool.AcquirePagePointerWithOverflowHandling(tempTx, scratchNumber, pagePosition.ScratchPage);
+                                        var checksum = StorageEnvironment.CalculatePageChecksum((byte*)page, page->PageNumber, out var expectedChecksum);
+                                        if (checksum != expectedChecksum)
+                                            ThrowInvalidChecksumOnPageFromScratch(scratchNumber, pagePosition, page, checksum, expectedChecksum);
+                                    }
                                 }
 
                                 var numberOfPages = scratchBufferPool.CopyPage(
@@ -1080,6 +1126,18 @@ namespace Voron.Impl.Journal
                 }
             }
 
+            private static void ThrowInvalidChecksumOnPageFromScratch(int scratchNumber, PagePosition pagePosition, PageHeader* page, ulong checksum, ulong expectedChecksum)
+            {
+                var message = $"During apply logs to data, tried to copy {scratchNumber} / {pagePosition.ScratchNumber} ({page->PageNumber}) " +
+                              $"has checksum {checksum} but expected {expectedChecksum}";
+
+                message += $"Page flags: {page->Flags}. ";
+
+                if ((page->Flags & PageFlags.Overflow) == PageFlags.Overflow)
+                    message += $"Overflow size: {page->OverflowSize}. ";
+
+                throw new InvalidDataException(message);
+            }
 
             private List<JournalFile> GetUnusedJournalFiles(IEnumerable<JournalSnapshot> jrnls, long lastProcessedJournal, long lastFlushedTransactionId)
             {
@@ -1091,8 +1149,8 @@ namespace Voron.Impl.Journal
                     if (j.Number == lastProcessedJournal) // we are in the last log we synced
                     {
                         if (j.Available4Kbs != 0 || //　if there are more pages to be used here or
-                            // we didn't synchronize whole journal
-                            j.PageTranslationTable.MaxTransactionId() != lastFlushedTransactionId) 
+                                                    // we didn't synchronize whole journal
+                            j.PageTranslationTable.MaxTransactionId() != lastFlushedTransactionId)
                             continue; // do not mark it as unused
 
 
@@ -1106,8 +1164,11 @@ namespace Voron.Impl.Journal
                 return unusedJournalFiles;
             }
 
-            private void UpdateFileHeaderAfterDataFileSync(long lastSyncedJournal,
-                long lastSyncedTransactionId, ref TransactionHeader lastReadTxHeader)
+            private void UpdateFileHeaderAfterDataFileSync(
+                long lastSyncedJournal,
+                long lastSyncedTransactionId,
+                bool ignoreLastSyncJournalMissing,
+                ref TransactionHeader lastReadTxHeader)
             {
                 Debug.Assert(lastSyncedJournal != -1);
                 Debug.Assert(lastSyncedTransactionId != -1);
@@ -1124,41 +1185,15 @@ namespace Voron.Impl.Journal
                     header->Journal.LastSyncedJournal = lastSyncedJournal;
                     header->Journal.LastSyncedTransactionId = lastSyncedTransactionId;
 
+                    Memory.Set(header->Journal.Reserved, 0, JournalInfo.NumberOfReservedBytes);
+
+                    if (ignoreLastSyncJournalMissing)
+                        header->Journal.Flags |= JournalInfoFlags.IgnoreMissingLastSyncJournal;
+                    else
+                        header->Journal.Flags &= ~JournalInfoFlags.IgnoreMissingLastSyncJournal;
+
                     header->Root = treeRootHeader;
-
-                    _waj._updateLogInfo(header);
                 });
-            }
-
-            public void SetLastReadTxHeader(JournalFile file, long maxTransactionId, ref TransactionHeader lastReadTxHeader)
-            {
-                var readTxHeader = stackalloc TransactionHeader[1];
-                lastReadTxHeader.TransactionId = -1;
-                long txPos = 0;
-                while (true)
-                {
-                    if (file.ReadTransaction(txPos, readTxHeader) == false)
-                        break;
-                    if (readTxHeader->HeaderMarker != Constants.TransactionHeaderMarker)
-                        break;
-                    if (readTxHeader->TransactionId > maxTransactionId)
-                        break;
-                    if (lastReadTxHeader.TransactionId > readTxHeader->TransactionId)
-                        // we got to a trasaction that is smaller than the previous one, this is very 
-                        // likely a reused journal with old transaction, which we can ignore
-                        break;
-
-                    lastReadTxHeader = *readTxHeader;
-
-                    var totalSize = readTxHeader->CompressedSize != -1 ? readTxHeader->CompressedSize + sizeof(TransactionHeader) : readTxHeader->UncompressedSize + sizeof(TransactionHeader);
-
-
-                    var roundTo4Kb = (totalSize / (4 * Constants.Size.Kilobyte)) +
-                                     (totalSize % (4 * Constants.Size.Kilobyte) == 0 ? 0 : 1);
-
-                    // We skip to the next transaction header.
-                    txPos += roundTo4Kb * 4 * Constants.Size.Kilobyte;
-                }
             }
 
             public void Dispose()
@@ -1249,7 +1284,18 @@ namespace Voron.Impl.Journal
                 _waj._files = _waj._files.RemoveFront(1);
                 _waj.CurrentFile = null;
 
-                _waj._headerAccessor.Modify(header => _waj._updateLogInfo(header));
+                _waj._headerAccessor.Modify(header =>
+                {
+                    header->Journal.CurrentJournal = -1;
+
+                    if (current.Number != header->Journal.LastSyncedJournal)
+                    {
+                        throw new InvalidOperationException($"Attempted to remove a journal ({current.Number}) that hasn't been synced yet (last synced journal: {header->Journal.LastSyncedJournal})");
+                    }
+
+                    Memory.Set(header->Journal.Reserved, 0, JournalInfo.NumberOfReservedBytes);
+                    header->Journal.Flags |= JournalInfoFlags.IgnoreMissingLastSyncJournal;
+                });
 
                 current.DeleteOnClose = true;
                 current.Release();
@@ -1262,49 +1308,66 @@ namespace Voron.Impl.Journal
             lock (_writeLock)
             {
                 var sp = Stopwatch.StartNew();
-                var journalEntry = PrepareToWriteToJournal(tx);
-                if (_logger.IsInfoEnabled)
+
+                IPagerLevelTransactionState tempEncCompressionPagerTxState = null;
+
+                if (_env.Options.EncryptionEnabled && _is32Bit)
                 {
-                    _logger.Info($"Preparing to write tx {tx.Id} to journal with {journalEntry.NumberOfUncompressedPages:#,#} pages ({(journalEntry.NumberOfUncompressedPages * Constants.Storage.PageSize) / Constants.Size.Kilobyte:#,#} kb) in {sp.Elapsed} with {Math.Round(journalEntry.NumberOf4Kbs * 4d, 1):#,#.#;;0} kb compressed.");
+                    // RavenDB-12854: in 32 bits locking/unlocking the memory is done separately for each mapping
+                    // we use temp tx for dealing with compression buffers pager to avoid locking (zeroing) it's content during tx dispose
+                    // because we might have another transaction already using it
+
+                    tempEncCompressionPagerTxState = new TempPagerTransaction(true);
                 }
 
-                if (tx.IsLazyTransaction && _lazyTransactionBuffer == null)
+                using (tempEncCompressionPagerTxState)
                 {
-                    _lazyTransactionBuffer = new LazyTransactionBuffer(_env.Options);
-                }
-
-                if (CurrentFile == null || CurrentFile.Available4Kbs < journalEntry.NumberOf4Kbs)
-                {
-                    _lazyTransactionBuffer?.WriteBufferToFile(CurrentFile, tx);
-                    CurrentFile = NextFile(journalEntry.NumberOf4Kbs);
+                    var journalEntry = PrepareToWriteToJournal(tx, tempEncCompressionPagerTxState);
                     if (_logger.IsInfoEnabled)
-                        _logger.Info($"New journal file created {CurrentFile.Number:D19}");
+                    {
+                        _logger.Info(
+                            $"Preparing to write tx {tx.Id} to journal with {journalEntry.NumberOfUncompressedPages:#,#} pages ({(journalEntry.NumberOfUncompressedPages * Constants.Storage.PageSize) / Constants.Size.Kilobyte:#,#} kb) in {sp.Elapsed} with {Math.Round(journalEntry.NumberOf4Kbs * 4d, 1):#,#.#;;0} kb compressed.");
+                    }
+
+                    if (tx.IsLazyTransaction && _lazyTransactionBuffer == null)
+                    {
+                        _lazyTransactionBuffer = new LazyTransactionBuffer(_env.Options);
+                    }
+
+                    if (CurrentFile == null || CurrentFile.Available4Kbs < journalEntry.NumberOf4Kbs)
+                    {
+                        _lazyTransactionBuffer?.WriteBufferToFile(CurrentFile, tx);
+                        CurrentFile = NextFile(journalEntry.NumberOf4Kbs);
+                        if (_logger.IsInfoEnabled)
+                            _logger.Info($"New journal file created {CurrentFile.Number:D19}");
+                    }
+
+                    sp.Restart();
+                    journalEntry.UpdatePageTranslationTable = CurrentFile.Write(tx, journalEntry, _lazyTransactionBuffer);
+                    sp.Stop();
+                    _lastCompressionAccelerationInfo.WriteDuration = sp.Elapsed;
+                    _lastCompressionAccelerationInfo.CalculateOptimalAcceleration();
+
+                    if (_logger.IsInfoEnabled)
+                        _logger.Info($"Writing {journalEntry.NumberOf4Kbs * 4:#,#} kb to journal {CurrentFile.Number:D19} took {sp.Elapsed}");
+
+                    journalFilePath = CurrentFile.JournalWriter.FileName.FullPath;
+
+                    if (CurrentFile.Available4Kbs == 0)
+                    {
+                        _lazyTransactionBuffer?.WriteBufferToFile(CurrentFile, tx);
+                        CurrentFile = null;
+                    }
+
+                    ZeroCompressionBufferIfNeeded(tempEncCompressionPagerTxState ?? tx);
+                    ReduceSizeOfCompressionBufferIfNeeded();
+
+                    return journalEntry;
                 }
-
-                sp.Restart();
-                CurrentFile.Write(tx, journalEntry, _lazyTransactionBuffer);
-                sp.Stop();
-                _lastCompressionAccelerationInfo.WriteDuration = sp.Elapsed;
-                _lastCompressionAccelerationInfo.CalculateOptimalAcceleration();
-
-                if (_logger.IsInfoEnabled)
-                    _logger.Info($"Writing {journalEntry.NumberOf4Kbs * 4:#,#} kb to journal {CurrentFile.Number:D19} took {sp.Elapsed}");
-
-                journalFilePath = CurrentFile.JournalWriter.FileName.FullPath;
-
-                if (CurrentFile.Available4Kbs == 0)
-                {
-                    _lazyTransactionBuffer?.WriteBufferToFile(CurrentFile, tx);
-                    CurrentFile = null;
-                }
-                ZeroCompressionBufferIfNeeded(tx);
-                ReduceSizeOfCompressionBufferIfNeeded();
-
-                return journalEntry;
             }
         }
 
-        private CompressedPagesResult PrepareToWriteToJournal(LowLevelTransaction tx)
+        private CompressedPagesResult PrepareToWriteToJournal(LowLevelTransaction tx, IPagerLevelTransactionState tempEncCompressionPagerTxState)
         {
             var txPages = tx.GetTransactionPages();
             var numberOfPages = txPages.Count;
@@ -1338,10 +1401,12 @@ namespace Voron.Impl.Journal
                 throw;
             }
 
-            tx.EnsurePagerStateReference(pagerState);
+            var compressionPagerTxState = tempEncCompressionPagerTxState ?? tx;
 
-            _compressionPager.EnsureMapped(tx, 0, pagesRequired);
-            var txHeaderPtr = _compressionPager.AcquirePagePointer(tx, 0);
+            compressionPagerTxState.EnsurePagerStateReference(pagerState);
+
+            _compressionPager.EnsureMapped(compressionPagerTxState, 0, pagesRequired);
+            var txHeaderPtr = _compressionPager.AcquirePagePointer(compressionPagerTxState, 0);
             var txPageInfoPtr = txHeaderPtr + sizeof(TransactionHeader);
             var pagesInfo = (TransactionHeaderPageInfo*)txPageInfoPtr;
 
@@ -1436,11 +1501,11 @@ namespace Voron.Impl.Journal
                     _lastCompressionBufferReduceCheck = DateTime.UtcNow;
                     throw;
                 }
-                
-                tx.EnsurePagerStateReference(pagerState);
-                _compressionPager.EnsureMapped(tx, pagesWritten, outputBufferInPages);
 
-                txHeaderPtr = _compressionPager.AcquirePagePointer(tx, pagesWritten);
+                compressionPagerTxState.EnsurePagerStateReference(pagerState);
+                _compressionPager.EnsureMapped(compressionPagerTxState, pagesWritten, outputBufferInPages);
+
+                txHeaderPtr = _compressionPager.AcquirePagePointer(compressionPagerTxState, pagesWritten);
                 var compressionBuffer = txHeaderPtr + sizeof(TransactionHeader);
 
                 var compressionDuration = Stopwatch.StartNew();
@@ -1476,7 +1541,7 @@ namespace Voron.Impl.Journal
             if (remainder != 0)
             {
                 // zero the remainder of the page
-                UnmanagedMemory.Set(txHeaderPtr + totalLength, 0, 4 * Constants.Size.Kilobyte - remainder);
+                Memory.Set(txHeaderPtr + totalLength, 0, 4 * Constants.Size.Kilobyte - remainder);
             }
 
             var reportedCompressionLength = performCompression ? compressedLen : -1;
@@ -1500,7 +1565,7 @@ namespace Voron.Impl.Journal
                 // the AEAD method, so no need to do it twice
                 txHeader->Hash = 0;
             }
-            
+
             var prepreToWriteToJournal = new CompressedPagesResult
             {
                 Base = txHeaderPtr,
@@ -1526,7 +1591,7 @@ namespace Voron.Impl.Journal
             txHeader->Flags |= TransactionPersistenceModeFlags.Encrypted;
             ulong macLen = (ulong)Sodium.crypto_aead_xchacha20poly1305_ietf_abytes();
             var subKeyLen = Sodium.crypto_aead_xchacha20poly1305_ietf_keybytes();
-            var subKey = stackalloc byte[(int)subKeyLen ];
+            var subKey = stackalloc byte[(int)subKeyLen];
             fixed (byte* mk = _env.Options.MasterKey)
             fixed (byte* ctx = Context)
             {
@@ -1552,7 +1617,7 @@ namespace Voron.Impl.Journal
                 npub,
                 subKey
             );
-            
+
             Debug.Assert(macLen == (ulong)Sodium.crypto_aead_xchacha20poly1305_ietf_abytes());
 
             if (rc != 0)
@@ -1620,26 +1685,28 @@ namespace Voron.Impl.Journal
 
         private DateTime _lastCompressionBufferReduceCheck = DateTime.UtcNow;
         private CompressionAccelerationStats _lastCompressionAccelerationInfo = new CompressionAccelerationStats();
+        private readonly bool _is32Bit;
 
-        public void ReduceSizeOfCompressionBufferIfNeeded()
+        public void ReduceSizeOfCompressionBufferIfNeeded(bool forceReduce = false)
         {
-            if (!ShouldReduceSizeOfCompressionPager())
+            var initialSize = _env.Options.InitialFileSize ?? _env.Options.InitialLogFileSize;
+            if (ShouldReduceSizeOfCompressionPager(initialSize, forceReduce) == false)
                 return;
 
             // the compression pager is too large, we probably had a big transaction and now can
             // free all of that and come back to more reasonable values.
-            if (_logger.IsOperationsEnabled)
+            if (forceReduce == false && _logger.IsOperationsEnabled)
             {
                 _logger.Operations(
-                    $"Compression buffer: {_compressionPager} has reached size {(_compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize) / Constants.Size.Kilobyte:#,#0} kb which is more than the limit " +
-                    $"of {_env.Options.MaxScratchBufferSize / 1024:#,#0} kb. Will trim it now to the max size allowed. If this is happen on a regular basis," +
+                    $"Compression buffer: {_compressionPager} has reached size {new Size(_compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize, SizeUnit.Bytes)} which is more than the initial size " +
+                    $"of {new Size(initialSize, SizeUnit.Bytes)}. Will trim it now to the max size allowed. If this is happen on a regular basis," +
                     " consider raising the limit (MaxScratchBufferSize option control it), since it can cause performance issues");
             }
 
             _lastCompressionBufferReduceCheck = DateTime.UtcNow;
 
             _compressionPager.Dispose();
-            _compressionPager = CreateCompressionPager(_env.Options.MaxScratchBufferSize);
+            _compressionPager = CreateCompressionPager(initialSize);
         }
 
         public void ZeroCompressionBufferIfNeeded(IPagerLevelTransactionState tx)
@@ -1648,27 +1715,30 @@ namespace Voron.Impl.Journal
                 return;
 
             var compressionBufferSize = _compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize;
+            _compressionPager.EnsureMapped(tx, 0, checked((int)_compressionPager.NumberOfAllocatedPages));
             var pagePointer = _compressionPager.AcquirePagePointer(tx, 0);
             Sodium.sodium_memzero(pagePointer, (UIntPtr)compressionBufferSize);
         }
 
-        private bool ShouldReduceSizeOfCompressionPager()
+        private bool ShouldReduceSizeOfCompressionPager(long initialSize, bool forceReduce)
         {
             var compressionBufferSize = _compressionPager.NumberOfAllocatedPages * Constants.Storage.PageSize;
-            if (compressionBufferSize <= _env.Options.MaxScratchBufferSize)
+            if (compressionBufferSize <= initialSize)
                 return false;
+
+            if (forceReduce)
+                return true;
 
             if ((DateTime.UtcNow - _lastCompressionBufferReduceCheck).TotalMinutes < 5)
                 return false;
 
-
-            // while we are above the limit, we still recently used at least half of it, no point
-            // in reducing size yet, we'll be called again
-            var shouldReduceSizeOfCompressionPager = _maxNumberOfPagesRequiredForCompressionBuffer < _compressionPager.NumberOfAllocatedPages / 2;
-            if (shouldReduceSizeOfCompressionPager)
+            if (_maxNumberOfPagesRequiredForCompressionBuffer < _compressionPager.NumberOfAllocatedPages / 2)
             {
+                // we recently used at least half of the compression buffer,
+                // no point in reducing size yet, we'll try to do it again next time
                 return true;
             }
+
             _maxNumberOfPagesRequiredForCompressionBuffer = 0;
             _lastCompressionBufferReduceCheck = DateTime.UtcNow;
             return true;
@@ -1678,10 +1748,12 @@ namespace Voron.Impl.Journal
         {
             if (Monitor.TryEnter(_writeLock) == false)
                 return;
+
             // if we can't get it, we are active, so it doesn't matter
             try
             {
-                ReduceSizeOfCompressionBufferIfNeeded();
+                // called when the storage environment was idle
+                ReduceSizeOfCompressionBufferIfNeeded(forceReduce: true);
             }
             finally
             {
@@ -1695,7 +1767,7 @@ namespace Voron.Impl.Journal
         public byte* Base;
         public int NumberOf4Kbs;
         public int NumberOfUncompressedPages;
+        public JournalFile.UpdatePageTranslationTableAction? UpdatePageTranslationTable;
     }
-
 }
 

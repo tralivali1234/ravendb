@@ -19,10 +19,17 @@ namespace FastTests
 {
     public static class RavenTestHelper
     {
+        public static readonly bool IsRunningOnCI;
+
         public static readonly ParallelOptions DefaultParallelOptions = new ParallelOptions
         {
             MaxDegreeOfParallelism = ProcessorInfo.ProcessorCount * 2
         };
+
+        static RavenTestHelper()
+        {
+            bool.TryParse(Environment.GetEnvironmentVariable("RAVEN_IS_RUNNING_ON_CI"), out IsRunningOnCI);
+        }
 
         private static int _pathCount;
 
@@ -30,7 +37,7 @@ namespace FastTests
         {
             testName = testName?.Replace("<", "").Replace(">", "");
 
-            var newDataDir = Path.GetFullPath($".\\Databases\\{testName ?? "TestDatabase"}_{serverPort}-{DateTime.Now:yyyy-MM-dd-HH-mm-ss-fff}-{Interlocked.Increment(ref _pathCount)}");
+            var newDataDir = Path.GetFullPath($".\\Databases\\{testName ?? "TestDatabase"}.{serverPort}-{Interlocked.Increment(ref _pathCount)}");
 
             if (PlatformDetails.RunningOnPosix)
                 newDataDir = PosixHelper.FixLinuxPath(newDataDir);
@@ -47,7 +54,25 @@ namespace FastTests
             foreach (var pathToDelete in localPathsToDelete)
             {
                 pathsToDelete.TryRemove(pathToDelete);
-                exceptionAggregator.Execute(() => ClearDatabaseDirectory(pathToDelete));
+
+                FileAttributes pathAttributes;
+                try
+                {
+                    pathAttributes = File.GetAttributes(pathToDelete);
+                }
+                catch (FileNotFoundException)
+                {
+                    continue;
+                }
+                catch (DirectoryNotFoundException)
+                {
+                    continue;
+                }
+
+                if (pathAttributes.HasFlag(FileAttributes.Directory))
+                    exceptionAggregator.Execute(() => ClearDatabaseDirectory(pathToDelete));
+                else
+                    exceptionAggregator.Execute(() => IOExtensions.DeleteFile(pathToDelete));
             }
         }
 
